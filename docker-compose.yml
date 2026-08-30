@@ -1,0 +1,10 @@
+services:
+  morphlake:
+    build: .
+    image: morphlake:0.1.0
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/models.yaml:/app/config/models.yaml:ro
+    restart: unless-stopped

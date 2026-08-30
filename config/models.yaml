@@ -1,0 +1,39 @@
+# Model behavior is entirely configuration-driven. The built-in hash provider
+# is deterministic and intended only for development and smoke tests. Change
+# each provider to openai_compatible and configure the environment variables
+# in production.
+models:
+  text_embedding:
+    provider: "${TEXT_EMBEDDING_PROVIDER:-hash}"
+    model: "${TEXT_EMBEDDING_MODEL:-morphlake-hash-text-v1}"
+    base_url: "${EMBEDDING_API_BASE:-}"
+    api_key: "${EMBEDDING_API_KEY:-}"
+    dimension: 384
+    timeout_seconds: 60
+
+  image_embedding:
+    provider: "${IMAGE_EMBEDDING_PROVIDER:-hash}"
+    model: "${IMAGE_EMBEDDING_MODEL:-morphlake-hash-image-v1}"
+    base_url: "${EMBEDDING_API_BASE:-}"
+    api_key: "${EMBEDDING_API_KEY:-}"
+    dimension: 512
+    timeout_seconds: 120
+
+  audio_transcription:
+    provider: "${AUDIO_TRANSCRIPTION_PROVIDER:-none}"
+    model: "${AUDIO_TRANSCRIPTION_MODEL:-whisper-1}"
+    base_url: "${EMBEDDING_API_BASE:-}"
+    api_key: "${EMBEDDING_API_KEY:-}"
+    timeout_seconds: 300
+
+  audio_embedding:
+    provider: "${AUDIO_EMBEDDING_PROVIDER:-hash}"
+    model: "${AUDIO_EMBEDDING_MODEL:-morphlake-hash-audio-v1}"
+    base_url: "${EMBEDDING_API_BASE:-}"
+    api_key: "${EMBEDDING_API_KEY:-}"
+    dimension: 384
+    timeout_seconds: 120
+
+chunking:
+  size: 1000
+  overlap: 150
