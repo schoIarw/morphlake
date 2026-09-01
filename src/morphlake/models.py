@@ -72,7 +72,7 @@ class VectorSearchRequest(BaseModel):
     vector_field: Literal["text", "image", "audio"] = "text"
     start_date: date | None = None
     end_date: date | None = None
-    limit: int = Field(20, ge=1, le=200)
+    limit: int = Field(10, ge=1, le=200)
 
     @field_validator("vector")
     @classmethod

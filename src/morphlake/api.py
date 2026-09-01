@@ -78,6 +78,92 @@ async def upload_file(
     return Asset.model_validate(result)
 
 
+async def _upload_typed_file(
+    *,
+    expected_media_type: str,
+    file: UploadFile,
+    business_domain: str,
+    department: str,
+    service: MorphLakeService,
+) -> Asset:
+    body = await file.read()
+    result = service.upload(
+        filename=file.filename or "",
+        content_type=file.content_type,
+        body=body,
+        business_domain=business_domain,
+        department=department,
+        expected_media_type=expected_media_type,
+    )
+    return Asset.model_validate(result)
+
+
+@router.post(
+    "/api/v1/files/documents",
+    response_model=Asset,
+    status_code=201,
+    dependencies=[Depends(require_api_key)],
+    tags=["files"],
+)
+async def upload_document(
+    file: Annotated[UploadFile, File()],
+    business_domain: Annotated[str, Form(min_length=1, max_length=128)],
+    department: Annotated[str, Form(min_length=1, max_length=128)],
+    service: Annotated[MorphLakeService, Depends(get_service)],
+) -> Asset:
+    return await _upload_typed_file(
+        expected_media_type="document",
+        file=file,
+        business_domain=business_domain,
+        department=department,
+        service=service,
+    )
+
+
+@router.post(
+    "/api/v1/files/images",
+    response_model=Asset,
+    status_code=201,
+    dependencies=[Depends(require_api_key)],
+    tags=["files"],
+)
+async def upload_image(
+    file: Annotated[UploadFile, File()],
+    business_domain: Annotated[str, Form(min_length=1, max_length=128)],
+    department: Annotated[str, Form(min_length=1, max_length=128)],
+    service: Annotated[MorphLakeService, Depends(get_service)],
+) -> Asset:
+    return await _upload_typed_file(
+        expected_media_type="image",
+        file=file,
+        business_domain=business_domain,
+        department=department,
+        service=service,
+    )
+
+
+@router.post(
+    "/api/v1/files/audio",
+    response_model=Asset,
+    status_code=201,
+    dependencies=[Depends(require_api_key)],
+    tags=["files"],
+)
+async def upload_audio(
+    file: Annotated[UploadFile, File()],
+    business_domain: Annotated[str, Form(min_length=1, max_length=128)],
+    department: Annotated[str, Form(min_length=1, max_length=128)],
+    service: Annotated[MorphLakeService, Depends(get_service)],
+) -> Asset:
+    return await _upload_typed_file(
+        expected_media_type="audio",
+        file=file,
+        business_domain=business_domain,
+        department=department,
+        service=service,
+    )
+
+
 @router.get(
     "/api/v1/files",
     response_model=AssetList,
@@ -153,5 +239,31 @@ def vector_search(
     service: Annotated[MorphLakeService, Depends(get_service)],
 ) -> SearchResult:
     rows = service.vector_search(request)
+    items = [SearchHit(rank=index + 1, **row) for index, row in enumerate(rows)]
+    return SearchResult(items=items, returned=len(items))
+
+
+@router.post(
+    "/api/v1/search/vector/file",
+    response_model=SearchResult,
+    dependencies=[Depends(require_api_key)],
+    tags=["search"],
+)
+async def vector_search_file(
+    file: Annotated[UploadFile, File()],
+    business_domain: Annotated[str, Form(min_length=1, max_length=128)],
+    service: Annotated[MorphLakeService, Depends(get_service)],
+    start_date: Annotated[date | None, Form()] = None,
+    end_date: Annotated[date | None, Form()] = None,
+) -> SearchResult:
+    body = await file.read()
+    rows = service.vector_search_file(
+        filename=file.filename or "",
+        content_type=file.content_type,
+        body=body,
+        business_domain=business_domain,
+        start_date=start_date,
+        end_date=end_date,
+    )
     items = [SearchHit(rank=index + 1, **row) for index, row in enumerate(rows)]
     return SearchResult(items=items, returned=len(items))

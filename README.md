@@ -28,14 +28,14 @@ flowchart TB
 
 | 能力 | 支持内容 |
 | --- | --- |
-| 上传 | PDF、DOCX、TXT、Markdown、CSV、JSON、HTML、PNG/JPG/WebP 等图片、WAV/MP3/M4A/FLAC 等音频 |
+| 上传 | 文档、图片、音频独立接口；另保留自动分类兼容接口 |
 | 必填元数据 | `business_domain`（业务域）、`department`（业务部门） |
 | 文档处理 | 文本提取、可配置重叠切片、逐切片向量化 |
 | 图片处理 | 文件级图片向量 |
 | 音频处理 | 文件级音频向量；可选语音转写和转写文本向量 |
 | 清单查询 | 类型、日期、业务域、部门、文件名关键字 |
 | 全文检索 | 业务域、日期范围、全文关键字 |
-| 向量检索 | 业务域、日期范围、文本/图片/音频向量 |
+| 向量检索 | 上传文档/图片/音频自动向量化并返回 Paimon Top10；也支持直接提交向量 |
 | 下载 | 按 `file_id` 流式下载 MinIO 对象 |
 
 旧式二进制 `.doc` 会返回 415；请先转换为 `.docx`。扫描版 PDF 的 OCR 不在默认链路中，
@@ -80,11 +80,22 @@ curl http://localhost:8080/health/ready
 ### 3. 上传并查询
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/files \
+curl -X POST http://localhost:8080/api/v1/files/documents \
   -H 'X-API-Key: replace-if-configured' \
   -F 'business_domain=risk' \
   -F 'department=compliance' \
   -F 'file=@./contract.pdf'
+```
+
+用同模态查询文件自动向量化并查询 Top10（查询文件不会入库）：
+
+```bash
+curl -X POST http://localhost:8080/api/v1/search/vector/file \
+  -H 'X-API-Key: replace-if-configured' \
+  -F 'business_domain=risk' \
+  -F 'start_date=2026-01-01' \
+  -F 'end_date=2026-12-31' \
+  -F 'file=@./query.pdf'
 ```
 
 ```bash

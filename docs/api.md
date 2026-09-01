@@ -26,10 +26,19 @@ curl http://localhost:8080/health/ready
 
 ## 上传
 
-`POST /api/v1/files`，`multipart/form-data`。
+推荐按文件模态使用固定接口，均为 `multipart/form-data`：
+
+| 模态 | 接口 | 支持示例 |
+| --- | --- | --- |
+| 文档 | `POST /api/v1/files/documents` | PDF、DOCX、TXT、Markdown、CSV、JSON、HTML |
+| 图片 | `POST /api/v1/files/images` | PNG、JPG、WebP、BMP、TIFF |
+| 音频 | `POST /api/v1/files/audio` | WAV、MP3、M4A、FLAC、OGG、AAC |
+
+接口会校验扩展名与目标模态是否一致，错传返回 415。兼容接口 `POST /api/v1/files`
+仍可根据扩展名自动分类。
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/files \
+curl -X POST http://localhost:8080/api/v1/files/documents \
   -H 'X-API-Key: change-me' \
   -F 'business_domain=finance' \
   -F 'department=treasury' \
@@ -102,6 +111,49 @@ curl -X POST http://localhost:8080/api/v1/search/full-text \
 
 ## 向量检索
 
+### 上传查询文件并返回 Top10
+
+`POST /api/v1/search/vector/file` 接收文档、图片或音频查询文件，自动选择与上传入库时
+一致的向量模型，并调用 Paimon 原生向量索引返回最多 10 条清单：文档查询匹配文档切片，
+图片查询匹配图片文件，音频查询匹配音频文件。查询文件仅用于生成查询向量，不写入
+MinIO 或 Paimon。
+
+```bash
+curl -X POST http://localhost:8080/api/v1/search/vector/file \
+  -H 'X-API-Key: change-me' \
+  -F 'business_domain=finance' \
+  -F 'start_date=2026-08-01' \
+  -F 'end_date=2026-08-31' \
+  -F 'file=@./query-image.png'
+```
+
+返回结构：
+
+```json
+{
+  "items": [
+    {
+      "rank": 1,
+      "file_id": "...",
+      "filename": "similar-image.png",
+      "media_type": "image",
+      "business_domain": "finance",
+      "department": "treasury",
+      "created_at": "2026-08-20T03:00:00Z",
+      "record_type": "file",
+      "chunk_index": null,
+      "content_text": null
+    }
+  ],
+  "returned": 1
+}
+```
+
+扫描版 PDF 若无法提取文本会返回 422。日期为可选字段，且 `start_date` 不能晚于
+`end_date`。
+
+### 直接提交向量
+
 `POST /api/v1/search/vector`。
 
 ```bash
@@ -119,7 +171,7 @@ curl -X POST http://localhost:8080/api/v1/search/vector \
 ```
 
 示例数组为简写；实际维度必须严格等于所选模态配置。`vector_field` 可为 `text`、`image`
-或 `audio`。
+或 `audio`；未传 `limit` 时默认返回 Top10。
 
 ## 下载
 

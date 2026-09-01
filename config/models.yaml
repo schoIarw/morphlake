@@ -37,3 +37,4 @@ models:
 chunking:
   size: 1000
   overlap: 150
+

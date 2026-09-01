@@ -37,6 +37,7 @@ class FakeCatalog:
     def __init__(self, fail=False):
         self.fail = fail
         self.records = []
+        self.vector_query = None
 
     def initialize(self):
         return None
@@ -48,6 +49,10 @@ class FakeCatalog:
 
     def ping(self):
         return None
+
+    def vector_search(self, **values):
+        self.vector_query = values
+        return []
 
 
 def models(tmp_path: Path) -> ModelGateway:
@@ -116,3 +121,56 @@ def test_upload_rejects_empty_body(tmp_path: Path):
             department="audit",
         )
     assert exc.value.code == "empty_file"
+
+
+def test_typed_upload_rejects_mismatch_before_object_write(tmp_path: Path):
+    objects = FakeObjects()
+    service = MorphLakeService(settings(), objects, FakeCatalog(), models(tmp_path))
+    with pytest.raises(MorphLakeError) as exc:
+        service.upload(
+            filename="photo.png",
+            content_type="image/png",
+            body=b"image",
+            business_domain="risk",
+            department="audit",
+            expected_media_type="document",
+        )
+    assert exc.value.code == "media_type_mismatch"
+    assert objects.values == {}
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "body", "expected_field", "dimension"),
+    [
+        ("query.txt", "text/plain", b"document query", "text", 4),
+        ("query.png", "image/png", b"image query", "image", 5),
+        ("query.mp3", "audio/mpeg", b"audio query", "audio", 6),
+    ],
+)
+def test_query_file_is_vectorized_by_modality_and_uses_top_10(
+    tmp_path: Path,
+    filename: str,
+    content_type: str,
+    body: bytes,
+    expected_field: str,
+    dimension: int,
+):
+    catalog = FakeCatalog()
+    objects = FakeObjects()
+    service = MorphLakeService(settings(), objects, catalog, models(tmp_path))
+
+    assert (
+        service.vector_search_file(
+            filename=filename,
+            content_type=content_type,
+            body=body,
+            business_domain="risk",
+        )
+        == []
+    )
+
+    assert catalog.vector_query["vector_field"] == expected_field
+    assert len(catalog.vector_query["vector"]) == dimension
+    assert catalog.vector_query["business_domain"] == "risk"
+    assert catalog.vector_query["limit"] == 10
+    assert objects.values == {}

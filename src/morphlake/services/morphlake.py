@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import mimetypes
 import re
 import uuid
@@ -44,6 +45,7 @@ class MorphLakeService:
         body: bytes,
         business_domain: str,
         department: str,
+        expected_media_type: str | None = None,
     ) -> dict[str, Any]:
         filename = Path(filename).name.strip()
         business_domain = business_domain.strip()
@@ -61,6 +63,12 @@ class MorphLakeService:
                 413,
             )
         media_type = classify(filename)
+        if expected_media_type and media_type != expected_media_type:
+            raise MorphLakeError(
+                "media_type_mismatch",
+                f"Expected a {expected_media_type} file, got {media_type}",
+                415,
+            )
         content_type = (
             content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
         )
@@ -101,6 +109,65 @@ class MorphLakeService:
 
     def vector_search(self, request: VectorSearchRequest):
         return self.catalog.vector_search(**request.model_dump())
+
+    def vector_search_file(
+        self,
+        *,
+        filename: str,
+        content_type: str | None,
+        body: bytes,
+        business_domain: str,
+        start_date=None,
+        end_date=None,
+    ):
+        """Vectorize an uploaded query file by modality and return Paimon Top 10."""
+        filename = Path(filename).name.strip()
+        business_domain = business_domain.strip()
+        if not filename or not business_domain:
+            raise MorphLakeError(
+                "invalid_vector_query", "filename and business_domain are required"
+            )
+        if not body:
+            raise MorphLakeError("empty_file", "Uploaded query file is empty")
+        if len(body) > self.settings.max_upload_bytes:
+            raise MorphLakeError(
+                "file_too_large",
+                f"File exceeds the {self.settings.max_upload_mb} MiB upload limit",
+                413,
+            )
+        if start_date and end_date and start_date > end_date:
+            raise MorphLakeError("invalid_date_range", "start_date must not be after end_date")
+
+        media_type = classify(filename)
+        resolved_content_type = (
+            content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        )
+        if media_type == "document":
+            text = extract_text(filename, body)
+            chunks = chunk_text(text, self.models.chunk_size, self.models.chunk_overlap)
+            if not chunks:
+                raise MorphLakeError(
+                    "document_text_empty",
+                    "The query document contains no extractable text",
+                    422,
+                )
+            vector = self._mean_vector([self.models.embed_text(chunk.text) for chunk in chunks])
+            vector_field = "text"
+        elif media_type == "image":
+            vector = self.models.embed_image(body, resolved_content_type)
+            vector_field = "image"
+        else:
+            vector = self.models.embed_audio(body)
+            vector_field = "audio"
+
+        return self.catalog.vector_search(
+            business_domain=business_domain,
+            vector=vector,
+            vector_field=vector_field,
+            start_date=start_date,
+            end_date=end_date,
+            limit=10,
+        )
 
     def ready(self) -> dict[str, str]:
         checks: dict[str, str] = {}
@@ -198,6 +265,15 @@ class MorphLakeService:
                 raise ConfigurationError(
                     f"{name} dimension is {configured}; Paimon expects {expected}"
                 )
+
+    @staticmethod
+    def _mean_vector(vectors: list[list[float]]) -> list[float]:
+        dimension = len(vectors[0])
+        if any(len(vector) != dimension for vector in vectors):
+            raise ConfigurationError("Document chunk embeddings have inconsistent dimensions")
+        mean = [sum(values) / len(vectors) for values in zip(*vectors, strict=True)]
+        norm = math.sqrt(sum(value * value for value in mean)) or 1.0
+        return [value / norm for value in mean]
 
     @staticmethod
     def _object_key(
