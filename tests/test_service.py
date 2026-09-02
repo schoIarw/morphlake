@@ -36,16 +36,25 @@ class FakeObjects:
 class FakeCatalog:
     def __init__(self, fail=False):
         self.fail = fail
-        self.records = []
+        self.asset = None
+        self.text_segments = []
+        self.image_features = []
+        self.audio_features = []
         self.vector_query = None
 
     def initialize(self):
         return None
 
-    def add(self, records):
+    def add(self, *, asset, text_segments, image_features, audio_features):
         if self.fail:
             raise RuntimeError("commit failed")
-        self.records.extend(records)
+        self.asset = asset
+        self.text_segments.extend(text_segments)
+        self.image_features.extend(image_features)
+        self.audio_features.extend(audio_features)
+
+    def maintain_indexes(self):
+        return None
 
     def ping(self):
         return None
@@ -89,11 +98,13 @@ def test_upload_writes_descriptor_and_document_chunks(tmp_path: Path):
         business_domain="risk",
         department="audit",
     )
-    assert result["record_type"] == "file"
     assert result["object_bucket"] == "data"
     assert result["chunk_count"] >= 2
-    assert all("body" not in record for record in catalog.records)
-    assert all(len(record["text_embedding"]) == 4 for record in catalog.records[1:])
+    assert catalog.asset == result
+    assert "body" not in catalog.asset
+    assert all("object_key" not in row for row in catalog.text_segments)
+    assert all(len(row["text_embedding"]) == 4 for row in catalog.text_segments)
+    assert all(row["domain_shard"] == result["domain_shard"] for row in catalog.text_segments)
 
 
 def test_upload_compensates_object_on_paimon_failure(tmp_path: Path):

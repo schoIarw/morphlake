@@ -109,6 +109,10 @@ curl -X POST http://localhost:8080/api/v1/search/full-text \
 
 返回按 Paimon 搜索顺序排列的文件/切片命中列表，`rank` 从 1 开始。
 
+全文和向量索引由容器按 `PAIMON_INDEX_BUILD_INTERVAL_SECONDS` 增量维护。上传成功后，清单和
+下载立即可用；新内容通常在下一轮索引维护后进入全文/向量结果（默认最多约 5 分钟，Ollama
+本地配置约 30 秒）。
+
 ## 向量检索
 
 ### 上传查询文件并返回 Top10

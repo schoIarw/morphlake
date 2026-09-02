@@ -1,9 +1,8 @@
-"""PyPaimon 2.0 metadata and native search adapter."""
+"""PyPaimon 2.0 storage and native-search adapter."""
 
 from __future__ import annotations
 
 import json
-import logging
 import threading
 from collections.abc import Iterable
 from datetime import date, timedelta
@@ -15,10 +14,13 @@ from pypaimon.multimodal import connect
 
 from morphlake.config import Settings
 from morphlake.errors import ConfigurationError, NotFoundError, StorageError
+from morphlake.partitioning import domain_shard
 
-LOGGER = logging.getLogger(__name__)
-
-PARTITION_KEYS = ["business_domain", "department", "upload_month"]
+ASSET_TABLE = "asset"
+TEXT_TABLE = "text"
+IMAGE_TABLE = "image"
+AUDIO_TABLE = "audio"
+PARTITION_KEYS = ["ingest_date", "domain_shard"]
 PUBLIC_COLUMNS = [
     "file_id",
     "filename",
@@ -46,37 +48,99 @@ SEARCH_COLUMNS = [
 ]
 
 
-def table_schema(settings: Settings) -> pa.Schema:
+def asset_schema(_: Settings) -> pa.Schema:
     return pa.schema(
         [
-            pa.field("row_id", pa.string(), nullable=False),
             pa.field("file_id", pa.string(), nullable=False),
-            pa.field("record_type", pa.string(), nullable=False),
             pa.field("business_domain", pa.string(), nullable=False),
             pa.field("department", pa.string(), nullable=False),
-            pa.field("upload_month", pa.string(), nullable=False),
+            pa.field("domain_shard", pa.int32(), nullable=False),
+            pa.field("ingest_date", pa.string(), nullable=False),
             pa.field("created_at", pa.string(), nullable=False),
             pa.field("filename", pa.string(), nullable=False),
             pa.field("media_type", pa.string(), nullable=False),
             pa.field("content_type", pa.string(), nullable=False),
             pa.field("file_size", pa.int64(), nullable=False),
+            pa.field("content_sha256", pa.string(), nullable=False),
             pa.field("object_bucket", pa.string(), nullable=False),
             pa.field("object_key", pa.string(), nullable=False),
             pa.field("object_etag", pa.string()),
             pa.field("chunk_count", pa.int32(), nullable=False),
-            pa.field("chunk_index", pa.int32()),
-            pa.field("chunk_start", pa.int64()),
-            pa.field("chunk_end", pa.int64()),
-            pa.field("content_text", pa.string()),
-            pa.field("text_embedding", pa.list_(pa.float32())),
-            pa.field("image_embedding", pa.list_(pa.float32())),
-            pa.field("audio_embedding", pa.list_(pa.float32())),
         ]
     )
 
 
+def text_schema(settings: Settings) -> pa.Schema:
+    return pa.schema(
+        [
+            *_search_fields("segment_id"),
+            pa.field("segment_type", pa.string(), nullable=False),
+            pa.field("chunk_start", pa.int64()),
+            pa.field("chunk_end", pa.int64()),
+            pa.field("embedding_model", pa.string(), nullable=False),
+            pa.field("embedding_version", pa.string(), nullable=False),
+            pa.field(
+                "text_embedding",
+                pa.list_(pa.float32(), settings.text_vector_dimension),
+                nullable=False,
+            ),
+        ]
+    )
+
+
+def image_schema(settings: Settings) -> pa.Schema:
+    return pa.schema(
+        [
+            *_search_fields("feature_id"),
+            pa.field("feature_type", pa.string(), nullable=False),
+            pa.field("embedding_model", pa.string(), nullable=False),
+            pa.field("embedding_version", pa.string(), nullable=False),
+            pa.field(
+                "image_embedding",
+                pa.list_(pa.float32(), settings.image_vector_dimension),
+                nullable=False,
+            ),
+        ]
+    )
+
+
+def audio_schema(settings: Settings) -> pa.Schema:
+    return pa.schema(
+        [
+            *_search_fields("feature_id"),
+            pa.field("feature_type", pa.string(), nullable=False),
+            pa.field("start_ms", pa.int64()),
+            pa.field("end_ms", pa.int64()),
+            pa.field("embedding_model", pa.string(), nullable=False),
+            pa.field("embedding_version", pa.string(), nullable=False),
+            pa.field(
+                "audio_embedding",
+                pa.list_(pa.float32(), settings.audio_vector_dimension),
+                nullable=False,
+            ),
+        ]
+    )
+
+
+def _search_fields(identifier: str) -> list[pa.Field]:
+    return [
+        pa.field(identifier, pa.string(), nullable=False),
+        pa.field("file_id", pa.string(), nullable=False),
+        pa.field("business_domain", pa.string(), nullable=False),
+        pa.field("department", pa.string(), nullable=False),
+        pa.field("domain_shard", pa.int32(), nullable=False),
+        pa.field("ingest_date", pa.string(), nullable=False),
+        pa.field("created_at", pa.string(), nullable=False),
+        pa.field("filename", pa.string(), nullable=False),
+        pa.field("media_type", pa.string(), nullable=False),
+        pa.field("record_type", pa.string(), nullable=False),
+        pa.field("chunk_index", pa.int32()),
+        pa.field("content_text", pa.string()),
+    ]
+
+
 class PaimonStore:
-    """Owns one append-only, partitioned multimodal Paimon table."""
+    """Owns four append-only Paimon tables with one partition strategy."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -84,43 +148,82 @@ class PaimonStore:
             database=settings.paimon_database,
             options=settings.paimon_catalog_options(),
         )
-        self.table = None
+        self.tables: dict[str, Any] = {}
         self._lock = threading.RLock()
 
     def initialize(self) -> None:
-        options = {
-            # PyPaimon 2.0 generic global indexes require unaware buckets and
-            # reject deletion vectors. Partitioning bounds each search domain.
-            "bucket": "-1",
-            "deletion-vectors.enabled": "false",
-            "data-evolution.enabled": "true",
-            "row-tracking.enabled": "true",
-            "blob-as-descriptor": "true",
-            "global-index.search-mode": "full",
+        """Create and validate the complete table model on service startup."""
+        definitions = {
+            ASSET_TABLE: (self.settings.paimon_table, asset_schema(self.settings), False),
+            TEXT_TABLE: (self.settings.paimon_text_table, text_schema(self.settings), True),
+            IMAGE_TABLE: (self.settings.paimon_image_table, image_schema(self.settings), True),
+            AUDIO_TABLE: (self.settings.paimon_audio_table, audio_schema(self.settings), True),
         }
         try:
-            self.table = self.connection.create_table(
-                self.settings.paimon_table,
-                schema=table_schema(self.settings),
-                options=options,
-                partitioned=PARTITION_KEYS,
-                ignore_if_exists=True,
-            )
-            self._validate_existing_table()
+            for key, (name, schema, has_vector) in definitions.items():
+                self.tables[key] = self.connection.create_table(
+                    name,
+                    schema=schema,
+                    options=self._table_options(has_vector=has_vector),
+                    partitioned=PARTITION_KEYS,
+                    ignore_if_exists=True,
+                )
+                self._validate_existing_table(key, schema)
         except (ConfigurationError, ValueError):
             raise
         except Exception as exc:
             raise StorageError(f"Paimon initialization failed: {exc}") from exc
 
-    def add(self, records: list[dict[str, Any]]) -> None:
-        table = self._require_table()
-        arrow = pa.Table.from_pylist(records, schema=table_schema(self.settings))
+    def add(
+        self,
+        *,
+        asset: dict[str, Any],
+        text_segments: list[dict[str, Any]],
+        image_features: list[dict[str, Any]],
+        audio_features: list[dict[str, Any]],
+    ) -> None:
+        """Write features first, then publish the asset descriptor last."""
+        writes = (
+            (TEXT_TABLE, text_segments, text_schema(self.settings)),
+            (IMAGE_TABLE, image_features, image_schema(self.settings)),
+            (AUDIO_TABLE, audio_features, audio_schema(self.settings)),
+            (ASSET_TABLE, [asset], asset_schema(self.settings)),
+        )
         try:
             with self._lock:
-                table.add(arrow)
-                self._build_indexes()
+                for table_key, rows, schema in writes:
+                    if rows:
+                        arrow = pa.Table.from_pylist(rows, schema=schema)
+                        self._require_table(table_key).add(arrow)
         except Exception as exc:
-            raise StorageError(f"Paimon write or index build failed: {exc}") from exc
+            raise StorageError(f"Paimon write failed: {exc}") from exc
+
+    def maintain_indexes(self) -> None:
+        """Incrementally build native indexes for newly committed row ranges."""
+        try:
+            with self._lock:
+                self._build_scalar_indexes(
+                    ASSET_TABLE,
+                    ["file_id"],
+                    ["business_domain", "department", "media_type"],
+                )
+                self._build_scalar_indexes(
+                    TEXT_TABLE,
+                    ["file_id"],
+                    ["business_domain", "department", "media_type", "segment_type"],
+                )
+                self._raw_table(TEXT_TABLE).create_global_index("content_text", "full-text")
+                self._build_vector_index(TEXT_TABLE, "text_embedding")
+                self._build_scalar_indexes(
+                    IMAGE_TABLE, ["file_id"], ["business_domain", "department"]
+                )
+                self._build_vector_index(IMAGE_TABLE, "image_embedding")
+                self._build_scalar_indexes(
+                    AUDIO_TABLE, ["file_id"], ["business_domain", "department"]
+                )
+                self._build_vector_index(AUDIO_TABLE, "audio_embedding")
+        except Exception as exc:
+            raise StorageError(f"Paimon index maintenance failed: {exc}") from exc
 
     def list_assets(
         self,
@@ -134,18 +237,19 @@ class PaimonStore:
         limit: int,
         offset: int,
     ) -> list[dict[str, Any]]:
-        builder = self._builder()
-        predicates = [builder.equal("record_type", "file")]
+        builder = self._builder(ASSET_TABLE)
+        predicates = []
         if media_type:
             predicates.append(builder.equal("media_type", media_type))
         if business_domain:
-            predicates.append(builder.equal("business_domain", business_domain))
+            predicates.extend(self._domain_predicates(builder, business_domain))
         if department:
             predicates.append(builder.equal("department", department))
         if filename:
             predicates.append(builder.contains("filename", filename))
         predicates.extend(self._date_predicates(builder, start_date, end_date))
         rows = self._read(
+            ASSET_TABLE,
             PredicateBuilder.and_predicates(predicates),
             columns=PUBLIC_COLUMNS,
             limit=limit + offset,
@@ -154,11 +258,13 @@ class PaimonStore:
         return rows[offset : offset + limit]
 
     def get_asset(self, file_id: str) -> dict[str, Any]:
-        builder = self._builder()
-        predicate = PredicateBuilder.and_predicates(
-            [builder.equal("record_type", "file"), builder.equal("file_id", file_id)]
+        builder = self._builder(ASSET_TABLE)
+        rows = self._read(
+            ASSET_TABLE,
+            builder.equal("file_id", file_id),
+            columns=PUBLIC_COLUMNS,
+            limit=1,
         )
-        rows = self._read(predicate, columns=PUBLIC_COLUMNS, limit=1)
         if not rows:
             raise NotFoundError(f"File {file_id} does not exist")
         return rows[0]
@@ -172,28 +278,31 @@ class PaimonStore:
         end_date: date | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        raw = self._raw_table()
-        partition_predicate = self._partition_predicate(business_domain, None, start_date, end_date)
-        exact_predicate = self._search_predicate(business_domain, start_date, end_date)
-        fetch_limit = max(limit * 10, 1000)
+        partition_predicate = self._partition_predicate(
+            TEXT_TABLE, business_domain, start_date, end_date
+        )
+        exact_predicate = self._search_predicate(TEXT_TABLE, business_domain, start_date, end_date)
+        fetch_limit = max(limit * 5, 50)
         try:
             search = (
-                raw.new_full_text_search_builder()
+                self._raw_table(TEXT_TABLE)
+                .new_full_text_search_builder()
                 .with_query(
                     "content_text",
                     json.dumps({"match": {"query": keyword}}, separators=(",", ":")),
                 )
                 .with_limit(fetch_limit)
+                .with_partition_filter(partition_predicate)
             )
-            if partition_predicate is not None:
-                search = search.with_partition_filter(partition_predicate)
             result = search.execute_local()
-            return self._read(
+            rows = self._read(
+                TEXT_TABLE,
                 exact_predicate,
                 columns=SEARCH_COLUMNS,
-                limit=limit,
+                limit=fetch_limit,
                 global_index_result=result,
             )
+            return self._committed_hits(rows, limit)
         except Exception as exc:
             raise StorageError(f"Paimon full-text search failed: {exc}") from exc
 
@@ -207,88 +316,134 @@ class PaimonStore:
         end_date: date | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        column = f"{vector_field}_embedding"
-        expected = {
-            "text": self.settings.text_vector_dimension,
-            "image": self.settings.image_vector_dimension,
-            "audio": self.settings.audio_vector_dimension,
+        table_key, column, expected = {
+            "text": (TEXT_TABLE, "text_embedding", self.settings.text_vector_dimension),
+            "image": (IMAGE_TABLE, "image_embedding", self.settings.image_vector_dimension),
+            "audio": (AUDIO_TABLE, "audio_embedding", self.settings.audio_vector_dimension),
         }[vector_field]
         if len(vector) != expected:
             raise ConfigurationError(
                 f"Vector dimension for {vector_field} must be {expected}, got {len(vector)}"
             )
-        raw = self._raw_table()
-        exact_predicate = self._search_predicate(business_domain, start_date, end_date)
+        exact_predicate = self._search_predicate(table_key, business_domain, start_date, end_date)
+        partition_predicate = self._partition_predicate(
+            table_key, business_domain, start_date, end_date
+        )
+        fetch_limit = max(limit * 5, 50)
         try:
-            search = (
-                raw.new_vector_search_builder()
+            result = (
+                self._raw_table(table_key)
+                .new_vector_search_builder()
                 .with_vector_column(column)
                 .with_query_vector(vector)
-                .with_limit(limit)
+                .with_limit(fetch_limit)
                 .with_filter(exact_predicate)
+                .with_partition_filter(partition_predicate)
+                .execute_local()
             )
-            result = search.execute_local()
-            return self._read(
+            rows = self._read(
+                table_key,
                 exact_predicate,
                 columns=SEARCH_COLUMNS,
-                limit=limit,
+                limit=fetch_limit,
                 global_index_result=result,
             )
+            return self._committed_hits(rows, limit)
         except Exception as exc:
             raise StorageError(f"Paimon vector search failed: {exc}") from exc
 
     def ping(self) -> None:
-        self._require_table()
+        for key in (ASSET_TABLE, TEXT_TABLE, IMAGE_TABLE, AUDIO_TABLE):
+            self._require_table(key)
         self.connection.catalog.list_tables(self.settings.paimon_database)
 
-    def _build_indexes(self) -> None:
-        table = self._require_table()
-        raw = table.raw_table
-        # These builds are incremental: PyPaimon skips already indexed row ranges.
-        raw.create_global_index("file_id", "btree")
-        raw.create_global_index("content_text", "full-text")
-        raw.create_global_index(
-            "text_embedding",
-            "ivf-flat",
-            options={"ivf-flat.dimension": str(self.settings.text_vector_dimension)},
-        )
-        raw.create_global_index(
-            "image_embedding",
-            "ivf-flat",
-            options={"ivf-flat.dimension": str(self.settings.image_vector_dimension)},
-        )
-        raw.create_global_index(
-            "audio_embedding",
-            "ivf-flat",
-            options={"ivf-flat.dimension": str(self.settings.audio_vector_dimension)},
+    def _table_options(self, *, has_vector: bool) -> dict[str, str]:
+        options = {
+            "bucket": "-1",
+            "deletion-vectors.enabled": "false",
+            "data-evolution.enabled": "true",
+            "row-tracking.enabled": "true",
+            "blob-as-descriptor": "true",
+            "file.compression": "zstd",
+            "target-file-size": "512 mb",
+            "global-index.row-count-per-shard": str(self.settings.paimon_index_row_count_per_shard),
+            "scalar-index.search-mode": "fast",
+            "full-text-index.search-mode": "fast",
+            "vector-index.search-mode": "fast",
+            "snapshot.time-retained": "72 h",
+            "snapshot.num-retained.min": "10",
+        }
+        if has_vector:
+            options.update({"vector.file.format": "vortex", "vector.target-file-size": "1 gb"})
+        return options
+
+    def _build_scalar_indexes(
+        self, table_key: str, btree_columns: list[str], bitmap_columns: list[str]
+    ) -> None:
+        raw = self._raw_table(table_key)
+        for column in btree_columns:
+            raw.create_global_index(column, "btree")
+        for column in bitmap_columns:
+            raw.create_global_index(column, "bitmap")
+
+    def _build_vector_index(self, table_key: str, column: str) -> None:
+        self._raw_table(table_key).create_global_index(
+            column, self.settings.paimon_vector_index_type
         )
 
-    def _validate_existing_table(self) -> None:
-        raw = self._raw_table()
-        actual_fields = {field.name for field in raw.fields}
-        required_fields = set(table_schema(self.settings).names)
-        missing = sorted(required_fields - actual_fields)
+    def _validate_existing_table(self, table_key: str, schema: pa.Schema) -> None:
+        raw = self._raw_table(table_key)
+        actual_fields = {field.name: field for field in raw.fields}
+        missing = sorted(set(schema.names) - set(actual_fields))
         if missing:
-            raise ConfigurationError(f"Existing Paimon table is missing columns: {missing}")
+            raise ConfigurationError(
+                f"Existing Paimon table {table_key} is missing columns: {missing}"
+            )
+        for field in schema:
+            if pa.types.is_fixed_size_list(field.type):
+                actual_dimension = getattr(actual_fields[field.name].type, "length", None)
+                if actual_dimension != field.type.list_size:
+                    raise ConfigurationError(
+                        f"Existing table {table_key}.{field.name} dimension must be "
+                        f"{field.type.list_size}, got {actual_dimension}"
+                    )
         if list(raw.partition_keys) != PARTITION_KEYS:
             raise ConfigurationError(
-                f"Existing table partitions must be {PARTITION_KEYS}, got {raw.partition_keys}"
+                f"Existing table {table_key} partitions must be {PARTITION_KEYS}, "
+                f"got {raw.partition_keys}"
             )
         options = raw.table_schema.options
         if options.get("bucket") != "-1":
-            raise ConfigurationError("Existing table must use bucket=-1 for generic global indexes")
+            raise ConfigurationError(
+                f"Existing table {table_key} must use bucket=-1 for global indexes"
+            )
         if options.get("deletion-vectors.enabled", "false").lower() != "false":
-            raise ConfigurationError("Existing table must disable deletion vectors")
+            raise ConfigurationError(f"Existing table {table_key} must disable deletion vectors")
+
+    def _committed_hits(self, rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        file_ids = list(dict.fromkeys(row["file_id"] for row in rows))
+        if not file_ids:
+            return []
+        builder = self._builder(ASSET_TABLE)
+        committed = self._read(
+            ASSET_TABLE,
+            builder.is_in("file_id", file_ids),
+            columns=["file_id"],
+            limit=len(file_ids),
+        )
+        committed_ids = {row["file_id"] for row in committed}
+        return [row for row in rows if row["file_id"] in committed_ids][:limit]
 
     def _read(
         self,
+        table_key: str,
         predicate,
         *,
         columns: list[str],
         limit: int,
         global_index_result=None,
     ) -> list[dict[str, Any]]:
-        raw = self._raw_table()
+        raw = self._raw_table(table_key)
         read_builder = raw.new_read_builder().with_projection(columns).with_limit(limit)
         if predicate is not None:
             read_builder = read_builder.with_filter(predicate)
@@ -299,32 +454,46 @@ class PaimonStore:
         return read_builder.new_read().to_arrow(plan.splits()).to_pylist()
 
     def _search_predicate(
-        self, business_domain: str, start_date: date | None, end_date: date | None
+        self,
+        table_key: str,
+        business_domain: str,
+        start_date: date | None,
+        end_date: date | None,
     ):
-        builder = self._builder()
-        predicates = [builder.equal("business_domain", business_domain)]
+        builder = self._builder(table_key)
+        predicates = self._domain_predicates(builder, business_domain)
         predicates.extend(self._date_predicates(builder, start_date, end_date))
         return PredicateBuilder.and_predicates(predicates)
 
     def _partition_predicate(
         self,
+        table_key: str,
         business_domain: str,
-        department: str | None,
         start_date: date | None,
         end_date: date | None,
     ):
-        raw = self._raw_table()
+        raw = self._raw_table(table_key)
         builder = PredicateBuilder(raw.partition_keys_fields)
-        predicates = [builder.equal("business_domain", business_domain)]
-        if department:
-            predicates.append(builder.equal("department", department))
-        if start_date:
-            predicates.append(
-                builder.greater_or_equal("upload_month", start_date.strftime("%Y-%m"))
+        predicates = [
+            builder.equal(
+                "domain_shard",
+                domain_shard(business_domain, self.settings.paimon_domain_shards),
             )
+        ]
+        if start_date:
+            predicates.append(builder.greater_or_equal("ingest_date", start_date.isoformat()))
         if end_date:
-            predicates.append(builder.less_or_equal("upload_month", end_date.strftime("%Y-%m")))
+            predicates.append(builder.less_or_equal("ingest_date", end_date.isoformat()))
         return PredicateBuilder.and_predicates(predicates)
+
+    def _domain_predicates(self, builder: PredicateBuilder, business_domain: str) -> list[Any]:
+        return [
+            builder.equal("business_domain", business_domain),
+            builder.equal(
+                "domain_shard",
+                domain_shard(business_domain, self.settings.paimon_domain_shards),
+            ),
+        ]
 
     @staticmethod
     def _date_predicates(
@@ -334,17 +503,19 @@ class PaimonStore:
         if start_date:
             values.append(builder.greater_or_equal("created_at", start_date.isoformat()))
         if end_date:
-            next_day = end_date + timedelta(days=1)
-            values.append(builder.less_than("created_at", next_day.isoformat()))
+            values.append(
+                builder.less_than("created_at", (end_date + timedelta(days=1)).isoformat())
+            )
         return values
 
-    def _builder(self) -> PredicateBuilder:
-        return PredicateBuilder(self._raw_table().fields)
+    def _builder(self, table_key: str) -> PredicateBuilder:
+        return PredicateBuilder(self._raw_table(table_key).fields)
 
-    def _raw_table(self):
-        return self._require_table().raw_table
+    def _raw_table(self, table_key: str):
+        return self._require_table(table_key).raw_table
 
-    def _require_table(self):
-        if self.table is None:
-            raise StorageError("Paimon table is not initialized")
-        return self.table
+    def _require_table(self, table_key: str):
+        try:
+            return self.tables[table_key]
+        except KeyError as exc:
+            raise StorageError(f"Paimon table {table_key} is not initialized") from exc

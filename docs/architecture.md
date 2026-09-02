@@ -4,102 +4,76 @@
 
 ```mermaid
 flowchart TB
-    subgraph S["服务层：单个 Python 容器"]
-        API["FastAPI / OpenAPI"]
-        X["提取、切片、模型调用"]
-        Q["查询与下载编排"]
-        API --> X
-        API --> Q
-    end
-    subgraph P["Paimon 2.0 存储层"]
-        T["multimodal_assets 追加表"]
-        I["BTree / Full-Text / IVF-Flat"]
-        T --> I
-    end
-    subgraph M["MinIO 底层存储"]
-        O["morphlake-data 原文件"]
-        W["morphlake-paimon warehouse"]
-    end
-    X --> O
-    X --> T
-    Q --> T
-    Q --> O
-    T --> W
+    C["用户或应用"] --> S["MorphLake Python / FastAPI\n单容器"]
+    S --> O["MinIO 数据桶\n原始文件"]
+    S --> P["Paimon 四表模型\n描述符、文本、图片、音频"]
+    S --> G["配置化模型\n嵌入与转写"]
+    P --> W["MinIO Paimon warehouse"]
 ```
 
-服务容器直接使用 PyPaimon 批写 API 提交数据和增量构建全局索引。没有常驻 Flink 或 Spark
-作业，也没有 Milvus、Elasticsearch 或任务队列。
+工程不引入 Spark、Milvus、Elasticsearch 或任务队列。服务容器使用 PyPaimon 直接写入并
+查询 Paimon 2.0；索引维护也是该容器内的轻量后台循环，不需要常驻 Flink 作业。
 
-## 上传时序与一致性
+## 面向 100,000,000 条/日的模型
+
+十年理论总量约 3650 亿条。工程不按“部门 × 类型 × 日期”组合创建物理表，否则表数量、
+元数据和运维复杂度会随组织变化持续膨胀。固定使用四张不同粒度的表：资产描述符、文本
+切片、图片特征、音频特征。
+
+四表统一按 `ingest_date / domain_shard` 分区，其中 `domain_shard` 是业务域 SHA-256 的稳定
+哈希模 32。业务部门、业务域和媒体类型使用 Bitmap 索引，保留精确业务过滤能力而不形成
+高基数目录。所有表使用 `bucket=-1`，由全局索引分片控制索引规模。
+
+## 启动与上传时序
 
 ```mermaid
 sequenceDiagram
-    participant C as 客户端
     participant A as MorphLake
     participant M as MinIO
-    participant G as 模型 API
+    participant G as 模型
     participant P as Paimon
-    C->>A: 文件 + 业务域 + 部门
-    A->>M: 写原始文件
-    A->>G: 提取后向量化
-    A->>P: 一批写文件行和切片行
-    A->>P: 增量构建原生索引
-    alt Paimon 阶段失败
-        A->>M: 补偿删除原文件
-        A-->>C: 稳定错误响应
-    else 成功
-        A-->>C: 201 + 文件描述符
-    end
+    A->>M: 检查/创建 bucket
+    A->>P: 自动创建并校验四张表
+    A->>M: 上传原始文件
+    A->>G: 提取、切片、向量化
+    A->>P: 写特征/切片表
+    A->>P: 最后写资产描述符
+    A-->>A: 定时增量构建原生索引
 ```
 
-一个上传请求内，文件描述行和所有切片行在同一个 Paimon 批提交中完成。索引随后同步增量
-构建。进程内写锁避免单容器内的并发提交冲突，因此容器固定为一个 worker。扩展到多个副本
-前，应引入 Paimon 提交冲突重试和分布式写协调；这不属于首版简单部署范围。
+资产描述符是文件对外可见的提交标记。特征行先写，描述符最后写；全文和向量结果还会
+回查描述符表。若多表写入在最后阶段失败，MinIO 对象会补偿删除，未发布的孤立特征不会
+出现在检索结果中。Paimon 表之间没有跨表 ACID 事务，因此这是一种明确的可见性协议。
 
-## Descriptor‑Only
+## Descriptor-Only
 
-MinIO `morphlake-data` bucket 保存原始二进制；Paimon 只保存：
+原始 Word、PDF、图片和音频二进制只保存到 `morphlake-data`。资产表只保存 bucket、object
+key、ETag、大小、SHA-256 和业务元数据；Paimon warehouse 保存提取文本、固定维向量和
+索引，不复制文件二进制。
 
-- `object_bucket`、`object_key`、`object_etag`、`file_size`；
-- 文件业务元数据；
-- 提取后的文本、切片位置；
-- 模型向量。
+## 索引维护
 
-因此 Paimon 表不会复制 Word、PDF、图片或音频二进制。
+上传请求不再同步重建索引。服务启动后按 `PAIMON_INDEX_BUILD_INTERVAL_SECONDS` 定时调用
+PyPaimon 增量索引构建，已索引 row range 会跳过。默认 300 秒，MacBook Ollama 测试配置为
+30 秒。该设计降低请求延迟和高并发写入时的索引提交冲突。
 
-## 分区、桶与索引
+| 表 | 原生索引 |
+| --- | --- |
+| 资产描述符 | file_id BTree；业务域/部门/类型 Bitmap |
+| 文本切片 | file_id BTree；业务字段 Bitmap；content_text Full-Text；text_embedding IVF-SQ |
+| 图片特征 | file_id BTree；业务字段 Bitmap；image_embedding IVF-SQ |
+| 音频特征 | file_id BTree；业务字段 Bitmap；audio_embedding IVF-SQ |
 
-| 项目 | 选择 | 原因 |
-| --- | --- | --- |
-| 分区 | 业务域 / 部门 / 上传月份 | 业务隔离和日期裁剪，避免日分区过碎 |
-| 桶 | `-1`（unaware） | PyPaimon 2.0 通用全文/向量全局索引的约束 |
-| 删除向量 | 关闭 | 通用全局索引的约束 |
-| 写模式 | append-only | 避免更新/删除破坏索引约束 |
-| 文件 ID | BTree 全局索引 | 下载和文件定位 |
-| 文本 | Full-Text 全局索引 | 原生全文搜索 |
-| 向量 | 每模态一个 IVF-Flat | 文本、图片、音频维度可独立配置 |
+默认搜索模式为 `fast`，因此新写入数据会在下一次索引维护完成后进入全文/向量 TopK；清单
+和下载不受此延迟影响。若本地测试需要更快可缩短间隔，生产环境应根据每批行数和索引耗时
+调整，而不是每次上传构建。
 
-全文检索先以业务域和月份分区裁剪，再在读回结果时应用精确日期边界。向量检索将业务域和
-日期谓词直接交给向量搜索构建器。
+## 生产注意事项
 
-## 模型接入
-
-`config/models.yaml` 定义四条路由：文本向量、图片向量、音频转写、音频向量。
-
-- `hash`：开发/CI 使用的确定性向量，不具备真实语义能力；
-- `openai_compatible`：调用 `/v1/embeddings`；
-- 音频转写调用 `/v1/audio/transcriptions`；
-- `none`：关闭音频转写。
-
-YAML 支持 `${ENV_NAME:-default}` 插值。生产模型返回维度必须与 Paimon 环境变量一致，服务
-会在启动和请求时校验。
-
-## 生产清单
-
-1. 给 MorphLake 使用专用 MinIO 账号，只授予两个 bucket 的必要权限。
-2. 设置 `MORPHLAKE_API_KEY`，并在入口网关启用 TLS、限流和审计。
-3. 把 YAML 中的 hash provider 替换为实际模型 API。
-4. 固定一个容器副本/worker；扩容前先验证提交协调方案。
-5. 对 MinIO 开启版本控制、生命周期和跨站备份，对 Paimon warehouse 做一致性备份。
-6. 监控 `/health/ready`、请求延迟、模型错误、Paimon 提交失败和 MinIO 容量。
-7. 用实际业务域/部门基数做分区和小文件压测；必要时设计离线 compact 维护窗口。
+1. 以真实日写入量压测每日分区文件数、索引耗时和查询 P99，并调整分片数；既有表的分片
+   算法与数量不能直接在线变更。
+2. 固定一个服务 worker。扩展为多副本前，应增加 Paimon 提交冲突重试和写入协调。
+3. 为 MinIO 开启版本控制、容量告警、跨站备份和生命周期策略；十年保留应由合规策略确认。
+4. 监控索引维护失败、最近成功时间、模型错误、Paimon 提交、MinIO 容量和小文件数量。
+5. 规划离线 compact 与过期分区维护窗口；维护任务可按需使用短生命周期 Flink 作业，但不
+   需要常驻作业。

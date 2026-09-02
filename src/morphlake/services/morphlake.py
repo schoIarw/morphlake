@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import mimetypes
 import re
@@ -13,6 +14,7 @@ from typing import Any
 from morphlake.config import Settings
 from morphlake.errors import ConfigurationError, MorphLakeError
 from morphlake.models import FullTextSearchRequest, VectorSearchRequest
+from morphlake.partitioning import domain_shard
 from morphlake.services.embeddings import ModelGateway
 from morphlake.services.extractors import chunk_text, classify, extract_text
 from morphlake.services.minio_store import MinioStore
@@ -77,7 +79,7 @@ class MorphLakeService:
         object_key = self._object_key(business_domain, department, created_at, file_id, filename)
         stored = self.objects.put(object_key, body, content_type)
         try:
-            records = self._records(
+            asset, text_segments, image_features, audio_features = self._records(
                 file_id=file_id,
                 filename=filename,
                 content_type=content_type,
@@ -88,8 +90,13 @@ class MorphLakeService:
                 created_at=created_at,
                 stored=stored,
             )
-            self.catalog.add(records)
-            return records[0]
+            self.catalog.add(
+                asset=asset,
+                text_segments=text_segments,
+                image_features=image_features,
+                audio_features=audio_features,
+            )
+            return asset
         except Exception:
             self.objects.delete(object_key)
             raise
@@ -179,6 +186,9 @@ class MorphLakeService:
                 checks[name] = f"error: {exc}"
         return checks
 
+    def maintain(self) -> None:
+        self.catalog.maintain_indexes()
+
     def _records(
         self,
         *,
@@ -191,67 +201,118 @@ class MorphLakeService:
         department: str,
         created_at: datetime,
         stored,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[
+        dict[str, Any],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         chunks = []
-        file_text = None
-        text_vector = image_vector = audio_vector = None
+        transcript = None
+        image_vector = audio_vector = None
         if media_type == "document":
-            file_text = extract_text(filename, body)
-            chunks = chunk_text(file_text, self.models.chunk_size, self.models.chunk_overlap)
+            text = extract_text(filename, body)
+            chunks = chunk_text(text, self.models.chunk_size, self.models.chunk_overlap)
         elif media_type == "image":
-            file_text = filename
             image_vector = self.models.embed_image(body, content_type)
         elif media_type == "audio":
-            file_text = self.models.transcribe_audio(filename, body, content_type)
+            transcript = self.models.transcribe_audio(filename, body, content_type)
             audio_vector = self.models.embed_audio(body)
-            if file_text:
-                text_vector = self.models.embed_text(file_text)
 
-        base = {
+        shard = domain_shard(business_domain, self.settings.paimon_domain_shards)
+        ingest_date = created_at.date().isoformat()
+        common = {
             "file_id": file_id,
             "business_domain": business_domain,
             "department": department,
-            "upload_month": created_at.strftime("%Y-%m"),
+            "domain_shard": shard,
+            "ingest_date": ingest_date,
             "created_at": created_at.isoformat(),
             "filename": filename,
             "media_type": media_type,
+        }
+        text_segments = []
+        text_spec = self.models.specs["text_embedding"]
+        for chunk in chunks:
+            text_segments.append(
+                {
+                    **common,
+                    "segment_id": f"{file_id}:{chunk.index}",
+                    "record_type": "chunk",
+                    "chunk_index": chunk.index,
+                    "content_text": chunk.text,
+                    "segment_type": "document_chunk",
+                    "chunk_start": chunk.start,
+                    "chunk_end": chunk.end,
+                    "embedding_model": text_spec.model,
+                    "embedding_version": "configured",
+                    "text_embedding": self.models.embed_text(chunk.text),
+                }
+            )
+        if transcript:
+            text_segments.append(
+                {
+                    **common,
+                    "segment_id": f"{file_id}:transcript:0",
+                    "record_type": "chunk",
+                    "chunk_index": 0,
+                    "content_text": transcript,
+                    "segment_type": "audio_transcript",
+                    "chunk_start": 0,
+                    "chunk_end": len(transcript),
+                    "embedding_model": text_spec.model,
+                    "embedding_version": "configured",
+                    "text_embedding": self.models.embed_text(transcript),
+                }
+            )
+
+        image_features = []
+        if image_vector is not None:
+            image_spec = self.models.specs["image_embedding"]
+            image_features.append(
+                {
+                    **common,
+                    "feature_id": f"{file_id}:image:0",
+                    "record_type": "file",
+                    "chunk_index": None,
+                    "content_text": filename,
+                    "feature_type": "whole_image",
+                    "embedding_model": image_spec.model,
+                    "embedding_version": "configured",
+                    "image_embedding": image_vector,
+                }
+            )
+
+        audio_features = []
+        if audio_vector is not None:
+            audio_spec = self.models.specs["audio_embedding"]
+            audio_features.append(
+                {
+                    **common,
+                    "feature_id": f"{file_id}:audio:0",
+                    "record_type": "file",
+                    "chunk_index": None,
+                    "content_text": transcript,
+                    "feature_type": "whole_audio",
+                    "start_ms": None,
+                    "end_ms": None,
+                    "embedding_model": audio_spec.model,
+                    "embedding_version": "configured",
+                    "audio_embedding": audio_vector,
+                }
+            )
+
+        asset = {
+            **common,
             "content_type": content_type,
             "file_size": len(body),
+            "content_sha256": hashlib.sha256(body).hexdigest(),
             "object_bucket": stored.bucket,
             "object_key": stored.key,
             "object_etag": stored.etag,
-            "chunk_count": len(chunks),
+            "chunk_count": len(text_segments),
         }
-        records = [
-            {
-                **base,
-                "row_id": file_id,
-                "record_type": "file",
-                "chunk_index": None,
-                "chunk_start": None,
-                "chunk_end": None,
-                "content_text": file_text if media_type != "document" else None,
-                "text_embedding": text_vector,
-                "image_embedding": image_vector,
-                "audio_embedding": audio_vector,
-            }
-        ]
-        for chunk in chunks:
-            records.append(
-                {
-                    **base,
-                    "row_id": f"{file_id}:{chunk.index}",
-                    "record_type": "chunk",
-                    "chunk_index": chunk.index,
-                    "chunk_start": chunk.start,
-                    "chunk_end": chunk.end,
-                    "content_text": chunk.text,
-                    "text_embedding": self.models.embed_text(chunk.text),
-                    "image_embedding": None,
-                    "audio_embedding": None,
-                }
-            )
-        return records
+        return asset, text_segments, image_features, audio_features
 
     def _validate_dimensions(self) -> None:
         mapping = {

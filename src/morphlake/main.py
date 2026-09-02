@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -30,9 +31,21 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        maintenance_task = None
         if initialize:
             service.initialize()
-        yield
+            maintenance_task = asyncio.create_task(
+                _index_maintenance_loop(
+                    service,
+                    settings.paimon_index_build_interval_seconds,
+                )
+            )
+        try:
+            yield
+        finally:
+            if maintenance_task is not None:
+                maintenance_task.cancel()
+                await asyncio.gather(maintenance_task, return_exceptions=True)
 
     application = FastAPI(
         title="MorphLake API",
@@ -78,6 +91,17 @@ def create_app(
         )
 
     return application
+
+
+async def _index_maintenance_loop(service: MorphLakeService, interval_seconds: int) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await asyncio.to_thread(service.maintain)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Scheduled Paimon index maintenance failed")
 
 
 app = create_app()

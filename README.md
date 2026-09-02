@@ -10,9 +10,9 @@ Milvus、Elasticsearch，也不依赖常驻 Flink 作业。
 ## 设计目标
 
 - **简单**：服务、写入和索引构建都在一个 Python 容器内完成。
-- **稳定**：一个追加型 Paimon 表、同步提交、单进程写锁；不维护常驻计算作业。
+- **稳定**：四张固定粒度的追加型 Paimon 表、单进程写锁；不维护常驻计算作业。
 - **Descriptor‑Only**：文件二进制只存 MinIO；Paimon 保存对象引用、元数据、文本和向量。
-- **原生检索**：全文使用 Paimon `full-text`，向量使用 Paimon `ivf-flat` 全局索引。
+- **原生检索**：全文使用 Paimon `full-text`，向量默认使用 Paimon `ivf-sq` 全局索引。
 - **配置驱动模型**：模型提供方、地址、模型名、维度、超时均在 YAML/环境变量中配置。
 
 ```mermaid
@@ -119,8 +119,8 @@ curl http://localhost:8080/health/ready
 ```
 
 容器通过 Docker Desktop 的 `host.docker.internal:11434` 访问 Mac 上的 Ollama。本配置使用
-独立的 Paimon 表 `multimodal_assets_ollama`，避免与默认 384/512 维索引混用。不要在已有
-Paimon 向量表上直接修改维度。
+一套带 `_ollama` 后缀的四张 Paimon 表，避免与默认 384/512 维索引混用。不要在已有 Paimon
+向量表上直接修改维度。
 
 ### 2. 启动单容器
 
@@ -132,8 +132,9 @@ curl http://localhost:8080/health/ready
 容器启动时会：
 
 1. 检查并创建两个 MinIO bucket（需要账号具有相应权限）；
-2. 创建 `morphlake.multimodal_assets` 表；
-3. 校验已存在表的字段、分区、`bucket=-1` 和 deletion-vector 设置。
+2. 自动创建资产描述符、文本切片、图片特征和音频特征四张 Paimon 表；
+3. 校验已存在表的字段、`ingest_date/domain_shard` 分区、`bucket=-1` 和 deletion-vector；
+4. 启动定时增量索引维护；上传请求本身不重建索引。
 
 ### 3. 上传并查询
 
@@ -211,11 +212,12 @@ curl -OJ \
 [docs/table-model.md](docs/table-model.md)，架构和生产注意事项见
 [docs/architecture.md](docs/architecture.md)。启动后也可访问 `/docs` 查看 OpenAPI UI。
 
-## 为什么使用 unaware bucket
+## 海量数据分区与 unaware bucket
 
-表按 `business_domain / department / upload_month` 分区，并设置 `bucket=-1`。这是有意选择：
-PyPaimon 2.0 的通用全文和向量全局索引要求 unaware bucket，固定桶会被拒绝。分区承担主要
-数据裁剪职责；月份分区避免日粒度小文件爆炸，同时业务域和部门提供物理隔离。
+四表统一按 `ingest_date / domain_shard` 分区，并设置 `bucket=-1`。`domain_shard` 是业务域的
+稳定哈希模 32；部门、业务域和媒体类型使用 Bitmap 索引，不按“部门 × 模态 × 日期”动态
+分表。这样在每天 1 亿条、十年约 3650 亿条的规划下，表数量仍固定，日期裁剪与索引分片也
+可独立维护。PyPaimon 2.0 的通用全文和向量全局索引要求 unaware bucket，固定桶会被拒绝。
 
 通用全局索引同时要求关闭 deletion vectors，因此表采用追加模式。首个版本不提供删除/更新
 接口；如后续需要数据撤回，应设计软删除字段和定期重写流程，而不是破坏当前索引约束。
@@ -231,7 +233,7 @@ ruff check .
 pytest -q
 ```
 
-带原生 Paimon 全文和 IVF‑Flat 的集成测试使用本地临时 warehouse，不连接真实 MinIO。
+带原生 Paimon 全文和向量索引的集成测试使用本地临时 warehouse，不连接真实 MinIO。
 Docker 镜像构建也包含在 GitHub Actions 中。
 
 ## 目录
