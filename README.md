@@ -64,6 +64,64 @@ PAIMON_WAREHOUSE=s3://morphlake-paimon/warehouse
 生产环境应修改 `config/models.yaml`，把对应 `provider` 改为
 `openai_compatible`，并设置 `EMBEDDING_API_BASE`、`EMBEDDING_API_KEY` 和模型名称。
 
+### MacBook + Ollama 本地测试
+
+工程提供独立的 `config/models.ollama.yaml`、`.env.ollama.example` 和
+`docker-compose.ollama.yml`，不会改变默认或生产模型配置。模型映射如下：
+
+| 数据类型 | Ollama 链路 | 向量维度 |
+| --- | --- | --- |
+| 文档 | `nomic-embed-text:latest` | 768 |
+| 图片 | `minicpm-v:8b` 生成检索描述，再由 `nomic-embed-text:latest` 向量化 | 768 |
+| 音频 | 本地测试使用确定性 hash；当前所列 Ollama 模型没有音频语义嵌入能力 | 384 |
+
+你当前列出的模型已经包含本配置所需的两个模型。新机器可用以下命令下载或校验：
+
+```bash
+ollama pull nomic-embed-text:latest
+ollama pull minicpm-v:8b
+ollama list
+```
+
+Ollama macOS 应用通常会自动启动服务；若没有运行，可执行：
+
+```bash
+ollama serve
+```
+
+先在 Mac 终端验证文本向量和视觉模型：
+
+```bash
+curl http://localhost:11434/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nomic-embed-text:latest","input":"多模态数据底座测试"}'
+
+IMAGE_BASE64=$(base64 < ./test.png | tr -d '\n')
+curl http://localhost:11434/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"minicpm-v:8b",
+    "messages":[{
+      "role":"user",
+      "content":"请描述图片中的对象和文字",
+      "images":["'"$IMAGE_BASE64"'"]
+    }],
+    "stream":false
+  }'
+```
+
+启动 MorphLake 前复制本地配置，并填写可访问的 MinIO 地址和凭据：
+
+```bash
+cp .env.ollama.example .env.ollama
+docker compose -f docker-compose.ollama.yml up --build -d
+curl http://localhost:8080/health/ready
+```
+
+容器通过 Docker Desktop 的 `host.docker.internal:11434` 访问 Mac 上的 Ollama。本配置使用
+独立的 Paimon 表 `multimodal_assets_ollama`，避免与默认 384/512 维索引混用。不要在已有
+Paimon 向量表上直接修改维度。
+
 ### 2. 启动单容器
 
 ```bash

@@ -1,0 +1,10 @@
+services:
+  morphlake:
+    build: .
+    image: morphlake:ollama-local
+    env_file: .env.ollama
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/models.ollama.yaml:/app/config/models.ollama.yaml:ro
+    restart: unless-stopped

@@ -1,0 +1,37 @@
+# Local MacBook test profile. MorphLake runs in Docker while Ollama runs on
+# macOS, so the container reaches it through host.docker.internal.
+models:
+  text_embedding:
+    provider: openai_compatible
+    model: "${TEXT_EMBEDDING_MODEL:-nomic-embed-text:latest}"
+    base_url: "${OLLAMA_OPENAI_BASE_URL:-http://host.docker.internal:11434/v1}"
+    api_key: ollama
+    dimension: 768
+    timeout_seconds: 120
+
+  # Ollama embeddings accept text only. The image is first described by the
+  # local vision model, then that description is embedded with text_embedding.
+  image_embedding:
+    provider: ollama_vision_caption
+    model: "${IMAGE_VISION_MODEL:-minicpm-v:8b}"
+    base_url: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+    api_key: ""
+    dimension: 768
+    timeout_seconds: 300
+
+  # The listed local Ollama models do not provide audio transcription.
+  audio_transcription:
+    provider: none
+    model: none
+
+  # Deterministic smoke-test vector only; replace this route with a semantic
+  # audio embedding endpoint before evaluating audio retrieval quality.
+  audio_embedding:
+    provider: hash
+    model: morphlake-hash-audio-v1
+    dimension: 384
+    timeout_seconds: 120
+
+chunking:
+  size: 800
+  overlap: 120

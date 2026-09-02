@@ -41,6 +41,8 @@ class ModelGateway:
         spec = self._spec("image_embedding")
         if spec.provider == "hash":
             return _hash_embedding(body, self._dimension(spec))
+        if spec.provider == "ollama_vision_caption":
+            return self._ollama_vision_embedding(spec, body)
         data_url = f"data:{content_type};base64,{base64.b64encode(body).decode('ascii')}"
         return self._openai_embedding(spec, data_url)
 
@@ -100,6 +102,45 @@ class ModelGateway:
         if len(vector) != self._dimension(spec):
             raise StorageError(
                 f"Model {spec.model} returned dimension {len(vector)}; expected {spec.dimension}"
+            )
+        return vector
+
+    def _ollama_vision_embedding(self, spec: ModelSpec, body: bytes) -> list[float]:
+        """Describe an image with Ollama vision, then embed that description as text."""
+        if not spec.base_url:
+            raise ConfigurationError(f"base_url is required for model {spec.model}")
+        try:
+            response = httpx.post(
+                f"{spec.base_url.rstrip('/')}/api/chat",
+                headers=self._headers(spec),
+                json={
+                    "model": spec.model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Describe this image for semantic retrieval. Include visible "
+                                "text (OCR), objects, scene, layout, and key attributes. Be "
+                                "factual and concise."
+                            ),
+                            "images": [base64.b64encode(body).decode("ascii")],
+                        }
+                    ],
+                    "stream": False,
+                    "options": {"temperature": 0},
+                },
+                timeout=spec.timeout_seconds,
+            )
+            response.raise_for_status()
+            caption = response.json()["message"]["content"].strip()
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            raise StorageError(f"Ollama vision request failed for {spec.model}: {exc}") from exc
+        if not caption:
+            raise StorageError(f"Ollama vision model {spec.model} returned an empty description")
+        vector = self.embed_text(caption)
+        if len(vector) != self._dimension(spec):
+            raise StorageError(
+                f"Image pipeline returned dimension {len(vector)}; expected {spec.dimension}"
             )
         return vector
 
