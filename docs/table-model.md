@@ -73,7 +73,7 @@ feature_id、file_id、公共业务/分区/结果字段、feature_type、时间�
 
 ## 5. multimodal_transfer_audit
 
-一条上传、下载或限流拒绝事件一行。SQLite 作为实时 outbox 和天/周/月汇总缓存；API 后台
+一条上传、下载或限流拒绝事件一行。管理数据库作为实时 outbox 和天/周/月汇总缓存；API 后台
 将 outbox 批量追加到本表，形成长期审计明细。
 
 | 字段组 | 主要字段 |
@@ -85,7 +85,7 @@ feature_id、file_id、公共业务/分区/结果字段、feature_type、时间�
 | 客户端 | client_ip, user_agent |
 
 索引：event_id、token_id、file_id BTree；业务域、部门、操作和状态 Bitmap。表不保存 Token
-明文、使用人姓名和手机号码；人员信息只保留在受管理权限保护的 SQLite 中。
+明文、使用人姓名和手机号码；人员信息只保留在受管理权限保护的管理数据库中。
 
 ## 表参数
 

@@ -1,20 +1,46 @@
-"""SQLite-backed token administration, rate limiting, and transfer outbox."""
+"""Portable token administration, rate limiting, and transfer outbox storage."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
 import secrets
-import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    Column,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    and_,
+    case,
+    delete,
+    func,
+    insert,
+    inspect,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Connection, Engine
+
 from morphlake.config import Settings
+from morphlake.database import DatabaseConfig, create_management_engine, load_database_config
 from morphlake.errors import MorphLakeError
 from morphlake.partitioning import domain_shard
 
@@ -48,95 +74,142 @@ class RateDecision:
     reset_at_epoch: int
 
 
+METADATA = MetaData()
+
+API_TOKENS = Table(
+    "api_tokens",
+    METADATA,
+    Column("token_id", String(36), primary_key=True),
+    Column("token_hash", String(64), nullable=False, unique=True),
+    Column("token_prefix", String(16), nullable=False),
+    Column("business_domain", String(255), nullable=False),
+    Column("department", String(255), nullable=False),
+    Column("assignee_name", String(255), nullable=False),
+    Column("phone", String(64), nullable=False),
+    Column("notes", Text, nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("allocated_by", String(255), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+    Column("expires_at", String(40)),
+    Column("last_used_at", String(40)),
+    Column("period_seconds", Integer, nullable=False),
+    Column("upload_requests_limit", BigInteger, nullable=False),
+    Column("download_requests_limit", BigInteger, nullable=False),
+    Column("upload_bytes_limit", BigInteger, nullable=False),
+    Column("download_bytes_limit", BigInteger, nullable=False),
+    CheckConstraint("status IN ('active','disabled','deleted')", name="ck_api_tokens_status"),
+)
+Index(
+    "idx_api_tokens_scope",
+    API_TOKENS.c.business_domain,
+    API_TOKENS.c.department,
+    API_TOKENS.c.status,
+)
+
+RATE_COUNTERS = Table(
+    "rate_counters",
+    METADATA,
+    Column("token_id", String(36), primary_key=True),
+    Column("operation", String(16), primary_key=True),
+    Column("window_start", BigInteger, primary_key=True),
+    Column("request_count", BigInteger, nullable=False),
+    Column("byte_count", BigInteger, nullable=False),
+    CheckConstraint("operation IN ('upload','download')", name="ck_rate_counters_operation"),
+)
+
+TRANSFER_EVENTS = Table(
+    "transfer_events",
+    METADATA,
+    Column("event_id", String(36), primary_key=True),
+    Column("token_id", String(36), nullable=False),
+    Column("token_prefix", String(16), nullable=False),
+    Column("operation", String(16), nullable=False),
+    Column("business_domain", String(255), nullable=False),
+    Column("department", String(255), nullable=False),
+    Column("domain_shard", Integer, nullable=False),
+    Column("ingest_date", String(10), nullable=False),
+    Column("occurred_at", String(40), nullable=False),
+    Column("file_id", String(64)),
+    Column("filename", Text, nullable=False),
+    Column("media_type", String(32)),
+    Column("byte_count", BigInteger, nullable=False),
+    Column("duration_ms", BigInteger, nullable=False),
+    Column("status", String(32), nullable=False),
+    Column("error_code", String(128)),
+    Column("client_ip", String(64)),
+    Column("user_agent", String(512)),
+    Column("claim_id", String(36)),
+    Column("claimed_at", String(40)),
+    Column("synced_at", String(40)),
+    CheckConstraint("operation IN ('upload','download')", name="ck_transfer_events_operation"),
+)
+Index("idx_transfer_events_unsynced", TRANSFER_EVENTS.c.synced_at, TRANSFER_EVENTS.c.occurred_at)
+Index(
+    "idx_transfer_events_scope_time",
+    TRANSFER_EVENTS.c.business_domain,
+    TRANSFER_EVENTS.c.department,
+    TRANSFER_EVENTS.c.occurred_at,
+)
+
+TRANSFER_DAILY_STATS = Table(
+    "transfer_daily_stats",
+    METADATA,
+    Column("stat_date", String(10), primary_key=True),
+    Column("token_id", String(36), primary_key=True),
+    Column("token_prefix", String(16), nullable=False),
+    Column("business_domain", String(255), nullable=False),
+    Column("department", String(255), nullable=False),
+    Column("operation", String(16), primary_key=True),
+    Column("status", String(32), primary_key=True),
+    Column("request_count", BigInteger, nullable=False),
+    Column("byte_count", BigInteger, nullable=False),
+)
+
+SYSTEM_CONFIG = Table(
+    "system_config",
+    METADATA,
+    Column("config_key", String(128), primary_key=True),
+    Column("config_value", Text, nullable=False),
+    Column("description", Text, nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+
 class AdminStore:
-    """Small, transactional management database for a single service container."""
+    """Transactional management store supporting SQLite, MySQL, and PostgreSQL."""
+
+    _SCHEMA_LOCK_ID = 6_735_984_797_511_706_337
+    _SCHEMA_LOCK_NAME = "morphlake_management_schema"
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.path = Path(settings.admin_db_path)
+        self.database: DatabaseConfig = load_database_config(
+            settings.admin_db_config, settings.admin_db_path
+        )
+        self.backend = self.database.backend
+        self._engine: Engine | None = None
         self._lock = threading.RLock()
 
     def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS api_tokens (
-                    token_id TEXT PRIMARY KEY,
-                    token_hash TEXT NOT NULL UNIQUE,
-                    token_prefix TEXT NOT NULL,
-                    business_domain TEXT NOT NULL,
-                    department TEXT NOT NULL,
-                    assignee_name TEXT NOT NULL,
-                    phone TEXT NOT NULL,
-                    notes TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL CHECK (status IN ('active','disabled','deleted')),
-                    allocated_by TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    expires_at TEXT,
-                    last_used_at TEXT,
-                    period_seconds INTEGER NOT NULL,
-                    upload_requests_limit INTEGER NOT NULL,
-                    download_requests_limit INTEGER NOT NULL,
-                    upload_bytes_limit INTEGER NOT NULL,
-                    download_bytes_limit INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_api_tokens_scope
-                    ON api_tokens (business_domain, department, status);
+        """Create the database, tables, migrations, and required seed values idempotently."""
+        with self._lock:
+            if self._engine is None:
+                self._engine = create_management_engine(self.database)
+            self._initialize_schema()
 
-                CREATE TABLE IF NOT EXISTS rate_counters (
-                    token_id TEXT NOT NULL,
-                    operation TEXT NOT NULL CHECK (operation IN ('upload','download')),
-                    window_start INTEGER NOT NULL,
-                    request_count INTEGER NOT NULL,
-                    byte_count INTEGER NOT NULL,
-                    PRIMARY KEY (token_id, operation, window_start)
-                );
+    def close(self) -> None:
+        if self._engine is not None:
+            self._engine.dispose()
 
-                CREATE TABLE IF NOT EXISTS transfer_events (
-                    event_id TEXT PRIMARY KEY,
-                    token_id TEXT NOT NULL,
-                    token_prefix TEXT NOT NULL,
-                    operation TEXT NOT NULL CHECK (operation IN ('upload','download')),
-                    business_domain TEXT NOT NULL,
-                    department TEXT NOT NULL,
-                    domain_shard INTEGER NOT NULL,
-                    ingest_date TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    file_id TEXT,
-                    filename TEXT NOT NULL,
-                    media_type TEXT,
-                    byte_count INTEGER NOT NULL,
-                    duration_ms INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    error_code TEXT,
-                    client_ip TEXT,
-                    user_agent TEXT,
-                    claim_id TEXT,
-                    claimed_at TEXT,
-                    synced_at TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_transfer_events_unsynced
-                    ON transfer_events (synced_at, occurred_at);
-                CREATE INDEX IF NOT EXISTS idx_transfer_events_scope_time
-                    ON transfer_events (business_domain, department, occurred_at);
+    def ping(self) -> bool:
+        with self._engine_required().connect() as connection:
+            return connection.execute(select(1)).scalar_one() == 1
 
-                CREATE TABLE IF NOT EXISTS transfer_daily_stats (
-                    stat_date TEXT NOT NULL,
-                    token_id TEXT NOT NULL,
-                    token_prefix TEXT NOT NULL,
-                    business_domain TEXT NOT NULL,
-                    department TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    request_count INTEGER NOT NULL,
-                    byte_count INTEGER NOT NULL,
-                    PRIMARY KEY (stat_date, token_id, operation, status)
-                );
-                """
-            )
-            self._ensure_transfer_columns(connection)
+    def system_config(self) -> dict[str, str]:
+        with self._engine_required().connect() as connection:
+            rows = connection.execute(select(SYSTEM_CONFIG)).mappings().all()
+        return {row["config_key"]: row["config_value"] for row in rows}
 
     def create_token(
         self,
@@ -171,9 +244,8 @@ class AdminStore:
             raise MorphLakeError("invalid_rate_limit", "Rate limits must be non-negative")
 
         token_id = str(uuid.uuid4())
-        random_value = secrets.token_urlsafe(32)
         token_prefix = secrets.token_hex(4)
-        plaintext = f"mlk_{token_prefix}_{random_value}"
+        plaintext = f"mlk_{token_prefix}_{secrets.token_urlsafe(32)}"
         now = datetime.now(UTC).isoformat()
         identity = TokenIdentity(
             token_id=token_id,
@@ -189,45 +261,43 @@ class AdminStore:
             upload_bytes_limit=upload_bytes_limit,
             download_bytes_limit=download_bytes_limit,
         )
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute(
-                """
-                INSERT INTO api_tokens (
-                    token_id, token_hash, token_prefix, business_domain, department,
-                    assignee_name, phone, notes, status, allocated_by, created_at,
-                    updated_at, expires_at, period_seconds, upload_requests_limit,
-                    download_requests_limit, upload_bytes_limit, download_bytes_limit
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    token_id,
-                    self._token_hash(plaintext),
-                    token_prefix,
-                    identity.business_domain,
-                    identity.department,
-                    identity.assignee_name,
-                    identity.phone,
-                    notes.strip(),
-                    allocated_by,
-                    now,
-                    now,
-                    expires_at or None,
-                    period_seconds,
-                    upload_requests_limit,
-                    download_requests_limit,
-                    upload_bytes_limit,
-                    download_bytes_limit,
-                ),
+                insert(API_TOKENS).values(
+                    token_id=token_id,
+                    token_hash=self._token_hash(plaintext),
+                    token_prefix=token_prefix,
+                    business_domain=identity.business_domain,
+                    department=identity.department,
+                    assignee_name=identity.assignee_name,
+                    phone=identity.phone,
+                    notes=notes.strip(),
+                    status="active",
+                    allocated_by=allocated_by,
+                    created_at=now,
+                    updated_at=now,
+                    expires_at=expires_at or None,
+                    last_used_at=None,
+                    period_seconds=period_seconds,
+                    upload_requests_limit=upload_requests_limit,
+                    download_requests_limit=download_requests_limit,
+                    upload_bytes_limit=upload_bytes_limit,
+                    download_bytes_limit=download_bytes_limit,
+                )
             )
         return CreatedToken(identity=identity, plaintext=plaintext)
 
     def authenticate(self, plaintext: str | None) -> TokenIdentity:
         if not plaintext:
             raise MorphLakeError("token_required", "API token is required", 401)
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM api_tokens WHERE token_hash = ?", (self._token_hash(plaintext),)
-            ).fetchone()
+        with self._transaction() as connection:
+            row = (
+                connection.execute(
+                    select(API_TOKENS).where(API_TOKENS.c.token_hash == self._token_hash(plaintext))
+                )
+                .mappings()
+                .first()
+            )
             if row is None:
                 raise MorphLakeError("token_invalid", "API token is invalid", 401)
             if row["status"] == "disabled":
@@ -237,34 +307,37 @@ class AdminStore:
             if row["expires_at"] and datetime.fromisoformat(row["expires_at"]) <= datetime.now(UTC):
                 raise MorphLakeError("token_expired", "API token has expired", 403)
             connection.execute(
-                "UPDATE api_tokens SET last_used_at = ? WHERE token_id = ?",
-                (datetime.now(UTC).isoformat(), row["token_id"]),
+                update(API_TOKENS)
+                .where(API_TOKENS.c.token_id == row["token_id"])
+                .values(last_used_at=datetime.now(UTC).isoformat())
             )
         return self._identity(row)
 
     def list_tokens(self, *, include_deleted: bool = False) -> list[dict[str, Any]]:
-        where = "" if include_deleted else "WHERE status != 'deleted'"
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"SELECT * FROM api_tokens {where} ORDER BY created_at DESC"  # noqa: S608
-            ).fetchall()
+        statement = select(API_TOKENS).order_by(API_TOKENS.c.created_at.desc())
+        if not include_deleted:
+            statement = statement.where(API_TOKENS.c.status != "deleted")
+        with self._engine_required().connect() as connection:
+            rows = connection.execute(statement).mappings().all()
         return [dict(row) for row in rows]
 
     def set_token_status(self, token_id: str, status: str) -> None:
         if status not in {"active", "disabled", "deleted"}:
             raise MorphLakeError("invalid_token_status", "Unsupported token status")
-        with self._connect() as connection:
-            deleted_guard = "" if status == "deleted" else "AND status != 'deleted'"
+        criteria = API_TOKENS.c.token_id == token_id
+        if status != "deleted":
+            criteria = and_(criteria, API_TOKENS.c.status != "deleted")
+        with self._transaction() as connection:
             result = connection.execute(
-                f"UPDATE api_tokens SET status = ?, updated_at = ? "  # noqa: S608
-                f"WHERE token_id = ? {deleted_guard}",
-                (status, datetime.now(UTC).isoformat(), token_id),
+                update(API_TOKENS)
+                .where(criteria)
+                .values(status=status, updated_at=datetime.now(UTC).isoformat())
             )
             if result.rowcount != 1:
                 existing = connection.execute(
-                    "SELECT status FROM api_tokens WHERE token_id = ?", (token_id,)
-                ).fetchone()
-                if existing and existing["status"] == "deleted":
+                    select(API_TOKENS.c.status).where(API_TOKENS.c.token_id == token_id)
+                ).scalar_one_or_none()
+                if existing == "deleted":
                     raise MorphLakeError("token_deleted", "Deleted tokens cannot be changed", 409)
                 raise MorphLakeError("token_not_found", "Token does not exist", 404)
 
@@ -286,23 +359,18 @@ class AdminStore:
         ]
         if period_seconds <= 0 or any(value < 0 for value in limits):
             raise MorphLakeError("invalid_rate_limit", "Rate limits must be non-negative")
-        with self._connect() as connection:
+        with self._transaction() as connection:
             result = connection.execute(
-                """
-                UPDATE api_tokens SET period_seconds = ?, upload_requests_limit = ?,
-                    download_requests_limit = ?, upload_bytes_limit = ?,
-                    download_bytes_limit = ?, updated_at = ?
-                WHERE token_id = ? AND status != 'deleted'
-                """,
-                (
-                    period_seconds,
-                    upload_requests_limit,
-                    download_requests_limit,
-                    upload_bytes_limit,
-                    download_bytes_limit,
-                    datetime.now(UTC).isoformat(),
-                    token_id,
-                ),
+                update(API_TOKENS)
+                .where(and_(API_TOKENS.c.token_id == token_id, API_TOKENS.c.status != "deleted"))
+                .values(
+                    period_seconds=period_seconds,
+                    upload_requests_limit=upload_requests_limit,
+                    download_requests_limit=download_requests_limit,
+                    upload_bytes_limit=upload_bytes_limit,
+                    download_bytes_limit=download_bytes_limit,
+                    updated_at=datetime.now(UTC).isoformat(),
+                )
             )
             if result.rowcount != 1:
                 raise MorphLakeError("token_not_found", "Active token does not exist", 404)
@@ -314,38 +382,57 @@ class AdminStore:
         now_epoch = int(time.time())
         window_start = now_epoch - now_epoch % identity.period_seconds
         reset_at = window_start + identity.period_seconds
-        with self._lock, self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        key = {
+            "token_id": identity.token_id,
+            "operation": operation,
+            "window_start": window_start,
+        }
+        with self._lock, self._transaction(immediate=True) as connection:
             connection.execute(
-                "DELETE FROM rate_counters WHERE token_id = ? AND window_start < ?",
-                (
-                    identity.token_id,
-                    now_epoch - max(86_400, identity.period_seconds * 2),
-                ),
+                delete(RATE_COUNTERS).where(
+                    and_(
+                        RATE_COUNTERS.c.token_id == identity.token_id,
+                        RATE_COUNTERS.c.window_start
+                        < now_epoch - max(86_400, identity.period_seconds * 2),
+                    )
+                )
             )
-            row = connection.execute(
-                """
-                SELECT request_count, byte_count FROM rate_counters
-                WHERE token_id = ? AND operation = ? AND window_start = ?
-                """,
-                (identity.token_id, operation, window_start),
-            ).fetchone()
-            requests = int(row["request_count"]) if row else 0
-            used_bytes = int(row["byte_count"]) if row else 0
+            connection.execute(
+                self._insert_do_nothing(
+                    RATE_COUNTERS,
+                    {**key, "request_count": 0, "byte_count": 0},
+                    ["token_id", "operation", "window_start"],
+                )
+            )
+            statement = select(RATE_COUNTERS.c.request_count, RATE_COUNTERS.c.byte_count).where(
+                and_(
+                    RATE_COUNTERS.c.token_id == identity.token_id,
+                    RATE_COUNTERS.c.operation == operation,
+                    RATE_COUNTERS.c.window_start == window_start,
+                )
+            )
+            if self.backend != "sqlite":
+                statement = statement.with_for_update()
+            row = connection.execute(statement).mappings().one()
+            requests = int(row["request_count"])
+            used_bytes = int(row["byte_count"])
             if request_limit and requests + 1 > request_limit:
                 raise self._rate_error(operation, reset_at)
             if byte_limit and used_bytes + byte_count > byte_limit:
                 raise self._rate_error(operation, reset_at)
             connection.execute(
-                """
-                INSERT INTO rate_counters
-                    (token_id, operation, window_start, request_count, byte_count)
-                VALUES (?, ?, ?, 1, ?)
-                ON CONFLICT(token_id, operation, window_start) DO UPDATE SET
-                    request_count = request_count + 1,
-                    byte_count = byte_count + excluded.byte_count
-                """,
-                (identity.token_id, operation, window_start, byte_count),
+                update(RATE_COUNTERS)
+                .where(
+                    and_(
+                        RATE_COUNTERS.c.token_id == identity.token_id,
+                        RATE_COUNTERS.c.operation == operation,
+                        RATE_COUNTERS.c.window_start == window_start,
+                    )
+                )
+                .values(
+                    request_count=RATE_COUNTERS.c.request_count + 1,
+                    byte_count=RATE_COUNTERS.c.byte_count + byte_count,
+                )
             )
         return RateDecision(
             remaining_requests=None if not request_limit else request_limit - requests - 1,
@@ -356,15 +443,26 @@ class AdminStore:
     def refund_rate(self, identity: TokenIdentity, operation: str, byte_count: int) -> None:
         now_epoch = int(time.time())
         window_start = now_epoch - now_epoch % identity.period_seconds
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute(
-                """
-                UPDATE rate_counters SET
-                    request_count = MAX(0, request_count - 1),
-                    byte_count = MAX(0, byte_count - ?)
-                WHERE token_id = ? AND operation = ? AND window_start = ?
-                """,
-                (byte_count, identity.token_id, operation, window_start),
+                update(RATE_COUNTERS)
+                .where(
+                    and_(
+                        RATE_COUNTERS.c.token_id == identity.token_id,
+                        RATE_COUNTERS.c.operation == operation,
+                        RATE_COUNTERS.c.window_start == window_start,
+                    )
+                )
+                .values(
+                    request_count=case(
+                        (RATE_COUNTERS.c.request_count <= 1, 0),
+                        else_=RATE_COUNTERS.c.request_count - 1,
+                    ),
+                    byte_count=case(
+                        (RATE_COUNTERS.c.byte_count <= byte_count, 0),
+                        else_=RATE_COUNTERS.c.byte_count - byte_count,
+                    ),
+                )
             )
 
     def record_transfer(
@@ -384,71 +482,59 @@ class AdminStore:
     ) -> str:
         event_id = str(uuid.uuid4())
         occurred_at = datetime.now(UTC)
-        event = (
-            event_id,
-            identity.token_id,
-            identity.token_prefix,
-            operation,
-            identity.business_domain,
-            identity.department,
-            domain_shard(identity.business_domain, self.settings.paimon_domain_shards),
-            occurred_at.date().isoformat(),
-            occurred_at.isoformat(),
-            file_id,
-            filename,
-            media_type,
-            byte_count,
-            duration_ms,
-            status,
-            error_code,
-            client_ip,
-            (user_agent or "")[:512],
-        )
-        with self._lock, self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                INSERT INTO transfer_events (
-                    event_id, token_id, token_prefix, operation, business_domain,
-                    department, domain_shard, ingest_date, occurred_at, file_id,
-                    filename, media_type, byte_count, duration_ms, status, error_code,
-                    client_ip, user_agent
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                event,
-            )
-            connection.execute(
-                """
-                INSERT INTO transfer_daily_stats (
-                    stat_date, token_id, token_prefix, business_domain, department,
-                    operation, status, request_count, byte_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
-                ON CONFLICT(stat_date, token_id, operation, status) DO UPDATE SET
-                    request_count = request_count + 1,
-                    byte_count = byte_count + excluded.byte_count
-                """,
-                (
-                    occurred_at.date().isoformat(),
-                    identity.token_id,
-                    identity.token_prefix,
-                    identity.business_domain,
-                    identity.department,
-                    operation,
-                    status,
-                    byte_count,
-                ),
-            )
+        event = {
+            "event_id": event_id,
+            "token_id": identity.token_id,
+            "token_prefix": identity.token_prefix,
+            "operation": operation,
+            "business_domain": identity.business_domain,
+            "department": identity.department,
+            "domain_shard": domain_shard(
+                identity.business_domain, self.settings.paimon_domain_shards
+            ),
+            "ingest_date": occurred_at.date().isoformat(),
+            "occurred_at": occurred_at.isoformat(),
+            "file_id": file_id,
+            "filename": filename,
+            "media_type": media_type,
+            "byte_count": byte_count,
+            "duration_ms": duration_ms,
+            "status": status,
+            "error_code": error_code,
+            "client_ip": client_ip,
+            "user_agent": (user_agent or "")[:512],
+            "claim_id": None,
+            "claimed_at": None,
+            "synced_at": None,
+        }
+        daily = {
+            "stat_date": occurred_at.date().isoformat(),
+            "token_id": identity.token_id,
+            "token_prefix": identity.token_prefix,
+            "business_domain": identity.business_domain,
+            "department": identity.department,
+            "operation": operation,
+            "status": status,
+            "request_count": 1,
+            "byte_count": byte_count,
+        }
+        with self._lock, self._transaction(immediate=True) as connection:
+            connection.execute(insert(TRANSFER_EVENTS).values(**event))
+            connection.execute(self._upsert_daily_stats(daily))
         return event_id
 
     def pending_transfer_events(self, limit: int) -> list[dict[str, Any]]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM transfer_events WHERE synced_at IS NULL
-                ORDER BY occurred_at ASC LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+        with self._engine_required().connect() as connection:
+            rows = (
+                connection.execute(
+                    select(TRANSFER_EVENTS)
+                    .where(TRANSFER_EVENTS.c.synced_at.is_(None))
+                    .order_by(TRANSFER_EVENTS.c.occurred_at.asc())
+                    .limit(limit)
+                )
+                .mappings()
+                .all()
+            )
         return [dict(row) for row in rows]
 
     def claim_transfer_events(
@@ -458,57 +544,71 @@ class AdminStore:
         claim_id = str(uuid.uuid4())
         now = datetime.now(UTC)
         stale = (now - timedelta(seconds=lease_seconds)).isoformat()
-        with self._lock, self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        with self._lock, self._transaction(immediate=True) as connection:
             connection.execute(
-                """
-                UPDATE transfer_events SET claim_id = NULL, claimed_at = NULL
-                WHERE synced_at IS NULL AND claimed_at < ?
-                """,
-                (stale,),
+                update(TRANSFER_EVENTS)
+                .where(
+                    and_(
+                        TRANSFER_EVENTS.c.synced_at.is_(None),
+                        TRANSFER_EVENTS.c.claimed_at.is_not(None),
+                        TRANSFER_EVENTS.c.claimed_at < stale,
+                    )
+                )
+                .values(claim_id=None, claimed_at=None)
             )
-            rows = connection.execute(
-                """
-                SELECT event_id FROM transfer_events
-                WHERE synced_at IS NULL AND claim_id IS NULL
-                ORDER BY occurred_at ASC LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-            event_ids = [row["event_id"] for row in rows]
+            statement = (
+                select(TRANSFER_EVENTS.c.event_id)
+                .where(
+                    and_(
+                        TRANSFER_EVENTS.c.synced_at.is_(None),
+                        TRANSFER_EVENTS.c.claim_id.is_(None),
+                    )
+                )
+                .order_by(TRANSFER_EVENTS.c.occurred_at.asc())
+                .limit(limit)
+            )
+            if self.backend != "sqlite":
+                statement = statement.with_for_update(skip_locked=True)
+            event_ids = list(connection.execute(statement).scalars())
             if not event_ids:
                 return claim_id, []
-            placeholders = ",".join("?" for _ in event_ids)
             connection.execute(
-                f"UPDATE transfer_events SET claim_id = ?, claimed_at = ? "  # noqa: S608
-                f"WHERE event_id IN ({placeholders})",
-                (claim_id, now.isoformat(), *event_ids),
+                update(TRANSFER_EVENTS)
+                .where(TRANSFER_EVENTS.c.event_id.in_(event_ids))
+                .values(claim_id=claim_id, claimed_at=now.isoformat())
             )
-            claimed = connection.execute(
-                "SELECT * FROM transfer_events WHERE claim_id = ? ORDER BY occurred_at",
-                (claim_id,),
-            ).fetchall()
-        return claim_id, [dict(row) for row in claimed]
+            rows = (
+                connection.execute(
+                    select(TRANSFER_EVENTS)
+                    .where(TRANSFER_EVENTS.c.claim_id == claim_id)
+                    .order_by(TRANSFER_EVENTS.c.occurred_at.asc())
+                )
+                .mappings()
+                .all()
+            )
+        return claim_id, [dict(row) for row in rows]
 
     def mark_events_synced(self, event_ids: list[str]) -> None:
         if not event_ids:
             return
-        placeholders = ",".join("?" for _ in event_ids)
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute(
-                f"UPDATE transfer_events SET synced_at = ? "  # noqa: S608
-                f"WHERE event_id IN ({placeholders})",
-                (datetime.now(UTC).isoformat(), *event_ids),
+                update(TRANSFER_EVENTS)
+                .where(TRANSFER_EVENTS.c.event_id.in_(event_ids))
+                .values(synced_at=datetime.now(UTC).isoformat(), claim_id=None, claimed_at=None)
             )
 
     def release_event_claim(self, claim_id: str) -> None:
-        with self._connect() as connection:
+        with self._transaction() as connection:
             connection.execute(
-                """
-                UPDATE transfer_events SET claim_id = NULL, claimed_at = NULL
-                WHERE claim_id = ? AND synced_at IS NULL
-                """,
-                (claim_id,),
+                update(TRANSFER_EVENTS)
+                .where(
+                    and_(
+                        TRANSFER_EVENTS.c.claim_id == claim_id,
+                        TRANSFER_EVENTS.c.synced_at.is_(None),
+                    )
+                )
+                .values(claim_id=None, claimed_at=None)
             )
 
     def transfer_stats(self, period: str) -> list[dict[str, Any]]:
@@ -516,59 +616,243 @@ class AdminStore:
         if days is None:
             raise MorphLakeError("invalid_period", "period must be day, week, or month")
         start = (datetime.now(UTC).date() - timedelta(days=days - 1)).isoformat()
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT token_prefix, business_domain, department, operation, status,
-                       SUM(request_count) AS request_count,
-                       SUM(byte_count) AS byte_count
-                FROM transfer_daily_stats WHERE stat_date >= ?
-                GROUP BY token_id, operation, status
-                ORDER BY business_domain, department, token_prefix, operation, status
-                """,
-                (start,),
-            ).fetchall()
+        statement = (
+            select(
+                TRANSFER_DAILY_STATS.c.token_prefix,
+                TRANSFER_DAILY_STATS.c.business_domain,
+                TRANSFER_DAILY_STATS.c.department,
+                TRANSFER_DAILY_STATS.c.operation,
+                TRANSFER_DAILY_STATS.c.status,
+                func.sum(TRANSFER_DAILY_STATS.c.request_count).label("request_count"),
+                func.sum(TRANSFER_DAILY_STATS.c.byte_count).label("byte_count"),
+            )
+            .where(TRANSFER_DAILY_STATS.c.stat_date >= start)
+            .group_by(
+                TRANSFER_DAILY_STATS.c.token_id,
+                TRANSFER_DAILY_STATS.c.token_prefix,
+                TRANSFER_DAILY_STATS.c.business_domain,
+                TRANSFER_DAILY_STATS.c.department,
+                TRANSFER_DAILY_STATS.c.operation,
+                TRANSFER_DAILY_STATS.c.status,
+            )
+            .order_by(
+                TRANSFER_DAILY_STATS.c.business_domain,
+                TRANSFER_DAILY_STATS.c.department,
+                TRANSFER_DAILY_STATS.c.token_prefix,
+                TRANSFER_DAILY_STATS.c.operation,
+                TRANSFER_DAILY_STATS.c.status,
+            )
+        )
+        with self._engine_required().connect() as connection:
+            rows = connection.execute(statement).mappings().all()
         return [dict(row) for row in rows]
 
     def recent_transfers(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM transfer_events ORDER BY occurred_at DESC LIMIT ?", (limit,)
-            ).fetchall()
+        with self._engine_required().connect() as connection:
+            rows = (
+                connection.execute(
+                    select(TRANSFER_EVENTS)
+                    .order_by(TRANSFER_EVENTS.c.occurred_at.desc())
+                    .limit(limit)
+                )
+                .mappings()
+                .all()
+            )
         return [dict(row) for row in rows]
 
     def unsynced_event_count(self) -> int:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) AS count FROM transfer_events WHERE synced_at IS NULL"
-            ).fetchone()
-        return int(row["count"])
+        with self._engine_required().connect() as connection:
+            value = connection.execute(
+                select(func.count())
+                .select_from(TRANSFER_EVENTS)
+                .where(TRANSFER_EVENTS.c.synced_at.is_(None))
+            ).scalar_one()
+        return int(value)
 
     def cleanup_synced_events(self) -> int:
         cutoff = (
-            datetime.now(UTC) - timedelta(days=self.settings.transfer_sqlite_retention_days)
+            datetime.now(UTC) - timedelta(days=self.settings.transfer_detail_retention_days)
         ).isoformat()
-        with self._connect() as connection:
+        with self._transaction() as connection:
             result = connection.execute(
-                "DELETE FROM transfer_events WHERE synced_at IS NOT NULL AND occurred_at < ?",
-                (cutoff,),
+                delete(TRANSFER_EVENTS).where(
+                    and_(
+                        TRANSFER_EVENTS.c.synced_at.is_not(None),
+                        TRANSFER_EVENTS.c.occurred_at < cutoff,
+                    )
+                )
             )
         return result.rowcount
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=NORMAL")
-        connection.execute("PRAGMA busy_timeout=30000")
-        return connection
+    def _initialize_schema(self) -> None:
+        engine = self._engine_required()
+        with engine.connect() as connection:
+            if self.backend == "sqlite":
+                connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                try:
+                    self._create_and_seed(connection)
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                return
 
-    @staticmethod
-    def _ensure_transfer_columns(connection: sqlite3.Connection) -> None:
-        existing = {row["name"] for row in connection.execute("PRAGMA table_info(transfer_events)")}
+            self._acquire_schema_lock(connection)
+            try:
+                self._create_and_seed(connection)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                self._release_schema_lock(connection)
+
+    def _create_and_seed(self, connection: Connection) -> None:
+        METADATA.create_all(connection, checkfirst=True)
+        self._ensure_transfer_columns(connection)
+        now = datetime.now(UTC).isoformat()
+        values = {
+            "schema_version": ("2", "MorphLake management schema version"),
+            "initialized_at": (now, "First successful schema initialization time"),
+            "database_backend": (self.backend, "Active management database backend"),
+            "default_rate_period_seconds": (
+                str(self.settings.default_rate_period_seconds),
+                "Default token quota window in seconds",
+            ),
+            "default_upload_requests": (
+                str(self.settings.default_upload_requests),
+                "Default upload request quota",
+            ),
+            "default_download_requests": (
+                str(self.settings.default_download_requests),
+                "Default download request quota",
+            ),
+            "default_upload_bytes": (
+                str(self.settings.default_upload_bytes),
+                "Default upload byte quota",
+            ),
+            "default_download_bytes": (
+                str(self.settings.default_download_bytes),
+                "Default download byte quota",
+            ),
+        }
+        for key, (value, description) in values.items():
+            connection.execute(
+                self._insert_do_nothing(
+                    SYSTEM_CONFIG,
+                    {
+                        "config_key": key,
+                        "config_value": value,
+                        "description": description,
+                        "updated_at": now,
+                    },
+                    ["config_key"],
+                )
+            )
+
+    def _ensure_transfer_columns(self, connection: Connection) -> None:
+        columns = {column["name"] for column in inspect(connection).get_columns("transfer_events")}
         for column in ("claim_id", "claimed_at"):
-            if column not in existing:
-                connection.execute(f"ALTER TABLE transfer_events ADD COLUMN {column} TEXT")
+            if column not in columns:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE transfer_events ADD COLUMN {column} VARCHAR(40)"
+                )
+
+    def _acquire_schema_lock(self, connection: Connection) -> None:
+        if self.backend == "postgresql":
+            connection.execute(
+                text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": self._SCHEMA_LOCK_ID}
+            )
+        else:
+            acquired = connection.execute(
+                text("SELECT GET_LOCK(:lock_name, 60)"),
+                {"lock_name": self._SCHEMA_LOCK_NAME},
+            ).scalar_one()
+            if acquired != 1:
+                raise TimeoutError("Timed out waiting for the management schema lock")
+        connection.commit()
+
+    def _release_schema_lock(self, connection: Connection) -> None:
+        try:
+            if self.backend == "postgresql":
+                connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": self._SCHEMA_LOCK_ID},
+                )
+            else:
+                connection.execute(
+                    text("SELECT RELEASE_LOCK(:lock_name)"),
+                    {"lock_name": self._SCHEMA_LOCK_NAME},
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+
+    @contextmanager
+    def _transaction(self, *, immediate: bool = False) -> Iterator[Connection]:
+        connection = self._engine_required().connect()
+        try:
+            if immediate and self.backend == "sqlite":
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            else:
+                connection.begin()
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _insert_do_nothing(self, table: Table, values: dict[str, Any], index_elements: list[str]):
+        if self.backend == "sqlite":
+            return (
+                sqlite_insert(table)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=index_elements)
+            )
+        if self.backend == "postgresql":
+            return (
+                postgresql_insert(table)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=index_elements)
+            )
+        statement = mysql_insert(table).values(**values)
+        first_key = index_elements[0]
+        return statement.on_duplicate_key_update(
+            **{first_key: getattr(statement.inserted, first_key)}
+        )
+
+    def _upsert_daily_stats(self, values: dict[str, Any]):
+        index_elements = ["stat_date", "token_id", "operation", "status"]
+        if self.backend == "sqlite":
+            statement = sqlite_insert(TRANSFER_DAILY_STATS).values(**values)
+            return statement.on_conflict_do_update(
+                index_elements=index_elements,
+                set_={
+                    "request_count": TRANSFER_DAILY_STATS.c.request_count + 1,
+                    "byte_count": TRANSFER_DAILY_STATS.c.byte_count + statement.excluded.byte_count,
+                },
+            )
+        if self.backend == "postgresql":
+            statement = postgresql_insert(TRANSFER_DAILY_STATS).values(**values)
+            return statement.on_conflict_do_update(
+                index_elements=index_elements,
+                set_={
+                    "request_count": TRANSFER_DAILY_STATS.c.request_count + 1,
+                    "byte_count": TRANSFER_DAILY_STATS.c.byte_count + statement.excluded.byte_count,
+                },
+            )
+        statement = mysql_insert(TRANSFER_DAILY_STATS).values(**values)
+        return statement.on_duplicate_key_update(
+            request_count=TRANSFER_DAILY_STATS.c.request_count + 1,
+            byte_count=TRANSFER_DAILY_STATS.c.byte_count + statement.inserted.byte_count,
+        )
+
+    def _engine_required(self) -> Engine:
+        if self._engine is None:
+            raise RuntimeError("AdminStore.initialize() must be called before use")
+        return self._engine
 
     def _token_hash(self, plaintext: str) -> str:
         return hmac.new(
@@ -578,7 +862,7 @@ class AdminStore:
         ).hexdigest()
 
     @staticmethod
-    def _identity(row: sqlite3.Row) -> TokenIdentity:
+    def _identity(row: Mapping[str, Any]) -> TokenIdentity:
         return TokenIdentity(
             token_id=row["token_id"],
             token_prefix=row["token_prefix"],

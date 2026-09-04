@@ -34,7 +34,8 @@ def test_catalog_options_use_path_style_minio():
 
 def test_five_table_defaults_and_index_settings():
     settings = Settings()
-    assert settings.admin_db_path == Path("data/morphlake-admin.db")
+    assert settings.admin_db_config == Path("config/database.yaml")
+    assert settings.admin_db_path is None
     assert settings.paimon_table == "multimodal_asset_descriptor"
     assert settings.paimon_text_table == "multimodal_text_segment"
     assert settings.paimon_image_table == "multimodal_image_feature"
@@ -42,3 +43,8 @@ def test_five_table_defaults_and_index_settings():
     assert settings.paimon_audit_table == "multimodal_transfer_audit"
     assert settings.paimon_domain_shards == 32
     assert settings.paimon_vector_index_type == "ivf-sq"
+
+
+def test_legacy_sqlite_retention_environment_name_is_supported(monkeypatch):
+    monkeypatch.setenv("MORPHLAKE_TRANSFER_SQLITE_RETENTION_DAYS", "45")
+    assert Settings().transfer_detail_retention_days == 45

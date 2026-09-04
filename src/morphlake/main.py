@@ -40,6 +40,7 @@ def create_app(
     admin_store = admin_store or AdminStore(settings)
     metrics = metrics or Metrics()
     admin_store.initialize()
+    metrics.management_db_info.labels(admin_store.backend).set(1)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -58,7 +59,10 @@ def create_app(
                     asyncio.create_task(_audit_flush_loop(service, admin_store, metrics, settings)),
                     asyncio.create_task(
                         _health_monitor_loop(
-                            service, metrics, settings.health_check_interval_seconds
+                            service,
+                            admin_store,
+                            metrics,
+                            settings.health_check_interval_seconds,
                         )
                     ),
                 ]
@@ -229,12 +233,21 @@ async def _flush_audit_once(
 
 
 async def _health_monitor_loop(
-    service: MorphLakeService, metrics: Metrics, interval_seconds: int
+    service: MorphLakeService,
+    store: AdminStore,
+    metrics: Metrics,
+    interval_seconds: int,
 ) -> None:
     while True:
         checks = await asyncio.to_thread(service.ready)
         for component, status in checks.items():
             metrics.component_up.labels(component).set(1 if status == "ok" else 0)
+        try:
+            await asyncio.to_thread(store.ping)
+            metrics.component_up.labels("management_db").set(1)
+        except Exception:
+            metrics.component_up.labels("management_db").set(0)
+            LOGGER.exception("Management database health check failed")
         await asyncio.sleep(interval_seconds)
 
 

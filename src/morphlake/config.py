@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?}")
@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", alias="MORPHLAKE_LOG_LEVEL")
     max_upload_mb: int = Field(200, alias="MORPHLAKE_MAX_UPLOAD_MB")
     models_config: Path = Field(Path("config/models.yaml"), alias="MORPHLAKE_MODELS_CONFIG")
-    admin_db_path: Path = Field(Path("data/morphlake-admin.db"), alias="MORPHLAKE_ADMIN_DB_PATH")
+    admin_db_config: Path = Field(Path("config/database.yaml"), alias="MORPHLAKE_ADMIN_DB_CONFIG")
+    admin_db_path: Path | None = Field(None, alias="MORPHLAKE_ADMIN_DB_PATH")
     admin_username: str = Field("admin", alias="MORPHLAKE_ADMIN_USERNAME")
     admin_password: str = Field("change-me", alias="MORPHLAKE_ADMIN_PASSWORD")
     token_pepper: str = Field("change-me-in-production", alias="MORPHLAKE_TOKEN_PEPPER")
@@ -73,8 +74,13 @@ class Settings(BaseSettings):
         5, alias="PAIMON_AUDIT_FLUSH_INTERVAL_SECONDS", ge=1
     )
     paimon_audit_batch_size: int = Field(1_000, alias="PAIMON_AUDIT_BATCH_SIZE", ge=1, le=100_000)
-    transfer_sqlite_retention_days: int = Field(
-        30, alias="MORPHLAKE_TRANSFER_SQLITE_RETENTION_DAYS", ge=1
+    transfer_detail_retention_days: int = Field(
+        30,
+        validation_alias=AliasChoices(
+            "MORPHLAKE_TRANSFER_DETAIL_RETENTION_DAYS",
+            "MORPHLAKE_TRANSFER_SQLITE_RETENTION_DAYS",
+        ),
+        ge=1,
     )
     text_vector_dimension: int = Field(384, alias="PAIMON_TEXT_VECTOR_DIMENSION")
     image_vector_dimension: int = Field(512, alias="PAIMON_IMAGE_VECTOR_DIMENSION")
@@ -88,7 +94,9 @@ class Settings(BaseSettings):
             raise ValueError("PAIMON_VECTOR_INDEX_TYPE is not supported by PyPaimon 2.0")
         return value
 
-    @field_validator("minio_region", "metrics_token", "prometheus_url", mode="before")
+    @field_validator(
+        "minio_region", "metrics_token", "prometheus_url", "admin_db_path", mode="before"
+    )
     @classmethod
     def empty_to_none(cls, value: Any) -> Any:
         return None if value == "" else value

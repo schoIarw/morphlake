@@ -254,7 +254,7 @@ def transfers_page(
       <th>操作</th><th>状态</th><th>条数</th><th>字节数</th></tr></thead>
       <tbody>{stat_rows}</tbody></table></div>
     </section>
-    <section class="panel"><h2>最近传输明细（SQLite缓存，长期明细进入Paimon）</h2>
+    <section class="panel"><h2>最近传输明细（管理库缓存，长期明细进入Paimon）</h2>
       <div class="table-wrap"><table><thead><tr><th>时间</th><th>Token</th><th>操作</th>
       <th>业务域</th><th>部门</th><th>文件</th><th>字节</th><th>状态</th><th>错误</th>
       </tr></thead><tbody>{detail_rows}</tbody></table></div>

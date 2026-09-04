@@ -31,6 +31,7 @@ def create_admin_app(
     store = store or AdminStore(settings)
     metrics = metrics or Metrics()
     store.initialize()
+    metrics.management_db_info.labels(store.backend).set(1)
 
     application = FastAPI(
         title="MorphLake Administration",
@@ -63,7 +64,7 @@ def create_admin_app(
 
     @application.get("/health/live", include_in_schema=False)
     def live() -> dict[str, str]:
-        store.list_tokens()
+        store.ping()
         return {"status": "ok"}
 
     @application.get("/metrics", include_in_schema=False)
@@ -72,7 +73,12 @@ def create_admin_app(
         x_metrics_token: str | None = Header(None),
     ) -> Response:
         _check_metrics_token(settings, authorization, x_metrics_token)
-        metrics.component_up.labels("sqlite").set(1)
+        try:
+            store.ping()
+            metrics.component_up.labels("management_db").set(1)
+        except Exception:
+            metrics.component_up.labels("management_db").set(0)
+            raise
         return Response(metrics.render(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
     @application.exception_handler(MorphLakeError)

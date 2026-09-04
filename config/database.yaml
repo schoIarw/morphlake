@@ -1,0 +1,6 @@
+# Default single-host profile. Both API and administration containers mount the
+# same /app/data volume, so they see the same SQLite database.
+database:
+  backend: sqlite
+  path: data/morphlake-admin.db
+

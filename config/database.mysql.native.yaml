@@ -1,0 +1,15 @@
+database:
+  backend: mysql
+  host: mysql.example.internal
+  port: 3306
+  name: morphlake
+  auth:
+    mode: native
+    username: morphlake
+    password: replace-with-plaintext-password
+  auto_create_database: true
+  connect_timeout_seconds: 10
+  pool_size: 20
+  max_overflow: 40
+  pool_recycle_seconds: 1800
+

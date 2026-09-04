@@ -1,0 +1,17 @@
+database:
+  backend: postgresql
+  host: postgresql.example.internal
+  port: 5432
+  name: morphlake
+  auth:
+    mode: native
+    username: morphlake
+    password: replace-with-plaintext-password
+  auto_create_database: true
+  maintenance_database: postgres
+  ssl_mode: prefer
+  connect_timeout_seconds: 10
+  pool_size: 20
+  max_overflow: 40
+  pool_recycle_seconds: 1800
+

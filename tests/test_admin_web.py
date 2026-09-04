@@ -85,4 +85,5 @@ def test_admin_is_independent_and_exports_metrics(tmp_path: Path):
     assert denied.status_code == 401
     metrics = client.get("/metrics", headers={"X-Metrics-Token": "metrics-secret"})
     assert metrics.status_code == 200
-    assert 'morphlake_component_up{component="sqlite"} 1.0' in metrics.text
+    assert 'morphlake_component_up{component="management_db"} 1.0' in metrics.text
+    assert 'morphlake_management_db_info{backend="sqlite"} 1.0' in metrics.text

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "morphlake"
-version = "0.2.0"
+version = "0.3.0"
 description = "A simple Paimon 2.0 multimodal foundation on MinIO"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -21,6 +21,10 @@ dependencies = [
   "pyarrow>=16,<20",
   "httpx>=0.27,<1",
   "prometheus-client>=0.21,<1",
+  "SQLAlchemy>=2.0,<3",
+  "PyMySQL>=1.1,<2",
+  "psycopg[binary]>=3.2,<4",
+  "cryptography>=43,<48",
   "PyYAML>=6,<7",
   "pypdf>=5,<7",
   "python-docx>=1.1,<2",
@@ -43,6 +47,7 @@ packages = ["src/morphlake"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+markers = ["integration: requires external MySQL and PostgreSQL services"]
 
 [tool.ruff]
 line-length = 100

@@ -11,7 +11,7 @@ Milvus、Elasticsearch，也不依赖常驻 Flink 作业。
 ## 设计目标
 
 - **简单**：同一 Python 镜像分别启动 API 与管理容器，不新增检索或任务队列组件。
-- **稳定**：五张固定粒度的追加型 Paimon 表、SQLite 原子限流；不维护常驻计算作业。
+- **稳定**：五张固定粒度的追加型 Paimon 表、事务型管理数据库原子限流；不维护常驻计算作业。
 - **Descriptor‑Only**：文件二进制只存 MinIO；Paimon 保存对象引用、元数据、文本和向量。
 - **原生检索**：全文使用 Paimon `full-text`，向量默认使用 Paimon `ivf-sq` 全局索引。
 - **配置驱动模型**：模型提供方、地址、模型名、维度、超时均在 YAML/环境变量中配置。
@@ -20,7 +20,7 @@ Milvus、Elasticsearch，也不依赖常驻 Flink 作业。
 flowchart TB
     C["用户或应用"] --> A["API 容器 :8080"]
     U["管理员"] --> D["管理容器 :8081"]
-    A --> S["共享 SQLite<br/>Token、限流、审计 outbox"]
+    A --> S["共享管理数据库<br/>SQLite / MySQL / PostgreSQL"]
     D --> S
     A --> M["MinIO<br/>原始文件"]
     A --> P["Paimon 2.0<br/>描述符、特征、审计"]
@@ -66,6 +66,33 @@ MINIO_DATA_BUCKET=morphlake-data
 MINIO_PAIMON_BUCKET=morphlake-paimon
 PAIMON_WAREHOUSE=s3://morphlake-paimon/warehouse
 ```
+
+管理数据库由 `config/database.yaml` 配置，默认使用 SQLite。跨主机扩展 API 时，将对应示例
+复制为活动配置即可：
+
+```bash
+# MySQL 明文账号方式
+cp config/database.mysql.native.yaml config/database.yaml
+
+# PostgreSQL 加密账号方式
+cp config/database.postgresql.encrypt.yaml config/database.yaml
+```
+
+| 数据库 | `native` | `encrypt` | 首次自动建库/表 |
+| --- | --- | --- | --- |
+| SQLite | 无需账号 | 不适用 | 自动创建文件和表 |
+| MySQL | 配置内明文用户名、密码 | 配置内保存密文 | 支持 |
+| PostgreSQL | 配置内明文用户名、密码 | 配置内保存密文 | 支持 |
+
+使用加密方式时，密钥只放在环境变量，配置文件只保存 `ENC[...]` 密文：
+
+```bash
+export MORPHLAKE_DB_CREDENTIAL_KEY="$(python scripts/encrypt_db_credentials.py generate-key)"
+python scripts/encrypt_db_credentials.py encrypt
+```
+
+把命令输出的 `auth` 段复制到 `config/database.yaml`，再把
+`MORPHLAKE_DB_CREDENTIAL_KEY` 写入受保护的部署 Secret 或本机 `.env`。不要把密钥提交到 Git。
 
 开发配置默认使用确定性的 `hash` 向量，仅用于接口和索引冒烟验证，不具备语义效果。
 生产环境应修改 `config/models.yaml`，把对应 `provider` 改为
@@ -148,10 +175,11 @@ curl http://localhost:8080/health/ready \
 
 容器启动时会：
 
-1. 检查并创建两个 MinIO bucket（需要账号具有相应权限）；
-2. 自动创建资产描述符、文本切片、图片特征、音频特征和传输审计五张 Paimon 表；
-3. 校验已存在表的字段、`ingest_date/domain_shard` 分区、`bucket=-1` 和 deletion-vector；
-4. 启动定时增量索引维护；上传请求本身不重建索引。
+1. 根据配置创建管理数据库及五张管理表，并写入 schema 版本和默认配额配置；
+2. 检查并创建两个 MinIO bucket（需要账号具有相应权限）；
+3. 自动创建资产描述符、文本切片、图片特征、音频特征和传输审计五张 Paimon 表；
+4. 校验已存在 Paimon 表的字段、分区、`bucket=-1` 和 deletion-vector；
+5. 启动定时增量索引维护；上传请求本身不重建索引。
 
 ### 3. 上传并查询
 
@@ -247,8 +275,8 @@ HTTP Basic 认证后查看 OpenAPI UI。
 python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
-ruff format --check src tests
-ruff check src tests
+ruff format --check src tests scripts
+ruff check src tests scripts
 pytest -q
 ```
 
@@ -258,8 +286,9 @@ Docker 镜像构建也包含在 GitHub Actions 中。
 ## 目录
 
 ```text
-config/                 模型和切片配置
+config/                 模型、数据库和切片配置
 docs/                   架构、表模型、接口文档
+scripts/                数据库凭据加密工具
 src/morphlake/api.py    固定 API 契约
 src/morphlake/services  MinIO、模型、Paimon 和业务编排
 tests/                  单元、接口和 PyPaimon 集成测试

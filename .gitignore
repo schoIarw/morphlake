@@ -9,5 +9,6 @@ htmlcov/
 dist/
 build/
 .env
+.env.ollama
 .DS_Store
 data/

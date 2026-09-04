@@ -38,6 +38,11 @@ def create_token(store: AdminStore):
 
 def test_token_is_hashed_and_lifecycle_is_enforced(tmp_path: Path):
     store = make_store(tmp_path)
+    seeded = store.system_config()
+    assert seeded["schema_version"] == "2"
+    assert seeded["database_backend"] == "sqlite"
+    assert seeded["default_rate_period_seconds"] == "60"
+    assert store.ping()
     created = create_token(store)
     row = store.list_tokens()[0]
     assert created.plaintext not in str(row)

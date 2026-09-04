@@ -66,6 +66,12 @@ class Metrics:
             ["component"],
             registry=self.registry,
         )
+        self.management_db_info = Gauge(
+            "morphlake_management_db_info",
+            "Selected management database backend",
+            ["backend"],
+            registry=self.registry,
+        )
         self.index_runs = Counter(
             "morphlake_index_maintenance_total",
             "Paimon index maintenance runs",

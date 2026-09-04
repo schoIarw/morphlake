@@ -1,12 +1,13 @@
 services:
   morphlake-api:
     build: .
-    image: morphlake:0.2.0
+    image: morphlake:0.3.0
     env_file: .env
     ports:
       - "8080:8080"
     volumes:
       - ./config/models.yaml:/app/config/models.yaml:ro
+      - ./config/database.yaml:/app/config/database.yaml:ro
       - morphlake-admin-data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/live', timeout=3)"]
@@ -18,12 +19,13 @@ services:
 
   morphlake-admin:
     build: .
-    image: morphlake:0.2.0
+    image: morphlake:0.3.0
     env_file: .env
     command: ["uvicorn", "morphlake.admin_main:app", "--host", "0.0.0.0", "--port", "8081", "--workers", "1"]
     ports:
       - "8081:8081"
     volumes:
+      - ./config/database.yaml:/app/config/database.yaml:ro
       - morphlake-admin-data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health/live', timeout=3)"]

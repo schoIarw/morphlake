@@ -6,7 +6,7 @@
 flowchart TB
     C["用户或应用"] --> S["API 容器 :8080"]
     A["管理员"] --> M["管理容器 :8081"]
-    S --> D["共享 SQLite\n认证、限流、outbox"]
+    S --> D["共享管理数据库\nSQLite / MySQL / PostgreSQL"]
     M --> D
     S --> O["MinIO\n原始文件"]
     S --> P["Paimon 五表\n资产、特征、审计"]
@@ -33,9 +33,11 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant A as MorphLake
+    participant D as 管理数据库
     participant M as MinIO
     participant G as 模型
     participant P as Paimon
+    A->>D: 自动建库表并初始化配置
     A->>M: 检查/创建 bucket
     A->>P: 自动创建并校验五张表
     A->>M: 上传原始文件
@@ -77,8 +79,8 @@ PyPaimon 增量索引构建，已索引 row range 会跳过。默认 300 秒，M
 
 1. 以真实日写入量压测每日分区文件数、索引耗时和查询 P99，并调整分片数；既有表的分片
    算法与数量不能直接在线变更。
-2. 单个 API 容器固定一个 worker；同一 Docker 主机可启动多个 API 副本，共享 SQLite WAL，
-   审计 outbox 使用租约避免重复消费。跨主机扩容前需替换 SQLite，并完善 Paimon 提交重试。
+2. 单个 API 容器固定一个 worker；单机副本可共享 SQLite WAL，跨主机副本应统一连接 MySQL
+   或 PostgreSQL。审计 outbox 使用行锁和租约避免重复消费，并应完善 Paimon 提交重试。
 3. 为 MinIO 开启版本控制、容量告警、跨站备份和生命周期策略；十年保留应由合规策略确认。
 4. 监控索引维护失败、最近成功时间、模型错误、Paimon 提交、MinIO 容量和小文件数量。
 5. 规划离线 compact 与过期分区维护窗口；维护任务可按需使用短生命周期 Flink 作业，但不

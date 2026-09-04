@@ -1,0 +1,16 @@
+database:
+  backend: mysql
+  host: mysql.example.internal
+  port: 3306
+  name: morphlake
+  auth:
+    mode: encrypt
+    username: ENC[replace-with-script-output]
+    password: ENC[replace-with-script-output]
+    key_env: MORPHLAKE_DB_CREDENTIAL_KEY
+  auto_create_database: true
+  connect_timeout_seconds: 10
+  pool_size: 20
+  max_overflow: 40
+  pool_recycle_seconds: 1800
+
