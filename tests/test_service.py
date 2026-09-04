@@ -34,8 +34,9 @@ class FakeObjects:
 
 
 class FakeCatalog:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, maintenance_fail=False):
         self.fail = fail
+        self.maintenance_fail = maintenance_fail
         self.asset = None
         self.text_segments = []
         self.image_features = []
@@ -54,6 +55,8 @@ class FakeCatalog:
         self.audio_features.extend(audio_features)
 
     def maintain_indexes(self):
+        if self.maintenance_fail:
+            raise RuntimeError("index failed")
         return None
 
     def ping(self):
@@ -185,3 +188,15 @@ def test_query_file_is_vectorized_by_modality_and_uses_top_10(
     assert catalog.vector_query["business_domain"] == "risk"
     assert catalog.vector_query["limit"] == 10
     assert objects.values == {}
+
+
+def test_readiness_reports_index_maintenance_failure(tmp_path: Path):
+    service = MorphLakeService(
+        settings(),
+        FakeObjects(),
+        FakeCatalog(maintenance_fail=True),
+        models(tmp_path),
+    )
+    with pytest.raises(RuntimeError, match="index failed"):
+        service.maintain()
+    assert service.ready()["indexes"] == "error: index failed"

@@ -1,6 +1,6 @@
 # Paimon 后端表模型
 
-服务首次启动时使用 `ignore_if_exists=true` 创建以下四张表，并校验必需字段、统一分区、
+API 服务首次启动时使用 `ignore_if_exists=true` 创建以下五张表，并校验必需字段、统一分区、
 `bucket=-1` 和 deletion vector 配置。已存在但与模型不兼容的表会令启动失败，避免静默写坏。
 
 ## 统一物理设计
@@ -70,6 +70,22 @@ MacBook Ollama 配置使用 MiniCPM-V 生成图片描述，再以 Nomic 对描�
 feature_id、file_id、公共业务/分区/结果字段、feature_type、时间范围、模型元数据及
 `audio_embedding VECTOR<FLOAT,audio_dimension>`。若模型返回转写，还会在文本表写一条
 `audio_transcript`，从而进入全文和文本向量检索。
+
+## 5. multimodal_transfer_audit
+
+一条上传、下载或限流拒绝事件一行。SQLite 作为实时 outbox 和天/周/月汇总缓存；API 后台
+将 outbox 批量追加到本表，形成长期审计明细。
+
+| 字段组 | 主要字段 |
+| --- | --- |
+| 标识 | event_id, token_id, token_prefix, file_id |
+| 业务/分区 | business_domain, department, domain_shard, ingest_date |
+| 传输 | operation, occurred_at, filename, media_type, byte_count, duration_ms |
+| 结果 | status, error_code |
+| 客户端 | client_ip, user_agent |
+
+索引：event_id、token_id、file_id BTree；业务域、部门、操作和状态 Bitmap。表不保存 Token
+明文、使用人姓名和手机号码；人员信息只保留在受管理权限保护的 SQLite 中。
 
 ## 表参数
 

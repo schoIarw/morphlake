@@ -20,6 +20,7 @@ ASSET_TABLE = "asset"
 TEXT_TABLE = "text"
 IMAGE_TABLE = "image"
 AUDIO_TABLE = "audio"
+AUDIT_TABLE = "audit"
 PARTITION_KEYS = ["ingest_date", "domain_shard"]
 PUBLIC_COLUMNS = [
     "file_id",
@@ -122,6 +123,32 @@ def audio_schema(settings: Settings) -> pa.Schema:
     )
 
 
+def audit_schema(_: Settings) -> pa.Schema:
+    """Append-only upload/download audit records retained in Paimon."""
+    return pa.schema(
+        [
+            pa.field("event_id", pa.string(), nullable=False),
+            pa.field("token_id", pa.string(), nullable=False),
+            pa.field("token_prefix", pa.string(), nullable=False),
+            pa.field("operation", pa.string(), nullable=False),
+            pa.field("business_domain", pa.string(), nullable=False),
+            pa.field("department", pa.string(), nullable=False),
+            pa.field("domain_shard", pa.int32(), nullable=False),
+            pa.field("ingest_date", pa.string(), nullable=False),
+            pa.field("occurred_at", pa.string(), nullable=False),
+            pa.field("file_id", pa.string()),
+            pa.field("filename", pa.string(), nullable=False),
+            pa.field("media_type", pa.string()),
+            pa.field("byte_count", pa.int64(), nullable=False),
+            pa.field("duration_ms", pa.int64(), nullable=False),
+            pa.field("status", pa.string(), nullable=False),
+            pa.field("error_code", pa.string()),
+            pa.field("client_ip", pa.string()),
+            pa.field("user_agent", pa.string()),
+        ]
+    )
+
+
 def _search_fields(identifier: str) -> list[pa.Field]:
     return [
         pa.field(identifier, pa.string(), nullable=False),
@@ -140,7 +167,7 @@ def _search_fields(identifier: str) -> list[pa.Field]:
 
 
 class PaimonStore:
-    """Owns four append-only Paimon tables with one partition strategy."""
+    """Owns five append-only Paimon tables with one partition strategy."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -158,6 +185,7 @@ class PaimonStore:
             TEXT_TABLE: (self.settings.paimon_text_table, text_schema(self.settings), True),
             IMAGE_TABLE: (self.settings.paimon_image_table, image_schema(self.settings), True),
             AUDIO_TABLE: (self.settings.paimon_audio_table, audio_schema(self.settings), True),
+            AUDIT_TABLE: (self.settings.paimon_audit_table, audit_schema(self.settings), False),
         }
         try:
             for key, (name, schema, has_vector) in definitions.items():
@@ -222,8 +250,27 @@ class PaimonStore:
                     AUDIO_TABLE, ["file_id"], ["business_domain", "department"]
                 )
                 self._build_vector_index(AUDIO_TABLE, "audio_embedding")
+                self._build_scalar_indexes(
+                    AUDIT_TABLE,
+                    ["event_id", "token_id", "file_id"],
+                    ["business_domain", "department", "operation", "status"],
+                )
+                self._refresh_tables()
         except Exception as exc:
             raise StorageError(f"Paimon index maintenance failed: {exc}") from exc
+
+    def add_transfer_events(self, events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        columns = audit_schema(self.settings).names
+        rows = [{column: event.get(column) for column in columns} for event in events]
+        try:
+            with self._lock:
+                self._require_table(AUDIT_TABLE).add(
+                    pa.Table.from_pylist(rows, schema=audit_schema(self.settings))
+                )
+        except Exception as exc:
+            raise StorageError(f"Paimon transfer audit write failed: {exc}") from exc
 
     def list_assets(
         self,
@@ -252,7 +299,7 @@ class PaimonStore:
             ASSET_TABLE,
             PredicateBuilder.and_predicates(predicates),
             columns=PUBLIC_COLUMNS,
-            limit=limit + offset,
+            limit=None,
         )
         rows.sort(key=lambda row: (row["created_at"], row["file_id"]), reverse=True)
         return rows[offset : offset + limit]
@@ -273,6 +320,7 @@ class PaimonStore:
         self,
         *,
         business_domain: str,
+        department: str | None,
         keyword: str,
         start_date: date | None,
         end_date: date | None,
@@ -281,7 +329,9 @@ class PaimonStore:
         partition_predicate = self._partition_predicate(
             TEXT_TABLE, business_domain, start_date, end_date
         )
-        exact_predicate = self._search_predicate(TEXT_TABLE, business_domain, start_date, end_date)
+        exact_predicate = self._search_predicate(
+            TEXT_TABLE, business_domain, department, start_date, end_date
+        )
         fetch_limit = max(limit * 5, 50)
         try:
             search = (
@@ -298,11 +348,11 @@ class PaimonStore:
             rows = self._read(
                 TEXT_TABLE,
                 exact_predicate,
-                columns=SEARCH_COLUMNS,
+                columns=[*SEARCH_COLUMNS, "_ROW_ID"],
                 limit=fetch_limit,
                 global_index_result=result,
             )
-            return self._committed_hits(rows, limit)
+            return self._committed_hits(self._rank_hits(rows, result), limit)
         except Exception as exc:
             raise StorageError(f"Paimon full-text search failed: {exc}") from exc
 
@@ -310,6 +360,7 @@ class PaimonStore:
         self,
         *,
         business_domain: str,
+        department: str | None,
         vector: list[float],
         vector_field: str,
         start_date: date | None,
@@ -325,7 +376,9 @@ class PaimonStore:
             raise ConfigurationError(
                 f"Vector dimension for {vector_field} must be {expected}, got {len(vector)}"
             )
-        exact_predicate = self._search_predicate(table_key, business_domain, start_date, end_date)
+        exact_predicate = self._search_predicate(
+            table_key, business_domain, department, start_date, end_date
+        )
         partition_predicate = self._partition_predicate(
             table_key, business_domain, start_date, end_date
         )
@@ -344,16 +397,16 @@ class PaimonStore:
             rows = self._read(
                 table_key,
                 exact_predicate,
-                columns=SEARCH_COLUMNS,
+                columns=[*SEARCH_COLUMNS, "_ROW_ID"],
                 limit=fetch_limit,
                 global_index_result=result,
             )
-            return self._committed_hits(rows, limit)
+            return self._committed_hits(self._rank_hits(rows, result), limit)
         except Exception as exc:
             raise StorageError(f"Paimon vector search failed: {exc}") from exc
 
     def ping(self) -> None:
-        for key in (ASSET_TABLE, TEXT_TABLE, IMAGE_TABLE, AUDIO_TABLE):
+        for key in (ASSET_TABLE, TEXT_TABLE, IMAGE_TABLE, AUDIO_TABLE, AUDIT_TABLE):
             self._require_table(key)
         self.connection.catalog.list_tables(self.settings.paimon_database)
 
@@ -440,11 +493,13 @@ class PaimonStore:
         predicate,
         *,
         columns: list[str],
-        limit: int,
+        limit: int | None,
         global_index_result=None,
     ) -> list[dict[str, Any]]:
         raw = self._raw_table(table_key)
-        read_builder = raw.new_read_builder().with_projection(columns).with_limit(limit)
+        read_builder = raw.new_read_builder().with_projection(columns)
+        if limit is not None:
+            read_builder = read_builder.with_limit(limit)
         if predicate is not None:
             read_builder = read_builder.with_filter(predicate)
         scan = read_builder.new_scan()
@@ -457,11 +512,14 @@ class PaimonStore:
         self,
         table_key: str,
         business_domain: str,
+        department: str | None,
         start_date: date | None,
         end_date: date | None,
     ):
         builder = self._builder(table_key)
         predicates = self._domain_predicates(builder, business_domain)
+        if department:
+            predicates.append(builder.equal("department", department))
         predicates.extend(self._date_predicates(builder, start_date, end_date))
         return PredicateBuilder.and_predicates(predicates)
 
@@ -519,3 +577,29 @@ class PaimonStore:
             return self.tables[table_key]
         except KeyError as exc:
             raise StorageError(f"Paimon table {table_key} is not initialized") from exc
+
+    def _refresh_tables(self) -> None:
+        """Reload table objects so readers observe snapshots created during maintenance."""
+        names = {
+            ASSET_TABLE: self.settings.paimon_table,
+            TEXT_TABLE: self.settings.paimon_text_table,
+            IMAGE_TABLE: self.settings.paimon_image_table,
+            AUDIO_TABLE: self.settings.paimon_audio_table,
+            AUDIT_TABLE: self.settings.paimon_audit_table,
+        }
+        self.tables.update({key: self.connection.get_table(name) for key, name in names.items()})
+
+    @staticmethod
+    def _rank_hits(rows: list[dict[str, Any]], result: Any) -> list[dict[str, Any]]:
+        """Restore score order lost when Paimon's bitmap result is materialized."""
+        score_getter = getattr(result, "score_getter", lambda: None)()
+        if score_getter is not None:
+
+            def score(row: dict[str, Any]) -> float:
+                value = score_getter(row.get("_ROW_ID"))
+                return float(value) if value is not None else float("-inf")
+
+            rows.sort(key=score, reverse=True)
+        for row in rows:
+            row.pop("_ROW_ID", None)
+        return rows

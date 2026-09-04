@@ -32,11 +32,12 @@ def test_catalog_options_use_path_style_minio():
     assert options["s3.path-style-access"] == "true"
 
 
-def test_four_table_defaults_and_index_settings():
+def test_five_table_defaults_and_index_settings():
     settings = Settings()
     assert settings.paimon_table == "multimodal_asset_descriptor"
     assert settings.paimon_text_table == "multimodal_text_segment"
     assert settings.paimon_image_table == "multimodal_image_feature"
     assert settings.paimon_audio_table == "multimodal_audio_feature"
+    assert settings.paimon_audit_table == "multimodal_transfer_audit"
     assert settings.paimon_domain_shards == 32
     assert settings.paimon_vector_index_type == "ivf-sq"

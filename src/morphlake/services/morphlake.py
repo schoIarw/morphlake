@@ -33,6 +33,7 @@ class MorphLakeService:
         self.objects = objects or MinioStore(settings)
         self.catalog = catalog or PaimonStore(settings)
         self.models = models or ModelGateway(settings.models_config)
+        self._index_error: str | None = None
 
     def initialize(self) -> None:
         self._validate_dimensions()
@@ -124,12 +125,14 @@ class MorphLakeService:
         content_type: str | None,
         body: bytes,
         business_domain: str,
+        department: str | None = None,
         start_date=None,
         end_date=None,
     ):
         """Vectorize an uploaded query file by modality and return Paimon Top 10."""
         filename = Path(filename).name.strip()
         business_domain = business_domain.strip()
+        department = department.strip() if department else None
         if not filename or not business_domain:
             raise MorphLakeError(
                 "invalid_vector_query", "filename and business_domain are required"
@@ -169,6 +172,7 @@ class MorphLakeService:
 
         return self.catalog.vector_search(
             business_domain=business_domain,
+            department=department,
             vector=vector,
             vector_field=vector_field,
             start_date=start_date,
@@ -178,16 +182,29 @@ class MorphLakeService:
 
     def ready(self) -> dict[str, str]:
         checks: dict[str, str] = {}
-        for name, callback in (("minio", self.objects.ping), ("paimon", self.catalog.ping)):
+        for name, callback in (
+            ("minio", self.objects.ping),
+            ("paimon", self.catalog.ping),
+            ("models", self.models.ping),
+        ):
             try:
                 callback()
                 checks[name] = "ok"
             except Exception as exc:  # readiness must report all failed dependencies
                 checks[name] = f"error: {exc}"
+        checks["indexes"] = f"error: {self._index_error}" if self._index_error else "ok"
         return checks
 
     def maintain(self) -> None:
-        self.catalog.maintain_indexes()
+        try:
+            self.catalog.maintain_indexes()
+            self._index_error = None
+        except Exception as exc:
+            self._index_error = str(exc)
+            raise
+
+    def flush_transfer_events(self, events: list[dict[str, Any]]) -> None:
+        self.catalog.add_transfer_events(events)
 
     def _records(
         self,

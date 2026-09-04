@@ -6,11 +6,19 @@ from __future__ import annotations
 class MorphLakeError(Exception):
     """Base application error with a stable machine-readable code."""
 
-    def __init__(self, code: str, message: str, status_code: int = 400):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status_code: int = 400,
+        *,
+        headers: dict[str, str] | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.status_code = status_code
+        self.headers = headers or {}
 
 
 class NotFoundError(MorphLakeError):

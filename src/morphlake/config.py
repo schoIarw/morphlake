@@ -23,10 +23,30 @@ class Settings(BaseSettings):
     environment: str = Field("development", alias="MORPHLAKE_ENV")
     host: str = Field("0.0.0.0", alias="MORPHLAKE_HOST")
     port: int = Field(8080, alias="MORPHLAKE_PORT")
+    admin_port: int = Field(8081, alias="MORPHLAKE_ADMIN_PORT")
     log_level: str = Field("INFO", alias="MORPHLAKE_LOG_LEVEL")
-    api_key: str | None = Field(None, alias="MORPHLAKE_API_KEY")
     max_upload_mb: int = Field(200, alias="MORPHLAKE_MAX_UPLOAD_MB")
     models_config: Path = Field(Path("config/models.yaml"), alias="MORPHLAKE_MODELS_CONFIG")
+    admin_db_path: Path = Field(
+        Path("/app/data/morphlake-admin.db"), alias="MORPHLAKE_ADMIN_DB_PATH"
+    )
+    admin_username: str = Field("admin", alias="MORPHLAKE_ADMIN_USERNAME")
+    admin_password: str = Field("change-me", alias="MORPHLAKE_ADMIN_PASSWORD")
+    token_pepper: str = Field("change-me-in-production", alias="MORPHLAKE_TOKEN_PEPPER")
+    metrics_token: str | None = Field(None, alias="MORPHLAKE_METRICS_TOKEN")
+    prometheus_url: str | None = Field(None, alias="PROMETHEUS_URL")
+    health_check_interval_seconds: int = Field(
+        15, alias="MORPHLAKE_HEALTH_CHECK_INTERVAL_SECONDS", ge=5
+    )
+    default_rate_period_seconds: int = Field(
+        60, alias="MORPHLAKE_DEFAULT_RATE_PERIOD_SECONDS", ge=1
+    )
+    default_upload_requests: int = Field(60, alias="MORPHLAKE_DEFAULT_UPLOAD_REQUESTS", ge=0)
+    default_download_requests: int = Field(120, alias="MORPHLAKE_DEFAULT_DOWNLOAD_REQUESTS", ge=0)
+    default_upload_bytes: int = Field(1_073_741_824, alias="MORPHLAKE_DEFAULT_UPLOAD_BYTES", ge=0)
+    default_download_bytes: int = Field(
+        5_368_709_120, alias="MORPHLAKE_DEFAULT_DOWNLOAD_BYTES", ge=0
+    )
 
     minio_endpoint: str = Field("localhost:9000", alias="MINIO_ENDPOINT")
     minio_access_key: str = Field("minioadmin", alias="MINIO_ACCESS_KEY")
@@ -41,6 +61,7 @@ class Settings(BaseSettings):
     paimon_text_table: str = Field("multimodal_text_segment", alias="PAIMON_TEXT_TABLE")
     paimon_image_table: str = Field("multimodal_image_feature", alias="PAIMON_IMAGE_TABLE")
     paimon_audio_table: str = Field("multimodal_audio_feature", alias="PAIMON_AUDIO_TABLE")
+    paimon_audit_table: str = Field("multimodal_transfer_audit", alias="PAIMON_AUDIT_TABLE")
     paimon_warehouse: str = Field("s3://morphlake-paimon/warehouse", alias="PAIMON_WAREHOUSE")
     paimon_domain_shards: int = Field(32, alias="PAIMON_DOMAIN_SHARDS", ge=1, le=4096)
     paimon_vector_index_type: str = Field("ivf-sq", alias="PAIMON_VECTOR_INDEX_TYPE")
@@ -49,6 +70,13 @@ class Settings(BaseSettings):
     )
     paimon_index_row_count_per_shard: int = Field(
         500_000, alias="PAIMON_INDEX_ROW_COUNT_PER_SHARD", ge=1
+    )
+    paimon_audit_flush_interval_seconds: int = Field(
+        5, alias="PAIMON_AUDIT_FLUSH_INTERVAL_SECONDS", ge=1
+    )
+    paimon_audit_batch_size: int = Field(1_000, alias="PAIMON_AUDIT_BATCH_SIZE", ge=1, le=100_000)
+    transfer_sqlite_retention_days: int = Field(
+        30, alias="MORPHLAKE_TRANSFER_SQLITE_RETENTION_DAYS", ge=1
     )
     text_vector_dimension: int = Field(384, alias="PAIMON_TEXT_VECTOR_DIMENSION")
     image_vector_dimension: int = Field(512, alias="PAIMON_IMAGE_VECTOR_DIMENSION")
@@ -62,7 +90,7 @@ class Settings(BaseSettings):
             raise ValueError("PAIMON_VECTOR_INDEX_TYPE is not supported by PyPaimon 2.0")
         return value
 
-    @field_validator("api_key", "minio_region", mode="before")
+    @field_validator("minio_region", "metrics_token", "prometheus_url", mode="before")
     @classmethod
     def empty_to_none(cls, value: Any) -> Any:
         return None if value == "" else value

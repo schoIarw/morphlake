@@ -1,203 +1,163 @@
-# API 使用说明
+# MorphLake API
 
-基础地址示例：`http://localhost:8080`。如设置了 `MORPHLAKE_API_KEY`，除健康检查外的请求
-都必须携带 `X-API-Key`。完整机器可读契约位于运行时 `/openapi.json`。
+业务 API 默认地址为 `http://localhost:8080`。除 `/health/live` 外，所有业务接口都必须携带
+管理台分配的 Token：
 
-所有错误使用固定结构：
+```http
+Authorization: Bearer mlk_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+兼容客户端也可使用 `X-API-Token` 或 `X-API-Key` 传递同一个动态 Token；推荐 Bearer。
+Token 固定绑定一个 `business_domain + department`。请求省略范围时服务自动使用 Token 范围；
+显式提交其他范围返回 403 `token_scope_mismatch`。
+
+## 错误格式与 Token 状态
 
 ```json
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "Request validation failed",
-    "details": []
-  }
-}
+{"error":{"code":"token_disabled","message":"API token is disabled"}}
 ```
+
+| HTTP | code | 含义 |
+| --- | --- | --- |
+| 401 | `token_required` | 未提交 Token |
+| 401 | `token_invalid` | Token 不存在或密钥不正确 |
+| 401 | `token_invalid_scheme` | Authorization 不是 Bearer |
+| 403 | `token_disabled` | Token 已停用 |
+| 403 | `token_deleted` | Token 已删除 |
+| 403 | `token_expired` | Token 已过期 |
+| 403 | `token_scope_mismatch` | 请求超出业务域或部门范围 |
+| 429 | `rate_limit_exceeded` | 上传/下载周期次数或字节配额耗尽 |
+
+429 响应包含 `Retry-After` 秒数。Token 限流同时检查周期请求次数和周期字节数；配置值 0
+表示该项不限制。
 
 ## 健康检查
 
 ```bash
 curl http://localhost:8080/health/live
-curl http://localhost:8080/health/ready
+curl http://localhost:8080/health/ready \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN"
 ```
 
-`live` 只表示进程可响应；`ready` 会检查 MinIO 和 Paimon。
+`live` 只表示 API 进程可响应。`ready` 检查 MinIO、Paimon、模型端点以及最近一次索引维护
+状态；依赖失败时返回 503。
 
 ## 上传
 
-推荐按文件模态使用固定接口，均为 `multipart/form-data`：
+通用上传接口会按扩展名识别文档、图片或音频；类型专用接口会额外验证文件类型。
 
-| 模态 | 接口 | 支持示例 |
-| --- | --- | --- |
-| 文档 | `POST /api/v1/files/documents` | PDF、DOCX、TXT、Markdown、CSV、JSON、HTML |
-| 图片 | `POST /api/v1/files/images` | PNG、JPG、WebP、BMP、TIFF |
-| 音频 | `POST /api/v1/files/audio` | WAV、MP3、M4A、FLAC、OGG、AAC |
-
-接口会校验扩展名与目标模态是否一致，错传返回 415。兼容接口 `POST /api/v1/files`
-仍可根据扩展名自动分类。
+| 类型 | 路径 |
+| --- | --- |
+| 自动识别 | `POST /api/v1/files` |
+| 文档 | `POST /api/v1/files/documents` |
+| 图片 | `POST /api/v1/files/images` |
+| 音频 | `POST /api/v1/files/audio` |
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/files/documents \
-  -H 'X-API-Key: change-me' \
-  -F 'business_domain=finance' \
-  -F 'department=treasury' \
-  -F 'file=@./liquidity-report.docx'
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
+  -F 'business_domain=risk' \
+  -F 'department=audit' \
+  -F 'file=@./report.pdf'
 ```
 
-成功返回 201：
-
-```json
-{
-  "file_id": "1d8b9f47-20fe-4ef5-a37c-3023074cc758",
-  "filename": "liquidity-report.docx",
-  "media_type": "document",
-  "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "file_size": 12034,
-  "business_domain": "finance",
-  "department": "treasury",
-  "created_at": "2026-08-30T03:00:00Z",
-  "object_bucket": "morphlake-data",
-  "object_key": "finance/treasury/2026/08/30/.../liquidity-report.docx",
-  "object_etag": "...",
-  "chunk_count": 8
-}
-```
+上传成功返回 201 和资产描述符。原始二进制写入 MinIO；Paimon 只保存描述符、切片和向量。
 
 ## 清单查询
 
-`GET /api/v1/files`。
-
-| 参数 | 类型 | 说明 |
-| --- | --- | --- |
-| `media_type` | string | document / image / audio |
-| `business_domain` | string | 业务域精确匹配 |
-| `department` | string | 部门精确匹配 |
-| `filename` | string | 文件名包含匹配 |
-| `start_date` | date | 起始日期（含） |
-| `end_date` | date | 结束日期（含） |
-| `limit` | int | 1–200，默认 50 |
-| `offset` | int | 默认 0 |
-
 ```bash
 curl -G http://localhost:8080/api/v1/files \
-  -H 'X-API-Key: change-me' \
-  --data-urlencode 'business_domain=finance' \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   --data-urlencode 'media_type=document' \
-  --data-urlencode 'filename=liquidity' \
-  --data-urlencode 'start_date=2026-08-01' \
-  --data-urlencode 'end_date=2026-08-31' \
-  --data-urlencode 'limit=50'
+  --data-urlencode 'business_domain=risk' \
+  --data-urlencode 'department=audit' \
+  --data-urlencode 'filename=report' \
+  --data-urlencode 'start_date=2026-01-01' \
+  --data-urlencode 'end_date=2026-12-31' \
+  --data-urlencode 'limit=50' \
+  --data-urlencode 'offset=0'
 ```
+
+支持类型、业务域、部门、文件名关键字和闭区间日期过滤；结果按 `created_at/file_id` 倒序。
 
 ## 全文检索
 
-`POST /api/v1/search/full-text`。
-
 ```bash
 curl -X POST http://localhost:8080/api/v1/search/full-text \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   -H 'Content-Type: application/json' \
-  -H 'X-API-Key: change-me' \
   -d '{
-    "business_domain": "finance",
-    "keyword": "liquidity coverage ratio",
-    "start_date": "2026-08-01",
-    "end_date": "2026-08-31",
-    "limit": 20
+    "business_domain":"risk",
+    "department":"audit",
+    "keyword":"counterparty exposure",
+    "start_date":"2026-01-01",
+    "end_date":"2026-12-31",
+    "limit":20
   }'
 ```
 
-返回按 Paimon 搜索顺序排列的文件/切片命中列表，`rank` 从 1 开始。
+使用 Paimon `full-text` 原生全局索引，返回文件或切片命中清单。
 
-全文和向量索引由容器按 `PAIMON_INDEX_BUILD_INTERVAL_SECONDS` 增量维护。上传成功后，清单和
-下载立即可用；新内容通常在下一轮索引维护后进入全文/向量结果（默认最多约 5 分钟，Ollama
-本地配置约 30 秒）。
+## 直接向量检索
 
-## 向量检索
-
-### 上传查询文件并返回 Top10
-
-`POST /api/v1/search/vector/file` 接收文档、图片或音频查询文件，自动选择与上传入库时
-一致的向量模型，并调用 Paimon 原生向量索引返回最多 10 条清单：文档查询匹配文档切片，
-图片查询匹配图片文件，音频查询匹配音频文件。查询文件仅用于生成查询向量，不写入
-MinIO 或 Paimon。
-
-```bash
-curl -X POST http://localhost:8080/api/v1/search/vector/file \
-  -H 'X-API-Key: change-me' \
-  -F 'business_domain=finance' \
-  -F 'start_date=2026-08-01' \
-  -F 'end_date=2026-08-31' \
-  -F 'file=@./query-image.png'
-```
-
-返回结构：
-
-```json
-{
-  "items": [
-    {
-      "rank": 1,
-      "file_id": "...",
-      "filename": "similar-image.png",
-      "media_type": "image",
-      "business_domain": "finance",
-      "department": "treasury",
-      "created_at": "2026-08-20T03:00:00Z",
-      "record_type": "file",
-      "chunk_index": null,
-      "content_text": null
-    }
-  ],
-  "returned": 1
-}
-```
-
-扫描版 PDF 若无法提取文本会返回 422。日期为可选字段，且 `start_date` 不能晚于
-`end_date`。
-
-### 直接提交向量
-
-`POST /api/v1/search/vector`。
+向量维度必须与对应模型及 Paimon 表一致。
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/search/vector \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   -H 'Content-Type: application/json' \
-  -H 'X-API-Key: change-me' \
-  -d '{
-    "business_domain": "finance",
-    "vector_field": "image",
-    "vector": [0.01, -0.02],
-    "start_date": "2026-08-01",
-    "end_date": "2026-08-31",
-    "limit": 10
-  }'
+  --data-binary @vector-request.json
 ```
 
-示例数组为简写；实际维度必须严格等于所选模态配置。`vector_field` 可为 `text`、`image`
-或 `audio`；未传 `limit` 时默认返回 Top10。
+`vector-request.json`：
+
+```json
+{
+  "business_domain": "risk",
+  "department": "audit",
+  "vector_field": "text",
+  "vector": [0.01, 0.02],
+  "start_date": "2026-01-01",
+  "end_date": "2026-12-31",
+  "limit": 10
+}
+```
+
+示例向量仅展示结构，必须替换为完整维度。结果按 Paimon 相似度分数降序恢复并生成 `rank`。
+
+## 上传查询文件并返回 Top10
+
+查询文件只用于向量化，不会写入 MinIO 或 Paimon。
+
+```bash
+curl -X POST http://localhost:8080/api/v1/search/vector/file \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
+  -F 'business_domain=risk' \
+  -F 'department=audit' \
+  -F 'start_date=2026-01-01' \
+  -F 'end_date=2026-12-31' \
+  -F 'file=@./query.png'
+```
+
+文档提取和切片后取归一化平均向量；图片调用视觉描述再做文本向量；音频使用配置的音频
+向量链路。固定返回同模态 Top10。
 
 ## 下载
 
-`GET /api/v1/files/{file_id}/download`。
-
 ```bash
-curl -L -OJ \
-  -H 'X-API-Key: change-me' \
-  http://localhost:8080/api/v1/files/1d8b9f47-20fe-4ef5-a37c-3023074cc758/download
+curl -OJ \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
+  http://localhost:8080/api/v1/files/FILE_ID/download
 ```
 
-响应包含 `Content-Disposition`、`Content-Length` 和 `ETag`，文件内容从 MinIO 流式传输。
+下载前验证资产所属业务域和部门，并按 Token 下载次数及字节配额限流。
 
-## 常见状态码
+## Prometheus 与 OpenAPI
 
-| 状态码 | 含义 |
-| --- | --- |
-| 201 | 上传成功 |
-| 400 | 业务参数错误 |
-| 401 | API key 缺失或错误 |
-| 404 | 文件不存在 |
-| 413 | 超过上传大小限制 |
-| 415 | 文件类型不支持 |
-| 422 | 请求结构或字段校验失败 |
-| 503 | MinIO、模型或 Paimon 不可用 |
+```bash
+curl http://localhost:8080/metrics \
+  -H "Authorization: Bearer $MORPHLAKE_METRICS_TOKEN"
+```
+
+指标 Token 与业务 Token 相互独立。`/docs` 和 `/openapi.json` 使用管理账号 HTTP Basic
+认证。管理服务运行在 8081，不承载任何 `/api/v1` 业务接口。

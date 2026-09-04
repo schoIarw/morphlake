@@ -4,23 +4,27 @@
 
 ```mermaid
 flowchart TB
-    C["用户或应用"] --> S["MorphLake Python / FastAPI\n单容器"]
-    S --> O["MinIO 数据桶\n原始文件"]
-    S --> P["Paimon 四表模型\n描述符、文本、图片、音频"]
-    S --> G["配置化模型\n嵌入与转写"]
+    C["用户或应用"] --> S["API 容器 :8080"]
+    A["管理员"] --> M["管理容器 :8081"]
+    S --> D["共享 SQLite\n认证、限流、outbox"]
+    M --> D
+    S --> O["MinIO\n原始文件"]
+    S --> P["Paimon 五表\n资产、特征、审计"]
+    S --> G["配置化模型"]
     P --> W["MinIO Paimon warehouse"]
 ```
 
-工程不引入 Spark、Milvus、Elasticsearch 或任务队列。服务容器使用 PyPaimon 直接写入并
-查询 Paimon 2.0；索引维护也是该容器内的轻量后台循环，不需要常驻 Flink 作业。
+工程不引入 Spark、Milvus、Elasticsearch 或任务队列。业务 API 与 Web 管理使用同一镜像、
+两个独立容器，拥有独立端口、进程和健康检查，可独立重启。API 使用 PyPaimon 直接写入并
+查询 Paimon 2.0；索引维护也是 API 容器内的轻量后台循环，不需要常驻 Flink 作业。
 
 ## 面向 100,000,000 条/日的模型
 
 十年理论总量约 3650 亿条。工程不按“部门 × 类型 × 日期”组合创建物理表，否则表数量、
-元数据和运维复杂度会随组织变化持续膨胀。固定使用四张不同粒度的表：资产描述符、文本
-切片、图片特征、音频特征。
+元数据和运维复杂度会随组织变化持续膨胀。固定使用五张不同粒度的表：资产描述符、文本
+切片、图片特征、音频特征、传输审计。
 
-四表统一按 `ingest_date / domain_shard` 分区，其中 `domain_shard` 是业务域 SHA-256 的稳定
+五表统一按 `ingest_date / domain_shard` 分区，其中 `domain_shard` 是业务域 SHA-256 的稳定
 哈希模 32。业务部门、业务域和媒体类型使用 Bitmap 索引，保留精确业务过滤能力而不形成
 高基数目录。所有表使用 `bucket=-1`，由全局索引分片控制索引规模。
 
@@ -33,7 +37,7 @@ sequenceDiagram
     participant G as 模型
     participant P as Paimon
     A->>M: 检查/创建 bucket
-    A->>P: 自动创建并校验四张表
+    A->>P: 自动创建并校验五张表
     A->>M: 上传原始文件
     A->>G: 提取、切片、向量化
     A->>P: 写特征/切片表
@@ -63,6 +67,7 @@ PyPaimon 增量索引构建，已索引 row range 会跳过。默认 300 秒，M
 | 文本切片 | file_id BTree；业务字段 Bitmap；content_text Full-Text；text_embedding IVF-SQ |
 | 图片特征 | file_id BTree；业务字段 Bitmap；image_embedding IVF-SQ |
 | 音频特征 | file_id BTree；业务字段 Bitmap；audio_embedding IVF-SQ |
+| 传输审计 | event_id/token_id/file_id BTree；业务域/部门/操作/状态 Bitmap |
 
 默认搜索模式为 `fast`，因此新写入数据会在下一次索引维护完成后进入全文/向量 TopK；清单
 和下载不受此延迟影响。若本地测试需要更快可缩短间隔，生产环境应根据每批行数和索引耗时
@@ -72,7 +77,8 @@ PyPaimon 增量索引构建，已索引 row range 会跳过。默认 300 秒，M
 
 1. 以真实日写入量压测每日分区文件数、索引耗时和查询 P99，并调整分片数；既有表的分片
    算法与数量不能直接在线变更。
-2. 固定一个服务 worker。扩展为多副本前，应增加 Paimon 提交冲突重试和写入协调。
+2. 单个 API 容器固定一个 worker；同一 Docker 主机可启动多个 API 副本，共享 SQLite WAL，
+   审计 outbox 使用租约避免重复消费。跨主机扩容前需替换 SQLite，并完善 Paimon 提交重试。
 3. 为 MinIO 开启版本控制、容量告警、跨站备份和生命周期策略；十年保留应由合规策略确认。
 4. 监控索引维护失败、最近成功时间、模型错误、Paimon 提交、MinIO 容量和小文件数量。
 5. 规划离线 compact 与过期分区维护窗口；维护任务可按需使用短生命周期 Flink 作业，但不

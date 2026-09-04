@@ -1,5 +1,5 @@
 services:
-  morphlake:
+  morphlake-api:
     build: .
     image: morphlake:ollama-local
     env_file: .env.ollama
@@ -7,4 +7,31 @@ services:
       - "8080:8080"
     volumes:
       - ./config/models.ollama.yaml:/app/config/models.ollama.yaml:ro
+      - morphlake-admin-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/live', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     restart: unless-stopped
+
+  morphlake-admin:
+    build: .
+    image: morphlake:ollama-local
+    env_file: .env.ollama
+    command: ["uvicorn", "morphlake.admin_main:app", "--host", "0.0.0.0", "--port", "8081", "--workers", "1"]
+    ports:
+      - "8081:8081"
+    volumes:
+      - morphlake-admin-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health/live', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  morphlake-admin-data:

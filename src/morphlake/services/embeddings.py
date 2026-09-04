@@ -77,6 +77,21 @@ class ModelGateway:
         except (httpx.HTTPError, ValueError) as exc:
             raise StorageError(f"Audio transcription failed: {exc}") from exc
 
+    def ping(self) -> None:
+        """Check each distinct configured remote model endpoint."""
+        endpoints: dict[str, ModelSpec] = {}
+        for spec in self.specs.values():
+            if spec.provider == "openai_compatible" and spec.base_url:
+                endpoints[f"{spec.base_url.rstrip('/')}/models"] = spec
+            elif spec.provider == "ollama_vision_caption" and spec.base_url:
+                endpoints[f"{spec.base_url.rstrip('/')}/api/tags"] = spec
+        for url, spec in endpoints.items():
+            try:
+                response = httpx.get(url, headers=self._headers(spec), timeout=5)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise StorageError(f"Model endpoint unavailable at {url}: {exc}") from exc
+
     def _embed(self, name: str, value: str) -> list[float]:
         spec = self._spec(name)
         if spec.provider == "hash":

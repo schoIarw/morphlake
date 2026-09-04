@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: morphlake-api
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/morphlake-metrics-token
+    static_configs:
+      - targets: ["morphlake-api:8080"]
+
+  - job_name: morphlake-admin
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/morphlake-metrics-token
+    static_configs:
+      - targets: ["morphlake-admin:8081"]

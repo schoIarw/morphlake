@@ -1,7 +1,8 @@
 # MorphLake
 
 MorphLake 是一个以 **Apache Paimon 2.0 + MinIO** 为核心的多模态数据底座。它用一个
-Python/FastAPI 容器提供上传、清单查询、全文检索、向量检索和下载接口，不引入 Spark、
+Python/FastAPI API 容器提供上传、清单查询、全文检索、向量检索和下载接口，独立管理容器
+提供 Token、配额、统计和监控页面；不引入 Spark、
 Milvus、Elasticsearch，也不依赖常驻 Flink 作业。
 
 > 当前状态：可运行的首个版本。生产部署前需要接入实际 MinIO 地址和模型网关，并根据
@@ -9,18 +10,21 @@ Milvus、Elasticsearch，也不依赖常驻 Flink 作业。
 
 ## 设计目标
 
-- **简单**：服务、写入和索引构建都在一个 Python 容器内完成。
-- **稳定**：四张固定粒度的追加型 Paimon 表、单进程写锁；不维护常驻计算作业。
+- **简单**：同一 Python 镜像分别启动 API 与管理容器，不新增检索或任务队列组件。
+- **稳定**：五张固定粒度的追加型 Paimon 表、SQLite 原子限流；不维护常驻计算作业。
 - **Descriptor‑Only**：文件二进制只存 MinIO；Paimon 保存对象引用、元数据、文本和向量。
 - **原生检索**：全文使用 Paimon `full-text`，向量默认使用 Paimon `ivf-sq` 全局索引。
 - **配置驱动模型**：模型提供方、地址、模型名、维度、超时均在 YAML/环境变量中配置。
 
 ```mermaid
 flowchart TB
-    C["用户或应用"] --> A["MorphLake FastAPI<br/>单容器"]
+    C["用户或应用"] --> A["API 容器 :8080"]
+    U["管理员"] --> D["管理容器 :8081"]
+    A --> S["共享 SQLite<br/>Token、限流、审计 outbox"]
+    D --> S
     A --> M["MinIO<br/>原始文件"]
-    A --> P["Paimon 2.0<br/>描述符、切片、向量、索引"]
-    A --> G["配置化模型 API<br/>向量与语音转写"]
+    A --> P["Paimon 2.0<br/>描述符、特征、审计"]
+    A --> G["配置化模型 API"]
     P --> W["MinIO<br/>Paimon warehouse"]
 ```
 
@@ -37,6 +41,9 @@ flowchart TB
 | 全文检索 | 业务域、日期范围、全文关键字 |
 | 向量检索 | 上传文档/图片/音频自动向量化并返回 Paimon Top10；也支持直接提交向量 |
 | 下载 | 按 `file_id` 流式下载 MinIO 对象 |
+| 访问控制 | Token 绑定业务域/部门；支持启用、停用、删除和过期状态 |
+| 流量治理 | 按 Token 配置上传/下载周期次数及字节配额 |
+| 运维 | 独立 Web 管理容器、Prometheus 指标、Grafana 面板、天/周/月统计 |
 
 旧式二进制 `.doc` 会返回 415；请先转换为 `.docx`。扫描版 PDF 的 OCR 不在默认链路中，
 可通过模型网关扩展。
@@ -115,24 +122,34 @@ curl http://localhost:11434/api/chat \
 ```bash
 cp .env.ollama.example .env.ollama
 docker compose -f docker-compose.ollama.yml up --build -d
-curl http://localhost:8080/health/ready
+curl http://localhost:8080/health/live
 ```
 
 容器通过 Docker Desktop 的 `host.docker.internal:11434` 访问 Mac 上的 Ollama。本配置使用
-一套带 `_ollama` 后缀的四张 Paimon 表，避免与默认 384/512 维索引混用。不要在已有 Paimon
+一套带 `_ollama` 后缀的五张 Paimon 表，避免与默认 384/512 维索引混用。不要在已有 Paimon
 向量表上直接修改维度。
 
-### 2. 启动单容器
+### 2. 启动 API 与独立管理容器
 
 ```bash
 docker compose up --build -d
-curl http://localhost:8080/health/ready
+curl http://localhost:8080/health/live
+curl http://localhost:8081/health/live
+```
+
+访问 `http://localhost:8081/admin`，使用 `.env` 中的管理账号登录，创建绑定业务域和部门的
+Token。完整 Token 只显示一次：
+
+```bash
+export MORPHLAKE_TOKEN='mlk_...'
+curl http://localhost:8080/health/ready \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN"
 ```
 
 容器启动时会：
 
 1. 检查并创建两个 MinIO bucket（需要账号具有相应权限）；
-2. 自动创建资产描述符、文本切片、图片特征和音频特征四张 Paimon 表；
+2. 自动创建资产描述符、文本切片、图片特征、音频特征和传输审计五张 Paimon 表；
 3. 校验已存在表的字段、`ingest_date/domain_shard` 分区、`bucket=-1` 和 deletion-vector；
 4. 启动定时增量索引维护；上传请求本身不重建索引。
 
@@ -140,7 +157,7 @@ curl http://localhost:8080/health/ready
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/files/documents \
-  -H 'X-API-Key: replace-if-configured' \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   -F 'business_domain=risk' \
   -F 'department=compliance' \
   -F 'file=@./contract.pdf'
@@ -150,7 +167,7 @@ curl -X POST http://localhost:8080/api/v1/files/documents \
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/search/vector/file \
-  -H 'X-API-Key: replace-if-configured' \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   -F 'business_domain=risk' \
   -F 'start_date=2026-01-01' \
   -F 'end_date=2026-12-31' \
@@ -159,7 +176,7 @@ curl -X POST http://localhost:8080/api/v1/search/vector/file \
 
 ```bash
 curl -G http://localhost:8080/api/v1/files \
-  -H 'X-API-Key: replace-if-configured' \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   --data-urlencode 'media_type=document' \
   --data-urlencode 'business_domain=risk' \
   --data-urlencode 'department=compliance' \
@@ -171,7 +188,7 @@ curl -G http://localhost:8080/api/v1/files \
 ```bash
 curl -X POST http://localhost:8080/api/v1/search/full-text \
   -H 'Content-Type: application/json' \
-  -H 'X-API-Key: replace-if-configured' \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   -d '{
     "business_domain": "risk",
     "keyword": "counterparty exposure",
@@ -198,23 +215,25 @@ PY
 
 curl -X POST http://localhost:8080/api/v1/search/vector \
   -H 'Content-Type: application/json' \
-  -H 'X-API-Key: replace-if-configured' \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   --data-binary @/tmp/vector-request.json
 ```
 
 ```bash
 curl -OJ \
-  -H 'X-API-Key: replace-if-configured' \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   http://localhost:8080/api/v1/files/FILE_ID/download
 ```
 
 完整接口说明见 [docs/api.md](docs/api.md)，表结构见
 [docs/table-model.md](docs/table-model.md)，架构和生产注意事项见
-[docs/architecture.md](docs/architecture.md)。启动后也可访问 `/docs` 查看 OpenAPI UI。
+[docs/architecture.md](docs/architecture.md)，管理、限流和监控见
+[docs/administration.md](docs/administration.md)。启动后可访问 API 容器 `/docs`，使用管理账号
+HTTP Basic 认证后查看 OpenAPI UI。
 
 ## 海量数据分区与 unaware bucket
 
-四表统一按 `ingest_date / domain_shard` 分区，并设置 `bucket=-1`。`domain_shard` 是业务域的
+五表统一按 `ingest_date / domain_shard` 分区，并设置 `bucket=-1`。`domain_shard` 是业务域的
 稳定哈希模 32；部门、业务域和媒体类型使用 Bitmap 索引，不按“部门 × 模态 × 日期”动态
 分表。这样在每天 1 亿条、十年约 3650 亿条的规划下，表数量仍固定，日期裁剪与索引分片也
 可独立维护。PyPaimon 2.0 的通用全文和向量全局索引要求 unaware bucket，固定桶会被拒绝。
