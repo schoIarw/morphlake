@@ -247,8 +247,8 @@ HTTP Basic 认证后查看 OpenAPI UI。
 python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
-ruff format --check .
-ruff check .
+ruff format --check src tests
+ruff check src tests
 pytest -q
 ```
 
