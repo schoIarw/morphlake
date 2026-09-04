@@ -27,9 +27,7 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", alias="MORPHLAKE_LOG_LEVEL")
     max_upload_mb: int = Field(200, alias="MORPHLAKE_MAX_UPLOAD_MB")
     models_config: Path = Field(Path("config/models.yaml"), alias="MORPHLAKE_MODELS_CONFIG")
-    admin_db_path: Path = Field(
-        Path("/app/data/morphlake-admin.db"), alias="MORPHLAKE_ADMIN_DB_PATH"
-    )
+    admin_db_path: Path = Field(Path("data/morphlake-admin.db"), alias="MORPHLAKE_ADMIN_DB_PATH")
     admin_username: str = Field("admin", alias="MORPHLAKE_ADMIN_USERNAME")
     admin_password: str = Field("change-me", alias="MORPHLAKE_ADMIN_PASSWORD")
     token_pepper: str = Field("change-me-in-production", alias="MORPHLAKE_TOKEN_PEPPER")

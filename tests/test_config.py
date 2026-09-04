@@ -34,6 +34,7 @@ def test_catalog_options_use_path_style_minio():
 
 def test_five_table_defaults_and_index_settings():
     settings = Settings()
+    assert settings.admin_db_path == Path("data/morphlake-admin.db")
     assert settings.paimon_table == "multimodal_asset_descriptor"
     assert settings.paimon_text_table == "multimodal_text_segment"
     assert settings.paimon_image_table == "multimodal_image_feature"
