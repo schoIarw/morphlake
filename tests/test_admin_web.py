@@ -32,7 +32,7 @@ class FakeApiClient:
                     "content_text": "report body",
                 },
             )
-        if path == "/api/v1/files" and method == "GET":
+        if path in {"/api/v1/files", "/api/v1/admin/files"} and method == "GET":
             return ApiResult(
                 200,
                 {
@@ -48,6 +48,7 @@ class FakeApiClient:
                         }
                     ],
                     "returned": 1,
+                    "total": 41,
                 },
             )
         if "search" in path:
@@ -220,9 +221,15 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
     ):
         response = client.get(path)
         assert response.status_code == 200
-        assert "API Key" in response.text
-        assert 'name="business_domain"' not in response.text
-        assert 'name="department"' not in response.text
+        if path == "/admin/api/files":
+            assert "共 41 条" in response.text
+            assert "业务域（可选）" in response.text
+            assert "描述/概要模糊匹配" in response.text
+            assert "下一页" in response.text
+        else:
+            assert "API Key" in response.text
+            assert 'name="business_domain"' not in response.text
+            assert 'name="department"' not in response.text
         assert "spinner" in response.text
         assert "form.dataset.submitting" in response.text
 
@@ -258,7 +265,7 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
     assert "[0.1, 0.2, 0.3, …]" in files.text
     assert "preview-open" in files.text
     assert "download-file" in files.text
-    assert api.calls[-1]["path"] == "/api/v1/files"
+    assert api.calls[-1]["path"] == "/api/v1/admin/files"
 
     full_text = client.post(
         "/admin/api/full-text",
@@ -326,6 +333,28 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
     media = client.get("/admin/api/files/file-1/media", headers={"X-MorphLake-Key": token})
     assert media.status_code == 200
     assert media.headers["content-type"] == "audio/mpeg"
+
+    filtered = client.get(
+        "/admin/api/files",
+        params={
+            "business_domain": "risk",
+            "department": "audit",
+            "filename": "report",
+            "description": "summary",
+            "page": 3,
+            "page_size": 20,
+        },
+    )
+    assert filtered.status_code == 200
+    assert "risk" in filtered.text
+    assert "共 41 条" in filtered.text
+    assert api.calls[-1]["path"] == "/api/v1/admin/files"
+    assert api.calls[-1]["params"]["offset"] == 40
+    assert api.calls[-1]["params"]["description"] == "summary"
+
+    default_preview = client.get("/admin/api/files/file-1/preview")
+    assert default_preview.status_code == 200
+    assert api.calls[-1]["token"].startswith("mlk_")
 
 
 def test_admin_is_independent_and_exports_metrics(tmp_path: Path):

@@ -17,6 +17,7 @@ from morphlake.auth import (
     enforce_asset_access,
     get_admin_store,
     read_scope,
+    require_admin_token,
     require_token,
     write_scope,
 )
@@ -231,6 +232,44 @@ def list_files(
     )
     items = [Asset.model_validate(row) for row in rows]
     return AssetList(items=items, limit=limit, offset=offset, returned=len(items))
+
+
+@router.get("/api/v1/admin/files", response_model=AssetList, tags=["administration"])
+def admin_list_files(
+    service: Annotated[MorphLakeService, Depends(get_service)],
+    _: Annotated[TokenIdentity, Depends(require_admin_token)],
+    business_domain: Annotated[str | None, Query(max_length=255)] = None,
+    department: Annotated[str | None, Query(max_length=255)] = None,
+    media_type: Annotated[str | None, Query(pattern="^(document|image|audio)$")] = None,
+    filename: Annotated[str | None, Query(max_length=255)] = None,
+    description: Annotated[str | None, Query(max_length=1000)] = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AssetList:
+    """List any tenant's assets; only an all-domain administration key may call this API."""
+    if start_date and end_date and start_date > end_date:
+        raise MorphLakeError("invalid_date_range", "start_date must not be after end_date")
+    rows, total = service.admin_list_assets(
+        business_domain=business_domain,
+        department=department,
+        media_type=media_type,
+        filename=filename,
+        description=description,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit,
+        offset=offset,
+    )
+    items = [Asset.model_validate(row) for row in rows]
+    return AssetList(
+        items=items,
+        limit=limit,
+        offset=offset,
+        returned=len(items),
+        total=total,
+    )
 
 
 @router.get("/api/v1/files/{file_id}/download", tags=["files"])

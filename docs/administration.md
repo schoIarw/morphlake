@@ -118,14 +118,17 @@ MORPHLAKE_ADMIN_COOKIE_SECURE=true
 | 页面 | 转发到已有 API |
 | --- | --- |
 | 文件上传 | `POST /api/v1/files` 及 documents/images/audio 类型端点 |
-| 文件清单 | `GET /api/v1/files` |
+| 文件清单 | `GET /api/v1/admin/files`；自动显示最近清单、总数和翻页 |
 | 全文检索 | `POST /api/v1/search/full-text` |
 | 向量检索 | `POST /api/v1/search/vector`、`POST /api/v1/search/vector/file` |
 | 文件下载 | `GET /api/v1/files/{file_id}/download`，流式转发 |
 | API 状态 | `GET /health/ready` |
 
-这些页面要求业务 API Key。为避免反复输入，前端仅在当前浏览器标签页的 `sessionStorage` 保存
-Key，退出管理系统时清除；API 操作请求不会把 Key 写入日志或结果页面。配置项：
+上传、全文/向量检索等页面要求业务 API Key。为避免反复输入，前端仅在当前浏览器标签页的
+`sessionStorage` 保存 Key，退出管理系统时清除；API 操作请求不会把 Key 写入日志或结果页面。
+文件清单是管理员专属页面，管理容器在服务端从管理数据库解密默认管理 Key，直接加载最近数据，
+并支持业务域、部门、文件名、文本概要、类型和日期筛选以及分页；管理 Key 不下发到页面。
+配置项：
 
 上传、清单、全文、向量和状态查询提交后，按钮会被禁用并显示转圈状态，阻止重复提交。查询结果
 按照模态组合调用既有 API：图片显示缩略图并可放大，文档可查看提取文本，音频可在线播放，

@@ -14,6 +14,7 @@ from morphlake.services.extractors import classify
 class FakeService:
     def __init__(self):
         self.list_filters = None
+        self.admin_list_filters = None
         self.full_text_scope = None
         self.vector_scope = None
 
@@ -42,6 +43,28 @@ class FakeService:
     def list_assets(self, **filters):
         self.list_filters = filters
         return []
+
+    def admin_list_assets(self, **filters):
+        self.admin_list_filters = filters
+        return (
+            [
+                {
+                    "file_id": "admin-file-1",
+                    "filename": "quarterly-report.pdf",
+                    "media_type": "document",
+                    "content_type": "application/pdf",
+                    "file_size": 42,
+                    "business_domain": filters.get("business_domain") or "risk",
+                    "department": filters.get("department") or "audit",
+                    "created_at": datetime.now(UTC),
+                    "object_bucket": "data",
+                    "object_key": "risk/quarterly-report.pdf",
+                    "chunk_count": 1,
+                    "summary_text": "quarterly liquidity overview",
+                }
+            ],
+            321,
+        )
 
     def download(self, file_id):
         return (
@@ -202,6 +225,41 @@ def test_domain_and_admin_keys_receive_different_read_scopes(tmp_path: Path):
     assert service.vector_scope[1:] == (None, None)
 
 
+def test_admin_asset_catalog_requires_admin_key_and_returns_total(tmp_path: Path):
+    test_client, store, _ = build_client(tmp_path)
+    denied = test_client.get("/api/v1/admin/files")
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "admin_key_required"
+
+    admin_key = store.default_admin_token()
+    response = test_client.get(
+        "/api/v1/admin/files",
+        headers={"Authorization": f"Bearer {admin_key}"},
+        params={
+            "business_domain": "risk",
+            "department": "audit",
+            "filename": "quarterly",
+            "description": "liquidity",
+            "limit": 20,
+            "offset": 40,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 321
+    assert response.json()["returned"] == 1
+    assert test_client.app.state.fake_service.admin_list_filters == {
+        "business_domain": "risk",
+        "department": "audit",
+        "media_type": None,
+        "filename": "quarterly",
+        "description": "liquidity",
+        "start_date": None,
+        "end_date": None,
+        "limit": 20,
+        "offset": 40,
+    }
+
+
 def test_domain_key_cannot_download_another_domain(tmp_path: Path):
     test_client, store, _ = build_client(tmp_path)
     finance = store.create_token(
@@ -289,6 +347,14 @@ def test_openapi_contract_does_not_expose_scope_fields(tmp_path: Path):
     }
     assert "business_domain" not in list_parameters
     assert "department" not in list_parameters
+
+    admin_list_parameters = {
+        parameter["name"]
+        for parameter in schema["paths"]["/api/v1/admin/files"]["get"]["parameters"]
+    }
+    assert {"business_domain", "department", "filename", "description"}.issubset(
+        admin_list_parameters
+    )
 
     for component in ("FullTextSearchRequest", "VectorSearchRequest"):
         properties = schema["components"]["schemas"][component]["properties"]

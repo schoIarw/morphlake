@@ -236,6 +236,37 @@ class AdminStore:
             rows = connection.execute(select(SYSTEM_CONFIG)).mappings().all()
         return {row["config_key"]: row["config_value"] for row in rows}
 
+    def default_admin_token(self) -> str:
+        """Resolve the encrypted seed key for trusted server-side console calls."""
+        with self._engine_required().connect() as connection:
+            token_id = connection.execute(
+                select(SYSTEM_CONFIG.c.config_value).where(
+                    SYSTEM_CONFIG.c.config_key == "default_admin_token_id"
+                )
+            ).scalar_one_or_none()
+            row = (
+                connection.execute(
+                    select(API_TOKENS.c.token_ciphertext).where(
+                        and_(
+                            API_TOKENS.c.token_id == token_id,
+                            API_TOKENS.c.access_level == "admin",
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+                if token_id
+                else None
+            )
+        plaintext = self._decrypt_token(row["token_ciphertext"] if row else None)
+        if not plaintext:
+            raise MorphLakeError(
+                "default_admin_key_unavailable",
+                "The default administration key cannot be recovered",
+                503,
+            )
+        return plaintext
+
     def create_admin_session(self, username: str) -> tuple[str, AdminSession]:
         plaintext = secrets.token_urlsafe(48)
         now = datetime.now(UTC)

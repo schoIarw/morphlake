@@ -142,6 +142,17 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
         limit=10,
         offset=0,
     )
+    filtered_page, filtered_total = store.list_assets_page(
+        media_type=None,
+        business_domain="risk",
+        department="audit",
+        filename="report",
+        description="overview",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 8, 31),
+        limit=1,
+        offset=0,
+    )
     full_text = store.full_text_search(
         business_domain="risk",
         department="audit",
@@ -160,6 +171,8 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
         limit=10,
     )
     assert len(listed) == 1
+    assert filtered_total == 1
+    assert filtered_page[0]["file_id"] == "file-1"
     assert len(full_text) == 2
     assert len(vector) == 2
     assert listed[0]["summary_text"] == "liquidity overview"
@@ -168,6 +181,16 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
     preview = store.get_preview("file-1", 100)
     assert preview["summary_text"] == "liquidity overview"
     assert preview["content_text"] == "liquidity risk report"
+    summary_search = store.full_text_search(
+        business_domain="risk",
+        department="audit",
+        keyword="overview",
+        start_date=None,
+        end_date=None,
+        limit=10,
+    )
+    assert summary_search[0]["file_id"] == "file-1"
+    assert summary_search[0]["summary_text"] == "liquidity overview"
     global_list = store.list_assets(
         media_type="document",
         business_domain=None,

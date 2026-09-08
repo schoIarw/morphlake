@@ -28,6 +28,7 @@ Authorization: Bearer mlk_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 | 403 | `token_deleted` | Key 已删除 |
 | 403 | `token_expired` | Key 已过期 |
 | 403 | `token_scope_mismatch` | 业务域 Key 访问了其他业务域文件 |
+| 403 | `admin_key_required` | 普通业务 Key 调用了管理员专属接口 |
 | 429 | `rate_limit_exceeded` | 上传/下载周期次数或字节配额耗尽 |
 
 429 响应包含 `Retry-After` 秒数。限流同时检查周期请求次数和周期字节数；配置值 0 表示不限制。
@@ -85,6 +86,32 @@ curl -G http://localhost:8080/api/v1/files \
 - `embedding_dimension`：完整向量维度；
 - `thumbnail_available`：是否存在图片缩略图。
 
+### 管理员全域清单
+
+`GET /api/v1/admin/files` 仅接受 `access_level=admin` 的管理 Key。默认按创建时间倒序返回最近
+20 条，并返回符合筛选条件的精确 `total`。可选参数如下：
+
+| 参数 | 含义 |
+| --- | --- |
+| `business_domain` | 精确业务域，可省略以查询全部业务域 |
+| `department` | 精确部门，可独立使用或与业务域组合 |
+| `media_type` | document / image / audio |
+| `filename` | 文件名子串模糊匹配 |
+| `description` | 文件文本概要子串模糊匹配 |
+| `start_date` / `end_date` | 创建日期闭区间 |
+| `limit` / `offset` | 每页条数与偏移量，`limit` 最大 200 |
+
+```bash
+curl -G http://localhost:8080/api/v1/admin/files \
+  -H "Authorization: Bearer $MORPHLAKE_ADMIN_TOKEN" \
+  --data-urlencode 'business_domain=risk' \
+  --data-urlencode 'department=audit' \
+  --data-urlencode 'filename=report' \
+  --data-urlencode 'description=流动性风险' \
+  --data-urlencode 'limit=20' \
+  --data-urlencode 'offset=0'
+```
+
 ## 全文检索
 
 ```bash
@@ -99,7 +126,8 @@ curl -X POST http://localhost:8080/api/v1/search/full-text \
   }'
 ```
 
-使用 Paimon `full-text` 原生全局索引，返回文件或切片命中清单。业务范围由 Key 自动限定。
+使用 Paimon `full-text` 原生全局索引，检索文档切片、音频转写和三种模态的文件文本概要，
+返回去重后的文件命中清单。业务范围由 Key 自动限定。
 
 ## 直接向量检索
 

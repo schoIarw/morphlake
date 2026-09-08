@@ -41,9 +41,9 @@ API 服务首次启动时使用 `ignore_if_exists=true` 创建以下五张表，
 
 ## 2. multimodal_text_segment
 
-文档切片、音频转写或文件摘要一行；全文和文本向量查询只访问本表。每个文档和音频都会写入
-一条 `segment_type=file_summary` 记录，供清单摘要及文件级文本向量预览使用；它不计入
-`chunk_count`。
+文档切片、音频转写或文件摘要一行；全文和文本向量查询优先访问本表。每个文档、图片和音频
+都会写入一条 `segment_type=file_summary` 记录，供清单摘要、管理员描述筛选及文件级文本向量
+预览使用；它不计入 `chunk_count`。
 
 | 字段组 | 主要字段 |
 | --- | --- |
@@ -60,8 +60,9 @@ API 服务首次启动时使用 `ignore_if_exists=true` 创建以下五张表，
 
 当前每张图片一条 `whole_image_with_thumbnail` 特征，后续可追加区域或页面级 feature，而无需改变资产表。
 主要字段为 feature_id、file_id、公共业务/分区/结果字段、feature_type、模型元数据及
-`image_embedding VECTOR<FLOAT,image_dimension>`。索引包括 file_id BTree、业务字段 Bitmap
-和向量 IVF-SQ。
+`image_embedding VECTOR<FLOAT,image_dimension>`。索引包括 file_id BTree、业务字段 Bitmap、
+content_text Full-Text 和向量 IVF-SQ。图片概要同时进入文本表；图片表全文索引用于兼容升级前
+已经写入的概要记录。
 
 MacBook Ollama 配置使用 MiniCPM-V 生成图片描述，再以 Nomic 对描述向量化，图片向量因此
 为固定 768 维。
@@ -71,7 +72,8 @@ MacBook Ollama 配置使用 MiniCPM-V 生成图片描述，再以 Nomic 对描�
 当前每个音频一条 `whole_audio` 特征，预留 start_ms/end_ms 以支持后续时间片。主要字段为
 feature_id、file_id、公共业务/分区/结果字段、feature_type、时间范围、模型元数据及
 `audio_embedding VECTOR<FLOAT,audio_dimension>`。若模型返回转写，还会在文本表写一条
-`audio_transcript`，从而进入全文和文本向量检索。
+`audio_transcript`，从而进入全文和文本向量检索。音频表也维护 content_text Full-Text 索引，
+用于兼容升级前的概要记录。
 
 ## 5. multimodal_transfer_audit
 

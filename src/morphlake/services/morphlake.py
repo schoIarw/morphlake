@@ -114,6 +114,9 @@ class MorphLakeService:
     def list_assets(self, **filters):
         return self.catalog.list_assets(**filters)
 
+    def admin_list_assets(self, **filters):
+        return self.catalog.list_assets_page(**filters)
+
     def get_asset(self, file_id: str):
         return self.catalog.get_asset(file_id)
 
@@ -298,7 +301,10 @@ class MorphLakeService:
         }
         text_segments = []
         text_spec = self.models.specs["text_embedding"]
-        if media_type in {"document", "audio"}:
+        # Every modality publishes one summary row to the text table. This keeps
+        # full-text behavior uniform while binary/image/audio vectors remain in
+        # their modality-specific Paimon tables.
+        if summary:
             text_segments.append(
                 {
                     **common,

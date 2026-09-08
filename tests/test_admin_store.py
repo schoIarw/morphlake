@@ -44,6 +44,7 @@ def test_token_is_hashed_and_lifecycle_is_enforced(tmp_path: Path):
     assert seeded["default_rate_period_seconds"] == "60"
     assert seeded["default_admin_token_id"]
     assert store.ping()
+    assert store.default_admin_token().startswith("mlk_")
     admin_row = next(
         row for row in store.list_tokens(reveal=True) if row["access_level"] == "admin"
     )

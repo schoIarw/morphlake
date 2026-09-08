@@ -132,6 +132,8 @@ def test_image_upload_creates_summary_thumbnail_and_preview_vector(tmp_path: Pat
     assert len(result["embedding_preview"]) == 5
     assert len(objects.values) == 2
     assert any(key.endswith(".thumbnail.jpg") for key in objects.values)
+    assert catalog.text_segments[0]["segment_type"] == "file_summary"
+    assert catalog.text_segments[0]["content_text"] == result["summary_text"]
     assert catalog.image_features[0]["feature_type"] == "whole_image_with_thumbnail"
 
 

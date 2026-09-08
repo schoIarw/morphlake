@@ -37,8 +37,8 @@ flowchart TB
 | 文档处理 | 文本提取、可配置重叠切片、逐切片向量化 |
 | 图片处理 | 视觉描述、文件级图片向量、MinIO JPEG 缩略图 |
 | 音频处理 | 文件级音频向量；可选语音转写、内容摘要和转写文本向量 |
-| 清单查询 | 类型、日期、文件名关键字、摘要及前 8 位向量预览；业务范围由 Key 自动限定 |
-| 全文检索 | 日期范围、全文关键字；业务范围由 Key 自动限定 |
+| 清单查询 | 普通 Key 按所属域查询；管理员可跨域按业务域、部门、文件名或概要筛选并分页 |
+| 全文检索 | 日期范围、正文/切片/文件概要关键字；业务范围由 Key 自动限定 |
 | 向量检索 | 上传文档/图片/音频自动向量化并返回 Paimon Top10；也支持直接提交向量 |
 | 预览与下载 | 图片缩略图/放大、文本展示、音频播放，并可按 `file_id` 下载原文件 |
 | 访问控制 | 业务域 Key 仅查询本域，默认管理 Key 可查询全域；支持查看、复制和轮换 |
@@ -193,7 +193,7 @@ curl http://localhost:8080/health/ready \
 
 1. 根据配置创建管理数据库及六张管理表（含管理员会话表），并写入 schema 版本和默认配额配置；
 2. 检查并创建两个 MinIO bucket（需要账号具有相应权限）；
-3. 自动创建资产描述符、文本切片、图片特征、音频特征和传输审计五张 Paimon 表；
+3. 自动创建资产描述符、文本切片/概要、图片特征、音频特征和传输审计五张 Paimon 表；
 4. 校验已存在 Paimon 表的字段、分区、`bucket=-1` 和 deletion-vector；
 5. 启动定时增量索引维护；上传请求本身不重建索引。
 
@@ -222,6 +222,20 @@ curl -G http://localhost:8080/api/v1/files \
   --data-urlencode 'filename=contract' \
   --data-urlencode 'start_date=2026-01-01' \
   --data-urlencode 'end_date=2026-12-31'
+```
+
+管理员专属清单接口返回 `total`、`limit`、`offset` 和当前页数据；业务域、部门均可省略：
+
+```bash
+export MORPHLAKE_ADMIN_TOKEN='mlk_...'
+curl -G http://localhost:8080/api/v1/admin/files \
+  -H "Authorization: Bearer $MORPHLAKE_ADMIN_TOKEN" \
+  --data-urlencode 'business_domain=risk' \
+  --data-urlencode 'department=audit' \
+  --data-urlencode 'filename=contract' \
+  --data-urlencode 'description=counterparty exposure' \
+  --data-urlencode 'limit=20' \
+  --data-urlencode 'offset=0'
 ```
 
 ```bash

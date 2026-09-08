@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import re
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import (
@@ -342,27 +344,86 @@ def upload_action(
 def files_page(
     session: Annotated[AdminSession, Depends(require_admin_session)],
     settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
+    business_domain: Annotated[str, Query(max_length=255)] = "",
+    department: Annotated[str, Query(max_length=255)] = "",
+    media_type: Annotated[str, Query(pattern="^(|document|image|audio)$")] = "",
+    filename: Annotated[str, Query(max_length=255)] = "",
+    description: Annotated[str, Query(max_length=1000)] = "",
+    start_date: Annotated[str, Query(pattern=r"^$|^\d{4}-\d{2}-\d{2}$")] = "",
+    end_date: Annotated[str, Query(pattern=r"^$|^\d{4}-\d{2}-\d{2}$")] = "",
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=200)] = 20,
 ) -> HTMLResponse:
+    filters = {
+        "business_domain": business_domain,
+        "department": department,
+        "media_type": media_type,
+        "filename": filename,
+        "description": description,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    params = _compact({**filters, "limit": page_size, "offset": (page - 1) * page_size})
+    try:
+        result = client.request(
+            "GET",
+            "/api/v1/admin/files",
+            store.default_admin_token(),
+            params=params,
+        )
+    except MorphLakeError as exc:
+        result = ApiResult(exc.status_code, {"error": {"code": exc.code, "message": exc.message}})
+
+    payload = result.payload if isinstance(result.payload, dict) else {}
+    items = payload.get("items", []) if 200 <= result.status_code < 300 else []
+    total = int(payload.get("total") or 0)
+    total_pages = max(1, math.ceil(total / page_size))
+    media_options = "".join(
+        f'<option value="{value}" {"selected" if media_type == value else ""}>{label}</option>'
+        for value, label in (
+            ("", "全部"),
+            ("document", "文档"),
+            ("image", "图片"),
+            ("audio", "音频"),
+        )
+    )
+    size_options = "".join(
+        f'<option value="{size}" {"selected" if page_size == size else ""}>{size} 条/页</option>'
+        for size in (10, 20, 50, 100, 200)
+    )
     body = (
         _api_intro(
             "文件清单",
-            "查询范围自动取自 Key；可按文件类型、日期和文件名筛选。管理 Key 可查询全库。",
+            "管理员全域清单；默认显示最近文件，可按业务域、部门、文件名或文本概要筛选。",
         )
         + f"""
-    <section class="panel"><form method="post" action="/admin/api/files" class="grid-form">
-      {_csrf_input(session)}{_api_token_input()}
-      <label>文件类型<select name="media_type"><option value="">全部</option>
-      <option value="document">文档</option><option value="image">图片</option>
-      <option value="audio">音频</option></select></label>
-      {_input("文件名关键字", "filename")}
-      {_input("开始日期", "start_date", "date")}
-      {_input("结束日期", "end_date", "date")}
-      {_input("返回条数", "limit", "number", 50, min=1, max=200)}
-      {_input("偏移量", "offset", "number", 0, min=0)}
-      <div class="wide form-actions"><button>查询文件</button></div>
+    <section class="panel"><form method="get" action="/admin/api/files" class="grid-form">
+      {_input("业务域（可选）", "business_domain", value=business_domain)}
+      {_input("部门（可选）", "department", value=department)}
+      <label>文件类型<select name="media_type">{media_options}</select></label>
+      {_input("文件名模糊匹配", "filename", value=filename)}
+      {_input("描述/概要模糊匹配", "description", value=description)}
+      <label>每页条数<select name="page_size">{size_options}</select></label>
+      {_input("开始日期", "start_date", "date", start_date)}
+      {_input("结束日期", "end_date", "date", end_date)}
+      <input type="hidden" name="page" value="1">
+      <div class="wide form-actions"><button>筛选文件</button>
+      <a class="button secondary" href="/admin/api/files">清除筛选</a></div>
     </form></section>"""
     )
-    return HTMLResponse(_page("文件清单", body, session, settings, "files"))
+    if 200 <= result.status_code < 300:
+        body += f"""<section class="panel"><div class="section-head"><h2>最近文件</h2>
+          <span class="hint">共 {total} 条 · 第 {page} / {total_pages} 页</span></div>
+          {_object_table(items if isinstance(items, list) else [])}
+          {_pagination(filters, page, page_size, total_pages)}</section>"""
+    else:
+        body += _result_panel(result, "文件清单查询失败")
+    return HTMLResponse(
+        _page("文件清单", body, session, settings, "files"),
+        status_code=result.status_code if result.status_code >= 500 else 200,
+    )
 
 
 @router.post("/api/files", response_class=HTMLResponse)
@@ -372,8 +433,11 @@ def files_action(
     client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
     csrf: Annotated[str, Form()],
     api_token: Annotated[str, Form()],
+    business_domain: Annotated[str, Form()] = "",
+    department: Annotated[str, Form()] = "",
     media_type: Annotated[str, Form()] = "",
     filename: Annotated[str, Form()] = "",
+    description: Annotated[str, Form()] = "",
     start_date: Annotated[str, Form()] = "",
     end_date: Annotated[str, Form()] = "",
     limit: Annotated[int, Form(ge=1, le=200)] = 50,
@@ -382,15 +446,18 @@ def files_action(
     _verify_csrf(csrf, session)
     params = _compact(
         {
+            "business_domain": business_domain,
+            "department": department,
             "media_type": media_type,
             "filename": filename,
+            "description": description,
             "start_date": start_date,
             "end_date": end_date,
             "limit": limit,
             "offset": offset,
         }
     )
-    result = client.request("GET", "/api/v1/files", api_token, params=params)
+    result = client.request("GET", "/api/v1/admin/files", api_token, params=params)
     return HTMLResponse(
         _page("文件查询结果", _result_panel(result, "文件清单"), session, settings, "files"),
         status_code=result.status_code,
@@ -620,10 +687,13 @@ def preview_proxy(
     file_id: str,
     session: Annotated[AdminSession, Depends(require_admin_session)],
     client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
-    api_key: Annotated[str, Header(alias="X-MorphLake-Key")],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    api_key: Annotated[str | None, Header(alias="X-MorphLake-Key")] = None,
 ) -> JSONResponse:
     del session
-    result = client.request("GET", f"/api/v1/files/{file_id}/preview", api_key)
+    result = client.request(
+        "GET", f"/api/v1/files/{file_id}/preview", api_key or store.default_admin_token()
+    )
     return JSONResponse(result.payload, status_code=result.status_code)
 
 
@@ -632,10 +702,13 @@ def thumbnail_proxy(
     file_id: str,
     session: Annotated[AdminSession, Depends(require_admin_session)],
     client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
-    api_key: Annotated[str, Header(alias="X-MorphLake-Key")],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    api_key: Annotated[str | None, Header(alias="X-MorphLake-Key")] = None,
 ) -> StreamingResponse:
     del session
-    return _stream_api_response(client, f"/api/v1/files/{file_id}/thumbnail", api_key)
+    return _stream_api_response(
+        client, f"/api/v1/files/{file_id}/thumbnail", api_key or store.default_admin_token()
+    )
 
 
 @router.get("/api/files/{file_id}/media")
@@ -643,10 +716,13 @@ def media_proxy(
     file_id: str,
     session: Annotated[AdminSession, Depends(require_admin_session)],
     client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
-    api_key: Annotated[str, Header(alias="X-MorphLake-Key")],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    api_key: Annotated[str | None, Header(alias="X-MorphLake-Key")] = None,
 ) -> StreamingResponse:
     del session
-    return _stream_api_response(client, f"/api/v1/files/{file_id}/download", api_key)
+    return _stream_api_response(
+        client, f"/api/v1/files/{file_id}/download", api_key or store.default_admin_token()
+    )
 
 
 @router.get("/api/status", response_class=HTMLResponse)
@@ -934,6 +1010,17 @@ def _compact(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value not in (None, "")}
 
 
+def _pagination(filters: dict[str, Any], page: int, page_size: int, total_pages: int) -> str:
+    def link(target: int, label: str) -> str:
+        if target < 1 or target > total_pages:
+            return f'<span class="page-link disabled">{label}</span>'
+        query = urlencode(_compact({**filters, "page": target, "page_size": page_size}))
+        return f'<a class="page-link" href="/admin/api/files?{html.escape(query)}">{label}</a>'
+
+    return f"""<nav class="pagination" aria-label="文件清单分页">
+      {link(page - 1, "上一页")}<span>第 {page} 页</span>{link(page + 1, "下一页")}</nav>"""
+
+
 def _rows(rows: list[dict[str, Any]], keys: list[str]) -> str:
     return "".join(
         "<tr>"
@@ -1147,8 +1234,8 @@ const showModal=(title,node)=>{modalTitle.textContent=title;modalBody.replaceChi
 modal.querySelector('.modal-close').addEventListener('click',()=>modal.close());
 modal.addEventListener('click',event=>{if(event.target===modal)modal.close();});
 const apiFetch=async(path)=>{
-  const key=storedKey();if(!key)throw new Error('请先填写 API Key');
-  const response=await fetch(path,{headers:{'X-MorphLake-Key':key}});
+  const key=storedKey(),headers=key?{'X-MorphLake-Key':key}:{};
+  const response=await fetch(path,{headers});
   if(!response.ok){let message='请求失败（HTTP '+response.status+'）';
     try{const body=await response.json();message=body.error?.message||body.detail||message;}catch(_e){}
     throw new Error(message);}
@@ -1213,6 +1300,7 @@ _CSS = """
 .key-view{display:grid;grid-template-columns:minmax(190px,1fr) auto auto;gap:5px;min-width:330px;margin-bottom:5px}.key-view input{margin:0;padding:7px 8px}.key-view button{padding:7px 9px}.admin-key{background:#e8edff;color:var(--blue2)}
 button,.button{display:inline-block;border:0;border-radius:8px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;padding:10px 17px;text-decoration:none;font-weight:650;cursor:pointer}button:disabled{cursor:wait;opacity:.72}.secondary{background:#eef2ff;color:var(--blue2)}.danger{background:#fff0f1;color:var(--red)}.inline{display:inline}.spinner{display:inline-block;width:14px;height:14px;margin-right:8px;border:2px solid #ffffff70;border-top-color:#fff;border-radius:50%;vertical-align:-2px;animation:spin .72s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 .table-wrap{overflow:auto;margin-top:12px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#f8f9fc;color:#596579;font-size:12px}td{color:#344054}.asset-table td{vertical-align:middle}.asset-table .text-clip{display:block;max-width:280px;white-space:normal;line-height:1.45}.vector-preview{display:block;max-width:245px;overflow:hidden;text-overflow:ellipsis;color:#344054}.vector-preview+small{display:block;color:var(--muted);margin-top:3px}.row-actions{display:flex;gap:6px}.row-actions button{padding:7px 10px}.media-tile{position:relative;width:68px;height:58px;padding:0;overflow:hidden;border:1px solid #dce3ef;border-radius:9px;background:#f3f6fb;color:var(--blue2);display:grid;place-items:center}.media-tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.media-placeholder{font-size:11px;color:var(--muted)}.media-icon{font-size:23px;line-height:1}.media-tile small{font-size:10px}.preview-unavailable:after{content:'暂无缩略图';position:absolute;inset:0;display:grid;place-items:center;background:#f3f6fb;color:var(--muted);font-size:10px}
+.pagination{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:18px}.page-link{padding:7px 12px;border-radius:8px;background:#eef2ff;text-decoration:none}.page-link.disabled{color:#a5adba;background:#f1f3f7}
 .media-modal{width:min(920px,92vw);max-height:88vh;padding:0;border:0;border-radius:15px;box-shadow:0 30px 90px #10182766}.media-modal::backdrop{background:#101827a8}.modal-head{display:flex;align-items:center;justify-content:space-between;padding:15px 19px;border-bottom:1px solid var(--line)}.modal-head h2{margin:0;font-size:18px}.modal-close{width:34px;height:34px;padding:0;border-radius:50%;background:#eef2f7;color:var(--ink);font-size:22px}.modal-body{padding:20px;max-height:calc(88vh - 65px);overflow:auto}.modal-image{display:block;max-width:100%;max-height:72vh;margin:auto;border-radius:8px}.modal-body audio{display:block;width:min(680px,100%);margin:35px auto}.text-preview{display:grid;gap:15px}.text-preview section{padding:16px;border:1px solid var(--line);border-radius:10px}.text-preview h3{margin:0 0 9px}.text-preview p{white-space:pre-wrap}.text-preview pre{max-height:50vh}.empty{text-align:center!important;color:var(--muted);padding:30px!important}.status-pill{display:inline-block;padding:4px 9px;border-radius:20px;background:#eef2f7;font-size:12px}.status-pill.ok,.status-pill.active{background:#e7f8ee;color:var(--green)}.status-pill.error,.status-pill.deleted{background:#fff0f1;color:var(--red)}.status-pill.disabled{background:#fff6dc;color:var(--amber)}.result-head{margin-bottom:12px}.tabs{display:flex;gap:7px}.tabs a{padding:5px 10px;background:#eef2ff;border-radius:7px;text-decoration:none}.limit-form{min-width:330px;display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px}.alert{padding:12px 14px;background:#fff3dc;border:1px solid #f0cf88;border-radius:9px;color:#775310;margin-bottom:15px}pre{white-space:pre-wrap;word-break:break-all;background:#111827;color:#dbe7ff;padding:16px;border-radius:9px;max-height:460px;overflow:auto}.secret{font-size:16px}.token-created{text-align:center;max-width:760px;margin:40px auto}.success-mark{display:grid;place-items:center;width:52px;height:52px;margin:0 auto 12px;border-radius:50%;background:#e7f8ee;color:var(--green);font-size:26px}
 .login-body{min-height:100vh;background:radial-gradient(circle at 15% 15%,#4168ec 0,#183387 28%,#0e1729 70%);display:grid;place-items:center;padding:24px}.login-shell{width:min(960px,100%);display:grid;grid-template-columns:1.1fr .9fr;overflow:hidden;border-radius:20px;box-shadow:0 30px 80px #0006}.login-brand{color:#fff;padding:65px 55px;background:linear-gradient(145deg,#264ed3cc,#101c3de8)}.login-brand .eyebrow{color:#b9c9ff}.login-brand h1{font-size:36px;line-height:1.25;margin:22px 0 12px}.login-brand p{color:#c9d5ff}.login-card{background:#fff;padding:55px 48px;display:flex;flex-direction:column;justify-content:center}.login-card h2{font-size:25px;margin:6px 0}.login-card p{color:var(--muted);margin:0 0 20px}.login-card form{display:grid;gap:15px}.login-button{width:100%;margin-top:5px}.login-card>small{color:var(--muted);margin-top:18px;text-align:center}
 @media(max-width:980px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}}@media(max-width:760px){.topbar{padding:0 14px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:58px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 8px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:8px 10px}.content{margin-left:0;padding:124px 14px 30px}.grid-form,.split .grid-form,.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.welcome{align-items:flex-start;gap:18px;flex-direction:column}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:38px 28px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}

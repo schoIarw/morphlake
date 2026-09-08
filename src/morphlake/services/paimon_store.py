@@ -245,10 +245,12 @@ class PaimonStore:
                 self._build_scalar_indexes(
                     IMAGE_TABLE, ["file_id"], ["business_domain", "department"]
                 )
+                self._raw_table(IMAGE_TABLE).create_global_index("content_text", "full-text")
                 self._build_vector_index(IMAGE_TABLE, "image_embedding")
                 self._build_scalar_indexes(
                     AUDIO_TABLE, ["file_id"], ["business_domain", "department"]
                 )
+                self._raw_table(AUDIO_TABLE).create_global_index("content_text", "full-text")
                 self._build_vector_index(AUDIO_TABLE, "audio_embedding")
                 self._build_scalar_indexes(
                     AUDIT_TABLE,
@@ -284,6 +286,32 @@ class PaimonStore:
         limit: int,
         offset: int,
     ) -> list[dict[str, Any]]:
+        rows, _ = self.list_assets_page(
+            media_type=media_type,
+            business_domain=business_domain,
+            department=department,
+            filename=filename,
+            description=None,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            offset=offset,
+        )
+        return rows
+
+    def list_assets_page(
+        self,
+        *,
+        media_type: str | None,
+        business_domain: str | None,
+        department: str | None,
+        filename: str | None,
+        description: str | None,
+        start_date: date | None,
+        end_date: date | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict[str, Any]], int]:
         builder = self._builder(ASSET_TABLE)
         predicates = []
         if media_type:
@@ -294,6 +322,17 @@ class PaimonStore:
             predicates.append(builder.equal("department", department))
         if filename:
             predicates.append(builder.contains("filename", filename))
+        if description:
+            summary_file_ids = self._summary_file_ids(
+                description=description,
+                business_domain=business_domain,
+                department=department,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if not summary_file_ids:
+                return [], 0
+            predicates.append(builder.is_in("file_id", summary_file_ids))
         predicates.extend(self._date_predicates(builder, start_date, end_date))
         rows = self._read(
             ASSET_TABLE,
@@ -302,7 +341,8 @@ class PaimonStore:
             limit=None,
         )
         rows.sort(key=lambda row: (row["created_at"], row["file_id"]), reverse=True)
-        return self._enrich_assets(rows[offset : offset + limit])
+        total = len(rows)
+        return self._enrich_assets(rows[offset : offset + limit]), total
 
     def get_asset(self, file_id: str) -> dict[str, Any]:
         builder = self._builder(ASSET_TABLE)
@@ -349,36 +389,72 @@ class PaimonStore:
         end_date: date | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        partition_predicate = self._partition_predicate(
-            TEXT_TABLE, business_domain, start_date, end_date
-        )
-        exact_predicate = self._search_predicate(
-            TEXT_TABLE, business_domain, department, start_date, end_date
-        )
         fetch_limit = max(limit * 5, 50)
         try:
-            search = (
-                self._raw_table(TEXT_TABLE)
-                .new_full_text_search_builder()
-                .with_query(
-                    "content_text",
-                    json.dumps({"match": {"query": keyword}}, separators=(",", ":")),
+            rows: list[dict[str, Any]] = []
+            # TEXT_TABLE includes chunks and the canonical file-summary row. The
+            # modality tables are also searched so summaries written before the
+            # canonical row was introduced remain discoverable.
+            for table_key in (TEXT_TABLE, IMAGE_TABLE, AUDIO_TABLE):
+                partition_predicate = self._partition_predicate(
+                    table_key, business_domain, start_date, end_date
                 )
-                .with_limit(fetch_limit)
-            )
-            if partition_predicate is not None:
-                search = search.with_partition_filter(partition_predicate)
-            result = search.execute_local()
-            rows = self._read(
-                TEXT_TABLE,
-                exact_predicate,
-                columns=[*SEARCH_COLUMNS, "_ROW_ID"],
-                limit=fetch_limit,
-                global_index_result=result,
-            )
-            return self._committed_hits(self._rank_hits(rows, result), limit)
+                exact_predicate = self._search_predicate(
+                    table_key, business_domain, department, start_date, end_date
+                )
+                search = (
+                    self._raw_table(table_key)
+                    .new_full_text_search_builder()
+                    .with_query(
+                        "content_text",
+                        json.dumps({"match": {"query": keyword}}, separators=(",", ":")),
+                    )
+                    .with_limit(fetch_limit)
+                )
+                if partition_predicate is not None:
+                    search = search.with_partition_filter(partition_predicate)
+                result = search.execute_local()
+                matched = self._read(
+                    table_key,
+                    exact_predicate,
+                    columns=[*SEARCH_COLUMNS, "_ROW_ID"],
+                    limit=fetch_limit,
+                    global_index_result=result,
+                )
+                rows.extend(self._rank_hits(matched, result))
+            return self._committed_hits(rows, limit)
         except Exception as exc:
             raise StorageError(f"Paimon full-text search failed: {exc}") from exc
+
+    def _summary_file_ids(
+        self,
+        *,
+        description: str,
+        business_domain: str | None,
+        department: str | None,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> list[str]:
+        """Return exact substring matches across canonical and legacy summary rows."""
+        file_ids: set[str] = set()
+        for table_key in (TEXT_TABLE, IMAGE_TABLE, AUDIO_TABLE):
+            builder = self._builder(table_key)
+            predicates = [builder.contains("content_text", description)]
+            if table_key == TEXT_TABLE:
+                predicates.append(builder.equal("segment_type", "file_summary"))
+            if business_domain:
+                predicates.extend(self._domain_predicates(builder, business_domain))
+            if department:
+                predicates.append(builder.equal("department", department))
+            predicates.extend(self._date_predicates(builder, start_date, end_date))
+            rows = self._read(
+                table_key,
+                PredicateBuilder.and_predicates(predicates),
+                columns=["file_id"],
+                limit=None,
+            )
+            file_ids.update(row["file_id"] for row in rows)
+        return sorted(file_ids)
 
     def vector_search(
         self,

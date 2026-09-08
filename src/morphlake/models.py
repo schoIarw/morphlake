@@ -36,6 +36,7 @@ class AssetList(BaseModel):
     limit: int
     offset: int
     returned: int
+    total: int | None = None
 
 
 class SearchHit(BaseModel):

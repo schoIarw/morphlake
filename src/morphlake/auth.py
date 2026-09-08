@@ -41,6 +41,19 @@ def read_scope(identity: TokenIdentity) -> tuple[str | None, str | None]:
     return identity.business_domain, None
 
 
+def require_admin_token(
+    identity: Annotated[TokenIdentity, Depends(require_token)],
+) -> TokenIdentity:
+    """Restrict administration APIs to the seeded all-domain administration key."""
+    if identity.access_level != "admin":
+        raise MorphLakeError(
+            "admin_key_required",
+            "This endpoint requires an administration key",
+            403,
+        )
+    return identity
+
+
 def enforce_asset_access(identity: TokenIdentity, business_domain: str) -> None:
     if identity.access_level != "admin" and business_domain != identity.business_domain:
         raise MorphLakeError(
