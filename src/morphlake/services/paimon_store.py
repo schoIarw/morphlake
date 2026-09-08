@@ -302,7 +302,7 @@ class PaimonStore:
             limit=None,
         )
         rows.sort(key=lambda row: (row["created_at"], row["file_id"]), reverse=True)
-        return rows[offset : offset + limit]
+        return self._enrich_assets(rows[offset : offset + limit])
 
     def get_asset(self, file_id: str) -> dict[str, Any]:
         builder = self._builder(ASSET_TABLE)
@@ -315,6 +315,29 @@ class PaimonStore:
         if not rows:
             raise NotFoundError(f"File {file_id} does not exist")
         return rows[0]
+
+    def get_preview(self, file_id: str, max_chars: int) -> dict[str, Any]:
+        asset = self._enrich_assets([self.get_asset(file_id)])[0]
+        builder = self._builder(TEXT_TABLE)
+        segments = self._read(
+            TEXT_TABLE,
+            builder.equal("file_id", file_id),
+            columns=["segment_type", "chunk_index", "content_text"],
+            limit=None,
+        )
+        wanted_type = "document_chunk" if asset["media_type"] == "document" else "audio_transcript"
+        content_rows = [row for row in segments if row["segment_type"] == wanted_type]
+        content_rows.sort(key=lambda row: row.get("chunk_index") or 0)
+        content = "\n\n".join(row.get("content_text") or "" for row in content_rows).strip()
+        return {
+            "file_id": asset["file_id"],
+            "filename": asset["filename"],
+            "media_type": asset["media_type"],
+            "content_type": asset["content_type"],
+            "summary_text": asset.get("summary_text"),
+            "content_text": content[:max_chars] or None,
+            "thumbnail_available": asset.get("thumbnail_available", False),
+        }
 
     def full_text_search(
         self,
@@ -486,14 +509,94 @@ class PaimonStore:
         if not file_ids:
             return []
         builder = self._builder(ASSET_TABLE)
-        committed = self._read(
-            ASSET_TABLE,
-            builder.is_in("file_id", file_ids),
-            columns=["file_id"],
-            limit=len(file_ids),
+        committed = self._enrich_assets(
+            self._read(
+                ASSET_TABLE,
+                builder.is_in("file_id", file_ids),
+                columns=PUBLIC_COLUMNS,
+                limit=len(file_ids),
+            )
         )
-        committed_ids = {row["file_id"] for row in committed}
-        return [row for row in rows if row["file_id"] in committed_ids][:limit]
+        assets = {row["file_id"]: row for row in committed}
+        hits = []
+        seen = set()
+        for row in rows:
+            file_id = row["file_id"]
+            if file_id in seen or file_id not in assets:
+                continue
+            seen.add(file_id)
+            hits.append({**assets[file_id], **row})
+            if len(hits) >= limit:
+                break
+        return hits
+
+    def _enrich_assets(self, assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Attach compact feature metadata without duplicating vectors in the asset table."""
+        if not assets:
+            return assets
+        file_ids = [asset["file_id"] for asset in assets]
+        summaries: dict[str, str] = {}
+        previews: dict[str, list[float]] = {}
+        thumbnails: set[str] = set()
+
+        text_builder = self._builder(TEXT_TABLE)
+        text_rows = self._read(
+            TEXT_TABLE,
+            PredicateBuilder.and_predicates(
+                [
+                    text_builder.is_in("file_id", file_ids),
+                    text_builder.equal("segment_type", "file_summary"),
+                ]
+            ),
+            columns=["file_id", "content_text", "text_embedding"],
+            limit=None,
+        )
+        for row in text_rows:
+            summaries[row["file_id"]] = row.get("content_text") or ""
+            previews[row["file_id"]] = self._vector_preview(row.get("text_embedding"))
+
+        for table_key, content_column, vector_column in (
+            (IMAGE_TABLE, "feature_type", "image_embedding"),
+            (AUDIO_TABLE, "feature_type", "audio_embedding"),
+        ):
+            ids = [
+                asset["file_id"]
+                for asset in assets
+                if asset["media_type"] == ("image" if table_key == IMAGE_TABLE else "audio")
+            ]
+            if not ids:
+                continue
+            builder = self._builder(table_key)
+            feature_rows = self._read(
+                table_key,
+                builder.is_in("file_id", ids),
+                columns=["file_id", "content_text", content_column, vector_column],
+                limit=None,
+            )
+            for row in feature_rows:
+                summaries[row["file_id"]] = row.get("content_text") or ""
+                previews[row["file_id"]] = self._vector_preview(row.get(vector_column))
+                if row.get(content_column) == "whole_image_with_thumbnail":
+                    thumbnails.add(row["file_id"])
+
+        dimensions = {
+            "document": self.settings.text_vector_dimension,
+            "image": self.settings.image_vector_dimension,
+            "audio": self.settings.audio_vector_dimension,
+        }
+        for asset in assets:
+            file_id = asset["file_id"]
+            asset["summary_text"] = summaries.get(file_id) or None
+            asset["embedding_preview"] = previews.get(file_id)
+            asset["embedding_dimension"] = dimensions[asset["media_type"]]
+            asset["thumbnail_available"] = file_id in thumbnails
+        return assets
+
+    @staticmethod
+    def _vector_preview(vector: Any) -> list[float] | None:
+        if vector is None:
+            return None
+        return [float(value) for value in vector[:8]]
 
     def _read(
         self,

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from docx import Document
+from PIL import Image, ImageOps
 from pypdf import PdfReader
 
 from morphlake.errors import MorphLakeError
@@ -103,3 +104,22 @@ def chunk_text(text: str, size: int, overlap: int) -> list[TextChunk]:
             break
         start = max(end - overlap, start + 1)
     return chunks
+
+
+def create_thumbnail(body: bytes, max_pixels: int) -> bytes:
+    """Create a bounded JPEG preview while keeping the original file in MinIO."""
+    try:
+        with Image.open(io.BytesIO(body)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.thumbnail((max_pixels, max_pixels), Image.Resampling.LANCZOS)
+            if image.mode in {"RGBA", "LA"}:
+                background = Image.new("RGB", image.size, "white")
+                background.paste(image, mask=image.getchannel("A"))
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=82, optimize=True)
+            return output.getvalue()
+    except (OSError, ValueError) as exc:
+        raise MorphLakeError("invalid_image", "Image cannot be decoded", 422) from exc

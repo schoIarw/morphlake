@@ -20,11 +20,33 @@ class FakeApiClient:
         self.calls.append({"method": method, "path": path, "token": token, **kwargs})
         if path == "/health/ready":
             return ApiResult(200, {"status": "ok", "checks": {"minio": "ok"}})
+        if path.endswith("/preview"):
+            return ApiResult(
+                200,
+                {
+                    "file_id": "file-1",
+                    "filename": "report.pdf",
+                    "media_type": "document",
+                    "content_type": "application/pdf",
+                    "summary_text": "report summary",
+                    "content_text": "report body",
+                },
+            )
         if path == "/api/v1/files" and method == "GET":
             return ApiResult(
                 200,
                 {
-                    "items": [{"file_id": "file-1", "filename": "report.pdf"}],
+                    "items": [
+                        {
+                            "file_id": "file-1",
+                            "filename": "report.pdf",
+                            "media_type": "document",
+                            "file_size": 2048,
+                            "summary_text": "report summary",
+                            "embedding_preview": [0.1, 0.2, 0.3],
+                            "embedding_dimension": 768,
+                        }
+                    ],
                     "returned": 1,
                 },
             )
@@ -44,6 +66,18 @@ class FakeApiClient:
             200,
             stream=httpx.ByteStream(b"download-body"),
             headers={"Content-Type": "application/pdf", "Content-Disposition": "attachment"},
+            request=request,
+        )
+        return response, DummyCloser()
+
+    def stream(self, path: str, token: str):
+        self.calls.append({"method": "GET", "path": path, "token": token})
+        content_type = "image/jpeg" if path.endswith("thumbnail") else "audio/mpeg"
+        request = httpx.Request("GET", f"http://api.test{path}")
+        response = httpx.Response(
+            200,
+            stream=httpx.ByteStream(b"stream-body"),
+            headers={"Content-Type": content_type},
             request=request,
         )
         return response, DummyCloser()
@@ -189,6 +223,8 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
         assert "API Key" in response.text
         assert 'name="business_domain"' not in response.text
         assert 'name="department"' not in response.text
+        assert "spinner" in response.text
+        assert "form.dataset.submitting" in response.text
 
     upload = client.post(
         "/admin/api/upload",
@@ -218,6 +254,10 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
     )
     assert files.status_code == 200
     assert "report.pdf" in files.text
+    assert "report summary" in files.text
+    assert "[0.1, 0.2, 0.3, …]" in files.text
+    assert "preview-open" in files.text
+    assert "download-file" in files.text
     assert api.calls[-1]["path"] == "/api/v1/files"
 
     full_text = client.post(
@@ -273,6 +313,19 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
     assert download.status_code == 200
     assert download.content == b"download-body"
     assert api.calls[-1]["path"] == "/api/v1/files/file-1/download"
+
+    preview = client.get("/admin/api/files/file-1/preview", headers={"X-MorphLake-Key": token})
+    assert preview.status_code == 200
+    assert preview.json()["summary_text"] == "report summary"
+    assert api.calls[-1]["token"] == token
+
+    thumbnail = client.get("/admin/api/files/file-1/thumbnail", headers={"X-MorphLake-Key": token})
+    assert thumbnail.status_code == 200
+    assert thumbnail.content == b"stream-body"
+
+    media = client.get("/admin/api/files/file-1/media", headers={"X-MorphLake-Key": token})
+    assert media.status_code == 200
+    assert media.headers["content-type"] == "audio/mpeg"
 
 
 def test_admin_is_independent_and_exports_metrics(tmp_path: Path):

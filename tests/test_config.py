@@ -40,6 +40,8 @@ def test_five_table_defaults_and_index_settings():
     assert settings.admin_session_ttl_seconds == 28_800
     assert settings.admin_cookie_secure is False
     assert settings.token_encryption_secret == "change-me-token-encryption-secret"
+    assert settings.thumbnail_max_pixels == 320
+    assert settings.preview_max_chars == 20_000
     assert settings.paimon_table == "multimodal_asset_descriptor"
     assert settings.paimon_text_table == "multimodal_text_segment"
     assert settings.paimon_image_table == "multimodal_image_feature"

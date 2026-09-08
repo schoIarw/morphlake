@@ -25,6 +25,10 @@ class Asset(BaseModel):
     object_key: str
     object_etag: str | None = None
     chunk_count: int = 0
+    summary_text: str | None = None
+    embedding_preview: list[float] | None = None
+    embedding_dimension: int | None = None
+    thumbnail_available: bool = False
 
 
 class AssetList(BaseModel):
@@ -45,6 +49,20 @@ class SearchHit(BaseModel):
     record_type: Literal["file", "chunk"]
     chunk_index: int | None = None
     content_text: str | None = None
+    content_type: str | None = None
+    file_size: int | None = None
+    summary_text: str | None = None
+    thumbnail_available: bool = False
+
+
+class FilePreview(BaseModel):
+    file_id: str
+    filename: str
+    media_type: MediaType
+    content_type: str
+    summary_text: str | None = None
+    content_text: str | None = None
+    thumbnail_available: bool = False
 
 
 class SearchResult(BaseModel):

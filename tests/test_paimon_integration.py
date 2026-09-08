@@ -49,6 +49,26 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
         asset=base,
         text_segments=[
             {
+                "segment_id": "file-1:summary",
+                "file_id": "file-1",
+                "business_domain": "risk",
+                "department": "audit",
+                "domain_shard": shard,
+                "ingest_date": "2026-08-30",
+                "created_at": "2026-08-30T00:00:00+00:00",
+                "filename": "report.txt",
+                "media_type": "document",
+                "record_type": "file",
+                "chunk_index": None,
+                "content_text": "liquidity overview",
+                "segment_type": "file_summary",
+                "chunk_start": None,
+                "chunk_end": None,
+                "embedding_model": "test",
+                "embedding_version": "1",
+                "text_embedding": [1.0, 0.0, 0.0, 0.0],
+            },
+            {
                 "segment_id": "file-1:0",
                 "file_id": "file-1",
                 "business_domain": "risk",
@@ -142,6 +162,12 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
     assert len(listed) == 1
     assert len(full_text) == 2
     assert len(vector) == 2
+    assert listed[0]["summary_text"] == "liquidity overview"
+    assert listed[0]["embedding_preview"] == [1.0, 0.0, 0.0, 0.0]
+    assert listed[0]["embedding_dimension"] == 4
+    preview = store.get_preview("file-1", 100)
+    assert preview["summary_text"] == "liquidity overview"
+    assert preview["content_text"] == "liquidity risk report"
     global_list = store.list_assets(
         media_type="document",
         business_domain=None,

@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     admin_port: int = Field(8081, alias="MORPHLAKE_ADMIN_PORT")
     log_level: str = Field("INFO", alias="MORPHLAKE_LOG_LEVEL")
     max_upload_mb: int = Field(200, alias="MORPHLAKE_MAX_UPLOAD_MB")
+    thumbnail_max_pixels: int = Field(320, alias="MORPHLAKE_THUMBNAIL_MAX_PIXELS", ge=64, le=2048)
+    preview_max_chars: int = Field(20_000, alias="MORPHLAKE_PREVIEW_MAX_CHARS", ge=1000, le=200_000)
     models_config: Path = Field(Path("config/models.yaml"), alias="MORPHLAKE_MODELS_CONFIG")
     admin_db_config: Path = Field(Path("config/database.yaml"), alias="MORPHLAKE_ADMIN_DB_CONFIG")
     admin_db_path: Path | None = Field(None, alias="MORPHLAKE_ADMIN_DB_PATH")

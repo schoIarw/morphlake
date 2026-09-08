@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from morphlake.config import Settings
 from morphlake.errors import MorphLakeError
@@ -108,6 +110,45 @@ def test_upload_writes_descriptor_and_document_chunks(tmp_path: Path):
     assert all("object_key" not in row for row in catalog.text_segments)
     assert all(len(row["text_embedding"]) == 4 for row in catalog.text_segments)
     assert all(row["domain_shard"] == result["domain_shard"] for row in catalog.text_segments)
+    assert result["summary_text"].startswith("abcdef")
+    assert len(result["embedding_preview"]) == 4
+    assert catalog.text_segments[0]["segment_type"] == "file_summary"
+
+
+def test_image_upload_creates_summary_thumbnail_and_preview_vector(tmp_path: Path):
+    source = io.BytesIO()
+    Image.new("RGB", (900, 450), "navy").save(source, "PNG")
+    objects, catalog = FakeObjects(), FakeCatalog()
+    service = MorphLakeService(settings(), objects, catalog, models(tmp_path))
+    result = service.upload(
+        filename="dashboard.png",
+        content_type="image/png",
+        body=source.getvalue(),
+        business_domain="risk",
+        department="audit",
+    )
+    assert result["summary_text"].startswith("图片文件")
+    assert result["thumbnail_available"] is True
+    assert len(result["embedding_preview"]) == 5
+    assert len(objects.values) == 2
+    assert any(key.endswith(".thumbnail.jpg") for key in objects.values)
+    assert catalog.image_features[0]["feature_type"] == "whole_image_with_thumbnail"
+
+
+def test_audio_upload_always_has_text_summary(tmp_path: Path):
+    objects, catalog = FakeObjects(), FakeCatalog()
+    service = MorphLakeService(settings(), objects, catalog, models(tmp_path))
+    result = service.upload(
+        filename="meeting.mp3",
+        content_type="audio/mpeg",
+        body=b"audio-content",
+        business_domain="risk",
+        department="audit",
+    )
+    assert "未配置语音转写模型" in result["summary_text"]
+    assert len(result["embedding_preview"]) == 6
+    assert catalog.text_segments[0]["segment_type"] == "file_summary"
+    assert catalog.audio_features[0]["content_text"] == result["summary_text"]
 
 
 def test_upload_compensates_object_on_paimon_failure(tmp_path: Path):

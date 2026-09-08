@@ -32,15 +32,15 @@ flowchart TB
 
 | 能力 | 支持内容 |
 | --- | --- |
-| 上传 | 文档、图片、音频独立接口；另保留自动分类兼容接口 |
+| 上传 | 文档、图片、音频独立接口；全部生成文本摘要，图片额外生成缩略图 |
 | 归属元数据 | 上传时由 API Key 自动关联 `business_domain` 和 `department` |
 | 文档处理 | 文本提取、可配置重叠切片、逐切片向量化 |
-| 图片处理 | 文件级图片向量 |
-| 音频处理 | 文件级音频向量；可选语音转写和转写文本向量 |
-| 清单查询 | 类型、日期、文件名关键字；业务范围由 Key 自动限定 |
+| 图片处理 | 视觉描述、文件级图片向量、MinIO JPEG 缩略图 |
+| 音频处理 | 文件级音频向量；可选语音转写、内容摘要和转写文本向量 |
+| 清单查询 | 类型、日期、文件名关键字、摘要及前 8 位向量预览；业务范围由 Key 自动限定 |
 | 全文检索 | 日期范围、全文关键字；业务范围由 Key 自动限定 |
 | 向量检索 | 上传文档/图片/音频自动向量化并返回 Paimon Top10；也支持直接提交向量 |
-| 下载 | 按 `file_id` 流式下载 MinIO 对象 |
+| 预览与下载 | 图片缩略图/放大、文本展示、音频播放，并可按 `file_id` 下载原文件 |
 | 访问控制 | 业务域 Key 仅查询本域，默认管理 Key 可查询全域；支持查看、复制和轮换 |
 | 流量治理 | 按 Key 配置上传/下载周期次数及字节配额 |
 | 运维 | 独立 Web 管理容器、Prometheus 指标、Grafana 面板、天/周/月统计 |
@@ -106,9 +106,9 @@ MORPHLAKE_TOKEN_ENCRYPTION_SECRET=replace-with-a-separate-key-encryption-secret
 管理数据库首次初始化会自动创建一个业务域/部门均为“管理员”的管理 Key。登录管理台后可在
 “Key 管理”页面查看和复制；该 Key 拥有全域查询与下载权限，应按管理员凭据保护。
 
-开发配置默认使用确定性的 `hash` 向量，仅用于接口和索引冒烟验证，不具备语义效果。
-生产环境应修改 `config/models.yaml`，把对应 `provider` 改为
-`openai_compatible`，并设置 `EMBEDDING_API_BASE`、`EMBEDDING_API_KEY` 和模型名称。
+开发配置默认使用确定性的 `hash` 向量和抽取式摘要，仅用于接口和索引冒烟验证，不具备完整
+语义效果。生产环境应修改 `config/models.yaml`，配置实际嵌入、摘要、视觉和语音转写模型；
+嵌入模型可使用 `openai_compatible`，MacBook 本地摘要使用 Ollama `qwen2.5:7b`。
 
 ### MacBook + Ollama 本地测试
 
@@ -117,7 +117,7 @@ MORPHLAKE_TOKEN_ENCRYPTION_SECRET=replace-with-a-separate-key-encryption-secret
 
 | 数据类型 | Ollama 链路 | 向量维度 |
 | --- | --- | --- |
-| 文档 | `nomic-embed-text:latest` | 768 |
+| 文档 | `qwen2.5:7b` 摘要，`nomic-embed-text:latest` 向量化 | 768 |
 | 图片 | `minicpm-v:8b` 生成检索描述，再由 `nomic-embed-text:latest` 向量化 | 768 |
 | 音频 | 本地测试使用确定性 hash；当前所列 Ollama 模型没有音频语义嵌入能力 | 384 |
 
@@ -126,6 +126,7 @@ MORPHLAKE_TOKEN_ENCRYPTION_SECRET=replace-with-a-separate-key-encryption-secret
 ```bash
 ollama pull nomic-embed-text:latest
 ollama pull minicpm-v:8b
+ollama pull qwen2.5:7b
 ollama list
 ```
 

@@ -25,6 +25,7 @@ from morphlake.metrics import Metrics, get_metrics
 from morphlake.models import (
     Asset,
     AssetList,
+    FilePreview,
     FullTextSearchRequest,
     Health,
     SearchHit,
@@ -291,6 +292,33 @@ def download_file(
         "ETag": asset.get("object_etag") or "",
     }
     return StreamingResponse(audited_stream(), media_type=asset["content_type"], headers=headers)
+
+
+@router.get("/api/v1/files/{file_id}/preview", response_model=FilePreview, tags=["files"])
+def preview_file(
+    file_id: str,
+    service: Annotated[MorphLakeService, Depends(get_service)],
+    identity: Annotated[TokenIdentity, Depends(require_token)],
+) -> FilePreview:
+    asset = service.get_asset(file_id)
+    enforce_asset_access(identity, asset["business_domain"])
+    return FilePreview.model_validate(service.preview(file_id))
+
+
+@router.get("/api/v1/files/{file_id}/thumbnail", tags=["files"])
+def thumbnail_file(
+    file_id: str,
+    service: Annotated[MorphLakeService, Depends(get_service)],
+    identity: Annotated[TokenIdentity, Depends(require_token)],
+) -> Response:
+    asset = service.get_asset(file_id)
+    enforce_asset_access(identity, asset["business_domain"])
+    body = service.thumbnail(asset)
+    return Response(
+        body,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600", "Content-Length": str(len(body))},
+    )
 
 
 @router.post("/api/v1/search/full-text", response_model=SearchResult, tags=["search"])

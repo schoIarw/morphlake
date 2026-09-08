@@ -41,7 +41,9 @@ API 服务首次启动时使用 `ignore_if_exists=true` 创建以下五张表，
 
 ## 2. multimodal_text_segment
 
-文档切片或音频转写一行；全文和文本向量查询只访问本表。
+文档切片、音频转写或文件摘要一行；全文和文本向量查询只访问本表。每个文档和音频都会写入
+一条 `segment_type=file_summary` 记录，供清单摘要及文件级文本向量预览使用；它不计入
+`chunk_count`。
 
 | 字段组 | 主要字段 |
 | --- | --- |
@@ -56,7 +58,7 @@ API 服务首次启动时使用 `ignore_if_exists=true` 创建以下五张表，
 
 ## 3. multimodal_image_feature
 
-当前每张图片一条 `whole_image` 特征，后续可追加区域或页面级 feature，而无需改变资产表。
+当前每张图片一条 `whole_image_with_thumbnail` 特征，后续可追加区域或页面级 feature，而无需改变资产表。
 主要字段为 feature_id、file_id、公共业务/分区/结果字段、feature_type、模型元数据及
 `image_embedding VECTOR<FLOAT,image_dimension>`。索引包括 file_id BTree、业务字段 Bitmap
 和向量 IVF-SQ。
@@ -112,3 +114,5 @@ global-index.row-count-per-shard=500000
 ```
 
 对象键包含业务路径便于运维定位，但它不是 Paimon 分区模型的一部分。
+图片缩略图使用 `<原对象键>.thumbnail.jpg`，仅存 MinIO；Paimon 的 feature 类型作为是否存在
+缩略图的轻量标记，不在 Paimon 中保存图片二进制。

@@ -55,9 +55,12 @@ class AdminApiClient:
         return ApiResult(response.status_code, payload)
 
     def download(self, file_id: str, token: str) -> tuple[httpx.Response, httpx.Client]:
+        return self.stream(f"/api/v1/files/{file_id}/download", token)
+
+    def stream(self, path: str, token: str) -> tuple[httpx.Response, httpx.Client]:
         request = httpx.Request(
             "GET",
-            f"{self.base_url}/api/v1/files/{file_id}/download",
+            f"{self.base_url}{path}",
             headers={"Authorization": f"Bearer {token}"},
         )
         client = httpx.Client(timeout=None, trust_env=False)

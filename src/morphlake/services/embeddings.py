@@ -23,6 +23,7 @@ class ModelSpec:
     base_url: str = ""
     api_key: str = ""
     timeout_seconds: float = 60
+    max_chars: int = 500
 
 
 class ModelGateway:
@@ -37,14 +38,60 @@ class ModelGateway:
     def embed_text(self, text: str) -> list[float]:
         return self._embed("text_embedding", text)
 
-    def embed_image(self, body: bytes, content_type: str) -> list[float]:
+    def embed_image(
+        self, body: bytes, content_type: str, description: str | None = None
+    ) -> list[float]:
         spec = self._spec("image_embedding")
         if spec.provider == "hash":
             return _hash_embedding(body, self._dimension(spec))
         if spec.provider == "ollama_vision_caption":
-            return self._ollama_vision_embedding(spec, body)
+            return self._ollama_vision_embedding(spec, body, description)
         data_url = f"data:{content_type};base64,{base64.b64encode(body).decode('ascii')}"
         return self._openai_embedding(spec, data_url)
+
+    def describe_image(self, body: bytes, content_type: str) -> str:
+        spec = self._spec("image_embedding")
+        if spec.provider == "ollama_vision_caption":
+            return self._ollama_vision_caption(spec, body)
+        return f"图片文件，格式 {content_type}，大小 {len(body)} 字节。"
+
+    def summarize(self, text: str, fallback: str) -> str:
+        normalized = " ".join(text.split())
+        if not normalized:
+            return fallback
+        spec = self.specs.get(
+            "text_summary",
+            ModelSpec(provider="extractive", model="morphlake-extractive-summary-v1"),
+        )
+        if spec.provider == "extractive":
+            return normalized[: spec.max_chars]
+        if spec.provider != "ollama_chat":
+            raise ConfigurationError(f"Unsupported text summary provider: {spec.provider}")
+        try:
+            response = httpx.post(
+                f"{spec.base_url.rstrip('/')}/api/chat",
+                headers=self._headers(spec),
+                json={
+                    "model": spec.model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "请用中文客观概括以下内容，保留主题、关键实体和结论，"
+                                f"不超过{spec.max_chars}字：\n\n{normalized[:12000]}"
+                            ),
+                        }
+                    ],
+                    "stream": False,
+                    "options": {"temperature": 0},
+                },
+                timeout=spec.timeout_seconds,
+            )
+            response.raise_for_status()
+            summary = response.json()["message"]["content"].strip()
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            raise StorageError(f"Summary request failed for {spec.model}: {exc}") from exc
+        return summary[: spec.max_chars] or fallback
 
     def embed_audio(self, body: bytes) -> list[float]:
         spec = self._spec("audio_embedding")
@@ -83,7 +130,7 @@ class ModelGateway:
         for spec in self.specs.values():
             if spec.provider == "openai_compatible" and spec.base_url:
                 endpoints[f"{spec.base_url.rstrip('/')}/models"] = spec
-            elif spec.provider == "ollama_vision_caption" and spec.base_url:
+            elif spec.provider in {"ollama_vision_caption", "ollama_chat"} and spec.base_url:
                 endpoints[f"{spec.base_url.rstrip('/')}/api/tags"] = spec
         for url, spec in endpoints.items():
             try:
@@ -120,8 +167,19 @@ class ModelGateway:
             )
         return vector
 
-    def _ollama_vision_embedding(self, spec: ModelSpec, body: bytes) -> list[float]:
+    def _ollama_vision_embedding(
+        self, spec: ModelSpec, body: bytes, description: str | None = None
+    ) -> list[float]:
         """Describe an image with Ollama vision, then embed that description as text."""
+        caption = description or self._ollama_vision_caption(spec, body)
+        vector = self.embed_text(caption)
+        if len(vector) != self._dimension(spec):
+            raise StorageError(
+                f"Image pipeline returned dimension {len(vector)}; expected {spec.dimension}"
+            )
+        return vector
+
+    def _ollama_vision_caption(self, spec: ModelSpec, body: bytes) -> str:
         if not spec.base_url:
             raise ConfigurationError(f"base_url is required for model {spec.model}")
         try:
@@ -134,9 +192,8 @@ class ModelGateway:
                         {
                             "role": "user",
                             "content": (
-                                "Describe this image for semantic retrieval. Include visible "
-                                "text (OCR), objects, scene, layout, and key attributes. Be "
-                                "factual and concise."
+                                "请用中文描述这张图片，用于语义检索和摘要。包括可见文字（OCR）、"
+                                "对象、场景、布局和关键属性；保持客观、简洁。"
                             ),
                             "images": [base64.b64encode(body).decode("ascii")],
                         }
@@ -152,12 +209,7 @@ class ModelGateway:
             raise StorageError(f"Ollama vision request failed for {spec.model}: {exc}") from exc
         if not caption:
             raise StorageError(f"Ollama vision model {spec.model} returned an empty description")
-        vector = self.embed_text(caption)
-        if len(vector) != self._dimension(spec):
-            raise StorageError(
-                f"Image pipeline returned dimension {len(vector)}; expected {spec.dimension}"
-            )
-        return vector
+        return caption
 
     def _spec(self, name: str) -> ModelSpec:
         try:

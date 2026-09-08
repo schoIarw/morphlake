@@ -58,6 +58,33 @@ class FakeService:
             iter([b"hello"]),
         )
 
+    def get_asset(self, file_id):
+        return {
+            "file_id": file_id,
+            "filename": "a.png",
+            "media_type": "image",
+            "content_type": "image/png",
+            "file_size": 5,
+            "business_domain": "risk",
+            "department": "audit",
+            "object_key": "risk/a.png",
+        }
+
+    def preview(self, file_id):
+        return {
+            "file_id": file_id,
+            "filename": "a.txt",
+            "media_type": "document",
+            "content_type": "text/plain",
+            "summary_text": "summary",
+            "content_text": "full preview text",
+            "thumbnail_available": False,
+        }
+
+    def thumbnail(self, asset):
+        assert asset["media_type"] == "image"
+        return b"jpeg-thumbnail"
+
     def full_text_search(self, request, business_domain, department):
         self.full_text_scope = (request, business_domain, department)
         return []
@@ -323,3 +350,35 @@ def test_download_metrics_and_validation(tmp_path: Path):
     )
     assert invalid.status_code == 422
     assert invalid.json()["error"]["code"] == "invalid_request"
+
+
+def test_preview_and_thumbnail_are_additive_authenticated_apis(tmp_path: Path):
+    test_client, store, _ = build_client(tmp_path)
+    preview = test_client.get("/api/v1/files/file-1/preview")
+    assert preview.status_code == 200
+    assert preview.json()["summary_text"] == "summary"
+    assert preview.json()["content_text"] == "full preview text"
+
+    thumbnail = test_client.get("/api/v1/files/file-1/thumbnail")
+    assert thumbnail.status_code == 200
+    assert thumbnail.content == b"jpeg-thumbnail"
+    assert thumbnail.headers["content-type"] == "image/jpeg"
+
+    finance = store.create_token(
+        business_domain="finance",
+        department="accounting",
+        assignee_name="Bob",
+        phone="13900000000",
+        notes="test",
+        allocated_by="pytest",
+        period_seconds=60,
+        upload_requests_limit=10,
+        download_requests_limit=10,
+        upload_bytes_limit=10_000,
+        download_bytes_limit=10_000,
+    )
+    denied = test_client.get(
+        "/api/v1/files/file-1/preview",
+        headers={"Authorization": f"Bearer {finance.plaintext}"},
+    )
+    assert denied.status_code == 403

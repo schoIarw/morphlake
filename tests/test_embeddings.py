@@ -33,6 +33,43 @@ def test_none_audio_transcription(tmp_path: Path):
     assert ModelGateway(path).transcribe_audio("a.wav", b"audio", "audio/wav") is None
 
 
+def test_missing_summary_config_uses_extractive_fallback(tmp_path: Path):
+    path = tmp_path / "models.yaml"
+    _config(path)
+    assert ModelGateway(path).summarize("  first   second  ", "fallback") == "first second"
+
+
+def test_ollama_summary(monkeypatch, tmp_path: Path):
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        """models:
+  text_summary:
+    provider: ollama_chat
+    model: qwen2.5:7b
+    base_url: http://ollama:11434
+    max_chars: 20
+  text_embedding: {provider: hash, model: text, dimension: 4}
+  image_embedding: {provider: hash, model: image, dimension: 5}
+  audio_transcription: {provider: none, model: none}
+  audio_embedding: {provider: hash, model: audio, dimension: 6}
+chunking: {size: 100, overlap: 10}
+""",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"message": {"content": "风险报告摘要"}},
+        )
+
+    monkeypatch.setattr("morphlake.services.embeddings.httpx.post", post)
+    assert ModelGateway(path).summarize("风险报告正文", "fallback") == "风险报告摘要"
+    assert calls[0][0] == "http://ollama:11434/api/chat"
+
+
 def test_ollama_vision_caption_is_embedded_as_text(monkeypatch, tmp_path: Path):
     path = tmp_path / "models.yaml"
     path.write_text(

@@ -61,7 +61,8 @@ curl -X POST http://localhost:8080/api/v1/files/documents \
 ```
 
 上传成功返回 201 和资产描述符。业务域、部门来自 Key；原始二进制写入 MinIO，Paimon 只保存
-描述符、切片和向量。
+描述符、切片、摘要和向量。三种模态均生成 `summary_text`；图片还会在 MinIO 生成固定上限尺寸
+的 JPEG 缩略图。未配置语音转写模型时，音频摘要会明确标记未转写，不伪造内容摘要。
 
 ## 清单查询
 
@@ -77,7 +78,12 @@ curl -G http://localhost:8080/api/v1/files \
 ```
 
 支持类型、文件名关键字和闭区间日期过滤；结果按 `created_at/file_id` 倒序。业务范围由 Key
-自动限定，不接受业务域和部门查询字段。
+自动限定，不接受业务域和部门查询字段。每项额外返回：
+
+- `summary_text`：上传时生成的文本摘要；
+- `embedding_preview`：对应模态向量的前 8 位，不重复返回完整向量；
+- `embedding_dimension`：完整向量维度；
+- `thumbnail_available`：是否存在图片缩略图。
 
 ## 全文检索
 
@@ -136,6 +142,22 @@ curl -X POST http://localhost:8080/api/v1/search/vector/file \
 链路。固定返回 Key 权限范围内的同模态 Top10。
 
 ## 下载
+
+### 内容与缩略图预览
+
+```bash
+curl -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
+  http://localhost:8080/api/v1/files/FILE_ID/preview
+
+curl -o thumbnail.jpg \
+  -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
+  http://localhost:8080/api/v1/files/FILE_ID/thumbnail
+```
+
+`preview` 返回摘要，以及文档提取文本或音频转写文本；内容由
+`MORPHLAKE_PREVIEW_MAX_CHARS` 限长。`thumbnail` 只适用于上传后生成过缩略图的图片。
+
+### 原文件下载
 
 ```bash
 curl -OJ \

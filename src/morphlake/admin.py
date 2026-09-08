@@ -12,8 +12,18 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.background import BackgroundTask
 
@@ -605,6 +615,40 @@ def download_action(
     )
 
 
+@router.get("/api/files/{file_id}/preview")
+def preview_proxy(
+    file_id: str,
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
+    api_key: Annotated[str, Header(alias="X-MorphLake-Key")],
+) -> JSONResponse:
+    del session
+    result = client.request("GET", f"/api/v1/files/{file_id}/preview", api_key)
+    return JSONResponse(result.payload, status_code=result.status_code)
+
+
+@router.get("/api/files/{file_id}/thumbnail")
+def thumbnail_proxy(
+    file_id: str,
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
+    api_key: Annotated[str, Header(alias="X-MorphLake-Key")],
+) -> StreamingResponse:
+    del session
+    return _stream_api_response(client, f"/api/v1/files/{file_id}/thumbnail", api_key)
+
+
+@router.get("/api/files/{file_id}/media")
+def media_proxy(
+    file_id: str,
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
+    api_key: Annotated[str, Header(alias="X-MorphLake-Key")],
+) -> StreamingResponse:
+    del session
+    return _stream_api_response(client, f"/api/v1/files/{file_id}/download", api_key)
+
+
 @router.get("/api/status", response_class=HTMLResponse)
 def status_page(
     session: Annotated[AdminSession, Depends(require_admin_session)],
@@ -733,10 +777,41 @@ def _search_form(session: AdminSession, action: str, special: str, limit: int) -
       <div class="wide form-actions"><button>开始检索</button></div></form></section>"""
 
 
+def _stream_api_response(client: AdminApiClient, path: str, api_key: str) -> StreamingResponse:
+    try:
+        response, http_client = client.stream(path, api_key)
+    except httpx.HTTPError as exc:
+        raise MorphLakeError("api_unreachable", str(exc), 502) from exc
+    if response.status_code >= 400:
+        body = response.read().decode(errors="replace")
+        status = response.status_code
+        response.close()
+        http_client.close()
+        raise MorphLakeError("preview_failed", body[:1000], status)
+    headers = {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() in {"content-disposition", "content-length", "etag", "cache-control"}
+    }
+
+    def close() -> None:
+        response.close()
+        http_client.close()
+
+    return StreamingResponse(
+        response.iter_raw(),
+        media_type=response.headers.get("content-type", "application/octet-stream"),
+        headers=headers,
+        background=BackgroundTask(close),
+    )
+
+
 def _result_panel(result: ApiResult, title: str) -> str:
     ok = 200 <= result.status_code < 300
     payload = result.payload if isinstance(result.payload, dict) else {"result": result.payload}
     items = payload.get("items") if isinstance(payload, dict) else None
+    if items is None and isinstance(payload, dict) and payload.get("file_id"):
+        items = [payload]
     table = _object_table(items) if isinstance(items, list) else ""
     badge = "成功" if ok else "失败"
     details_open = "" if table else " open"
@@ -750,6 +825,8 @@ def _result_panel(result: ApiResult, title: str) -> str:
 def _object_table(items: list[Any]) -> str:
     if not items:
         return '<div class="empty">没有匹配数据</div>'
+    if any(isinstance(item, dict) and item.get("file_id") for item in items):
+        return _asset_table([item for item in items if isinstance(item, dict)])
     keys = list(dict.fromkeys(key for item in items if isinstance(item, dict) for key in item))
     head = "".join(f"<th>{html.escape(str(key))}</th>" for key in keys)
     rows = "".join(
@@ -760,6 +837,97 @@ def _object_table(items: list[Any]) -> str:
         if isinstance(item, dict)
     )
     return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
+
+
+def _asset_table(items: list[dict[str, Any]]) -> str:
+    columns = [
+        ("rank", "排名"),
+        ("asset_preview", "预览"),
+        ("filename", "文件名"),
+        ("media_type", "类型"),
+        ("summary_text", "文本摘要"),
+        ("embedding_preview", "向量预览"),
+        ("file_size", "大小"),
+        ("business_domain", "业务域"),
+        ("department", "部门"),
+        ("created_at", "创建时间"),
+        ("content_text", "命中内容"),
+        ("actions", "操作"),
+    ]
+    available = {key for item in items for key in item}
+    selected = [
+        (key, label)
+        for key, label in columns
+        if key in {"asset_preview", "actions"} or key in available
+    ]
+    head = "".join(f"<th>{label}</th>" for _, label in selected)
+    rows = []
+    for item in items:
+        cells = []
+        for key, _ in selected:
+            if key == "asset_preview":
+                value = _asset_preview_cell(item)
+            elif key == "actions":
+                value = _asset_actions(item)
+            elif key == "embedding_preview":
+                vector = item.get(key)
+                if vector:
+                    compact = ", ".join(f"{float(number):.5g}" for number in vector[:8])
+                    dimension = item.get("embedding_dimension") or "?"
+                    value = f'<code class="vector-preview">[{compact}, …]</code><small>{dimension} 维</small>'
+                else:
+                    value = '<span class="hint">暂无</span>'
+            elif key in {"summary_text", "content_text"}:
+                text = str(item.get(key) or "")
+                short = text if len(text) <= 120 else f"{text[:120]}…"
+                value = f'<span class="text-clip" title="{html.escape(text)}">{html.escape(short)}</span>'
+            elif key == "file_size":
+                value = html.escape(_human_bytes(item.get(key)))
+            else:
+                value = html.escape(str(item.get(key) or ""))
+            cells.append(f"<td>{value}</td>")
+        rows.append(f"<tr>{''.join(cells)}</tr>")
+    return f'<div class="table-wrap"><table class="asset-table"><thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+
+
+def _asset_preview_cell(item: dict[str, Any]) -> str:
+    file_id = html.escape(str(item.get("file_id") or ""))
+    media_type = item.get("media_type")
+    if media_type == "image" and item.get("thumbnail_available"):
+        return f"""<button type="button" class="media-tile thumbnail-open" data-file-id="{file_id}"
+          aria-label="放大图片"><span class="media-placeholder">图片</span><img alt="图片缩略图"></button>"""
+    if media_type == "audio":
+        return f"""<button type="button" class="media-tile audio-open" data-file-id="{file_id}"
+          aria-label="播放音频"><span class="media-icon">♪</span><small>音频</small></button>"""
+    return f"""<button type="button" class="media-tile preview-open" data-file-id="{file_id}"
+      aria-label="查看文本"><span class="media-icon">▤</span><small>文档</small></button>"""
+
+
+def _asset_actions(item: dict[str, Any]) -> str:
+    file_id = html.escape(str(item.get("file_id") or ""))
+    filename = html.escape(str(item.get("filename") or "file"))
+    media_type = item.get("media_type")
+    action_class = {
+        "image": "thumbnail-open",
+        "audio": "audio-open",
+        "document": "preview-open",
+    }.get(media_type, "preview-open")
+    action_text = {"image": "放大", "audio": "播放", "document": "查看"}.get(media_type, "查看")
+    return f"""<div class="row-actions"><button type="button" class="secondary {action_class}"
+      data-file-id="{file_id}">{action_text}</button><button type="button" class="secondary download-file"
+      data-file-id="{file_id}" data-filename="{filename}">下载</button></div>"""
+
+
+def _human_bytes(value: Any) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return ""
 
 
 def _compact(values: dict[str, Any]) -> dict[str, Any]:
@@ -936,18 +1104,101 @@ def _page(
     </form></div></header><aside class="sidebar">{nav}</aside>
     <main class="content"><div class="page-head"><div><span class="eyebrow">MORPHLAKE CONSOLE</span>
     <h1>{html.escape(title)}</h1></div></div>{body}</main>
-    <script>document.querySelectorAll('.api-token').forEach(function(el){{
-    el.value=sessionStorage.getItem('morphlakeApiToken')||'';
-    el.addEventListener('input',function(){{sessionStorage.setItem('morphlakeApiToken',el.value)}})}});
-    document.querySelectorAll('.key-toggle').forEach(function(button){{button.addEventListener('click',function(){{
-    var input=document.getElementById(button.dataset.target);var hidden=input.type==='password';
-    input.type=hidden?'text':'password';button.textContent=hidden?'隐藏':'查看'}})}});
-    document.querySelectorAll('.key-copy').forEach(function(button){{button.addEventListener('click',function(){{
-    var input=document.getElementById(button.dataset.target);var done=function(){{button.textContent='已复制';
-    setTimeout(function(){{button.textContent='复制'}},1200)}};
-    if(navigator.clipboard&&window.isSecureContext){{navigator.clipboard.writeText(input.value).then(done)}}else{{
-    input.type='text';input.select();document.execCommand('copy');done()}}}})}});</script>
+    <dialog id="media-modal" class="media-modal"><div class="modal-head"><h2></h2>
+    <button type="button" class="modal-close" aria-label="关闭">×</button></div>
+    <div class="modal-body"></div></dialog><script>{_CONSOLE_JS}</script>
     </body></html>"""
+
+
+_CONSOLE_JS = r"""
+const storedKey=()=>sessionStorage.getItem('morphlakeApiToken')||'';
+document.querySelectorAll('.api-token').forEach(el=>{
+  el.value=storedKey();
+  el.addEventListener('input',()=>sessionStorage.setItem('morphlakeApiToken',el.value));
+});
+document.querySelectorAll('.key-toggle').forEach(button=>button.addEventListener('click',()=>{
+  const input=document.getElementById(button.dataset.target),hidden=input.type==='password';
+  input.type=hidden?'text':'password';button.textContent=hidden?'隐藏':'查看';
+}));
+document.querySelectorAll('.key-copy').forEach(button=>button.addEventListener('click',()=>{
+  const input=document.getElementById(button.dataset.target),done=()=>{
+    button.textContent='已复制';setTimeout(()=>button.textContent='复制',1200);
+  };
+  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(input.value).then(done);}
+  else{input.type='text';input.select();document.execCommand('copy');done();}
+}));
+
+const setBusy=(button,busy,label='处理中…')=>{
+  if(!button)return;
+  if(busy){button.dataset.original=button.innerHTML;button.disabled=true;
+    button.innerHTML='<span class="spinner"></span>'+label;}
+  else{button.disabled=false;button.innerHTML=button.dataset.original||button.innerHTML;}
+};
+document.querySelectorAll('form[action^="/admin/api/"]').forEach(form=>form.addEventListener('submit',event=>{
+  if(form.dataset.submitting==='1'){event.preventDefault();return;}
+  form.dataset.submitting='1';const button=form.querySelector('button[type="submit"],button:not([type])');
+  setBusy(button,true,form.enctype==='multipart/form-data'?'上传处理中…':'查询处理中…');
+  setTimeout(()=>{form.dataset.submitting='0';setBusy(button,false);},60000);
+}));
+
+const modal=document.getElementById('media-modal'),modalTitle=modal.querySelector('h2');
+const modalBody=modal.querySelector('.modal-body');
+const showModal=(title,node)=>{modalTitle.textContent=title;modalBody.replaceChildren(node);modal.showModal();};
+modal.querySelector('.modal-close').addEventListener('click',()=>modal.close());
+modal.addEventListener('click',event=>{if(event.target===modal)modal.close();});
+const apiFetch=async(path)=>{
+  const key=storedKey();if(!key)throw new Error('请先填写 API Key');
+  const response=await fetch(path,{headers:{'X-MorphLake-Key':key}});
+  if(!response.ok){let message='请求失败（HTTP '+response.status+'）';
+    try{const body=await response.json();message=body.error?.message||body.detail||message;}catch(_e){}
+    throw new Error(message);}
+  return response;
+};
+const showError=error=>window.alert(error.message||String(error));
+
+document.querySelectorAll('.thumbnail-open').forEach(button=>button.addEventListener('click',async()=>{
+  const image=button.querySelector('img');
+  try{
+    if(!image||!image.src){const response=await apiFetch('/admin/api/files/'+encodeURIComponent(button.dataset.fileId)+'/thumbnail');
+      const url=URL.createObjectURL(await response.blob());document.querySelectorAll('.thumbnail-open[data-file-id="'+CSS.escape(button.dataset.fileId)+'"] img').forEach(item=>{item.src=url;item.hidden=false;});}
+    const source=document.querySelector('.thumbnail-open[data-file-id="'+CSS.escape(button.dataset.fileId)+'"] img');
+    const large=document.createElement('img');large.className='modal-image';large.src=source.src;
+    showModal('图片预览',large);
+  }catch(error){showError(error);}
+}));
+document.querySelectorAll('.media-tile.thumbnail-open img').forEach(async image=>{
+  const button=image.closest('button');
+  try{const response=await apiFetch('/admin/api/files/'+encodeURIComponent(button.dataset.fileId)+'/thumbnail');
+    image.src=URL.createObjectURL(await response.blob());image.hidden=false;}
+  catch(_error){button.classList.add('preview-unavailable');}
+});
+document.querySelectorAll('.preview-open').forEach(button=>button.addEventListener('click',async()=>{
+  setBusy(button,true,'读取中…');
+  try{const response=await apiFetch('/admin/api/files/'+encodeURIComponent(button.dataset.fileId)+'/preview');
+    const data=await response.json(),wrap=document.createElement('div');wrap.className='text-preview';
+    const summary=document.createElement('section');summary.innerHTML='<h3>文本摘要</h3>';
+    const summaryText=document.createElement('p');summaryText.textContent=data.summary_text||'暂无摘要';summary.append(summaryText);
+    const content=document.createElement('section');content.innerHTML='<h3>文本内容</h3>';
+    const pre=document.createElement('pre');pre.textContent=data.content_text||'暂无可展示文本';content.append(pre);
+    wrap.append(summary,content);showModal(data.filename,wrap);
+  }catch(error){showError(error);}finally{setBusy(button,false);}
+}));
+document.querySelectorAll('.audio-open').forEach(button=>button.addEventListener('click',async()=>{
+  setBusy(button,true,'加载中…');
+  try{const response=await apiFetch('/admin/api/files/'+encodeURIComponent(button.dataset.fileId)+'/media');
+    const audio=document.createElement('audio');audio.controls=true;audio.autoplay=true;
+    audio.src=URL.createObjectURL(await response.blob());showModal('音频播放',audio);
+  }catch(error){showError(error);}finally{setBusy(button,false);}
+}));
+document.querySelectorAll('.download-file').forEach(button=>button.addEventListener('click',async()=>{
+  setBusy(button,true,'下载中…');
+  try{const response=await apiFetch('/admin/api/files/'+encodeURIComponent(button.dataset.fileId)+'/media');
+    const link=document.createElement('a');link.href=URL.createObjectURL(await response.blob());
+    link.download=button.dataset.filename||'download';document.body.append(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(link.href),10000);
+  }catch(error){showError(error);}finally{setBusy(button,false);}
+}));
+"""
 
 
 _CSS = """
@@ -960,7 +1211,9 @@ _CSS = """
 .cards{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:15px;margin-bottom:18px}.card{padding:18px;border-top:3px solid var(--blue)}.card span,.card small{display:block;color:var(--muted)}.card strong{display:block;font-size:28px;margin:5px 0}.welcome{display:flex;justify-content:space-between;align-items:center;padding:28px}.welcome p{margin-bottom:0}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:15px}.quick{display:flex;flex-direction:column;padding:20px;text-decoration:none;color:var(--ink);transition:.16s}.quick:hover{transform:translateY(-2px);border-color:#b8c7fa}.quick strong{font-size:16px}.quick span{color:var(--muted);margin:7px 0 14px}.quick b{color:var(--blue);font-size:12px}
 .grid-form{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:15px}.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}.split .grid-form{grid-template-columns:1fr 1fr}.wide{grid-column:1/-1}label{display:block;color:#4d596c;font-size:13px;font-weight:600}input,textarea,select{display:block;width:100%;margin-top:6px;padding:10px 11px;border:1px solid #ccd3df;border-radius:8px;background:#fff;color:var(--ink);font:inherit;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px #3b66f51c}textarea{min-height:90px;resize:vertical}label small,.hint{color:var(--muted);font-size:12px;font-weight:400}.token-field{padding:12px;background:#f6f8fd;border-radius:9px}.form-actions{display:flex;align-items:center;gap:14px}
 .key-view{display:grid;grid-template-columns:minmax(190px,1fr) auto auto;gap:5px;min-width:330px;margin-bottom:5px}.key-view input{margin:0;padding:7px 8px}.key-view button{padding:7px 9px}.admin-key{background:#e8edff;color:var(--blue2)}
-button,.button{display:inline-block;border:0;border-radius:8px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;padding:10px 17px;text-decoration:none;font-weight:650;cursor:pointer}.secondary{background:#eef2ff;color:var(--blue2)}.danger{background:#fff0f1;color:var(--red)}.inline{display:inline}.table-wrap{overflow:auto;margin-top:12px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#f8f9fc;color:#596579;font-size:12px}td{color:#344054}.empty{text-align:center!important;color:var(--muted);padding:30px!important}.status-pill{display:inline-block;padding:4px 9px;border-radius:20px;background:#eef2f7;font-size:12px}.status-pill.ok,.status-pill.active{background:#e7f8ee;color:var(--green)}.status-pill.error,.status-pill.deleted{background:#fff0f1;color:var(--red)}.status-pill.disabled{background:#fff6dc;color:var(--amber)}.result-head{margin-bottom:12px}.tabs{display:flex;gap:7px}.tabs a{padding:5px 10px;background:#eef2ff;border-radius:7px;text-decoration:none}.limit-form{min-width:330px;display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px}.alert{padding:12px 14px;background:#fff3dc;border:1px solid #f0cf88;border-radius:9px;color:#775310;margin-bottom:15px}pre{white-space:pre-wrap;word-break:break-all;background:#111827;color:#dbe7ff;padding:16px;border-radius:9px;max-height:460px;overflow:auto}.secret{font-size:16px}.token-created{text-align:center;max-width:760px;margin:40px auto}.success-mark{display:grid;place-items:center;width:52px;height:52px;margin:0 auto 12px;border-radius:50%;background:#e7f8ee;color:var(--green);font-size:26px}
+button,.button{display:inline-block;border:0;border-radius:8px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;padding:10px 17px;text-decoration:none;font-weight:650;cursor:pointer}button:disabled{cursor:wait;opacity:.72}.secondary{background:#eef2ff;color:var(--blue2)}.danger{background:#fff0f1;color:var(--red)}.inline{display:inline}.spinner{display:inline-block;width:14px;height:14px;margin-right:8px;border:2px solid #ffffff70;border-top-color:#fff;border-radius:50%;vertical-align:-2px;animation:spin .72s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+.table-wrap{overflow:auto;margin-top:12px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#f8f9fc;color:#596579;font-size:12px}td{color:#344054}.asset-table td{vertical-align:middle}.asset-table .text-clip{display:block;max-width:280px;white-space:normal;line-height:1.45}.vector-preview{display:block;max-width:245px;overflow:hidden;text-overflow:ellipsis;color:#344054}.vector-preview+small{display:block;color:var(--muted);margin-top:3px}.row-actions{display:flex;gap:6px}.row-actions button{padding:7px 10px}.media-tile{position:relative;width:68px;height:58px;padding:0;overflow:hidden;border:1px solid #dce3ef;border-radius:9px;background:#f3f6fb;color:var(--blue2);display:grid;place-items:center}.media-tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.media-placeholder{font-size:11px;color:var(--muted)}.media-icon{font-size:23px;line-height:1}.media-tile small{font-size:10px}.preview-unavailable:after{content:'暂无缩略图';position:absolute;inset:0;display:grid;place-items:center;background:#f3f6fb;color:var(--muted);font-size:10px}
+.media-modal{width:min(920px,92vw);max-height:88vh;padding:0;border:0;border-radius:15px;box-shadow:0 30px 90px #10182766}.media-modal::backdrop{background:#101827a8}.modal-head{display:flex;align-items:center;justify-content:space-between;padding:15px 19px;border-bottom:1px solid var(--line)}.modal-head h2{margin:0;font-size:18px}.modal-close{width:34px;height:34px;padding:0;border-radius:50%;background:#eef2f7;color:var(--ink);font-size:22px}.modal-body{padding:20px;max-height:calc(88vh - 65px);overflow:auto}.modal-image{display:block;max-width:100%;max-height:72vh;margin:auto;border-radius:8px}.modal-body audio{display:block;width:min(680px,100%);margin:35px auto}.text-preview{display:grid;gap:15px}.text-preview section{padding:16px;border:1px solid var(--line);border-radius:10px}.text-preview h3{margin:0 0 9px}.text-preview p{white-space:pre-wrap}.text-preview pre{max-height:50vh}.empty{text-align:center!important;color:var(--muted);padding:30px!important}.status-pill{display:inline-block;padding:4px 9px;border-radius:20px;background:#eef2f7;font-size:12px}.status-pill.ok,.status-pill.active{background:#e7f8ee;color:var(--green)}.status-pill.error,.status-pill.deleted{background:#fff0f1;color:var(--red)}.status-pill.disabled{background:#fff6dc;color:var(--amber)}.result-head{margin-bottom:12px}.tabs{display:flex;gap:7px}.tabs a{padding:5px 10px;background:#eef2ff;border-radius:7px;text-decoration:none}.limit-form{min-width:330px;display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px}.alert{padding:12px 14px;background:#fff3dc;border:1px solid #f0cf88;border-radius:9px;color:#775310;margin-bottom:15px}pre{white-space:pre-wrap;word-break:break-all;background:#111827;color:#dbe7ff;padding:16px;border-radius:9px;max-height:460px;overflow:auto}.secret{font-size:16px}.token-created{text-align:center;max-width:760px;margin:40px auto}.success-mark{display:grid;place-items:center;width:52px;height:52px;margin:0 auto 12px;border-radius:50%;background:#e7f8ee;color:var(--green);font-size:26px}
 .login-body{min-height:100vh;background:radial-gradient(circle at 15% 15%,#4168ec 0,#183387 28%,#0e1729 70%);display:grid;place-items:center;padding:24px}.login-shell{width:min(960px,100%);display:grid;grid-template-columns:1.1fr .9fr;overflow:hidden;border-radius:20px;box-shadow:0 30px 80px #0006}.login-brand{color:#fff;padding:65px 55px;background:linear-gradient(145deg,#264ed3cc,#101c3de8)}.login-brand .eyebrow{color:#b9c9ff}.login-brand h1{font-size:36px;line-height:1.25;margin:22px 0 12px}.login-brand p{color:#c9d5ff}.login-card{background:#fff;padding:55px 48px;display:flex;flex-direction:column;justify-content:center}.login-card h2{font-size:25px;margin:6px 0}.login-card p{color:var(--muted);margin:0 0 20px}.login-card form{display:grid;gap:15px}.login-button{width:100%;margin-top:5px}.login-card>small{color:var(--muted);margin-top:18px;text-align:center}
 @media(max-width:980px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}}@media(max-width:760px){.topbar{padding:0 14px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:58px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 8px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:8px 10px}.content{margin-left:0;padding:124px 14px 30px}.grid-form,.split .grid-form,.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.welcome{align-items:flex-start;gap:18px;flex-direction:column}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:38px 28px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}
 """

@@ -1,8 +1,18 @@
 # Model behavior is entirely configuration-driven. The built-in hash provider
 # is deterministic and intended only for development and smoke tests. Change
-# each provider to openai_compatible and configure the environment variables
-# in production.
+# embedding providers to openai_compatible and configure the environment
+# variables in production. Summary defaults to a deterministic extractive
+# fallback; use the Ollama profile or another supported chat provider for a
+# generative summary.
 models:
+  text_summary:
+    provider: "${TEXT_SUMMARY_PROVIDER:-extractive}"
+    model: "${TEXT_SUMMARY_MODEL:-morphlake-extractive-summary-v1}"
+    base_url: "${SUMMARY_API_BASE:-}"
+    api_key: "${SUMMARY_API_KEY:-}"
+    timeout_seconds: 120
+    max_chars: 500
+
   text_embedding:
     provider: "${TEXT_EMBEDDING_PROVIDER:-hash}"
     model: "${TEXT_EMBEDDING_MODEL:-morphlake-hash-text-v1}"
@@ -37,4 +47,3 @@ models:
 chunking:
   size: 1000
   overlap: 150
-

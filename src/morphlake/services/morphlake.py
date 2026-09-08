@@ -16,7 +16,7 @@ from morphlake.errors import ConfigurationError, MorphLakeError
 from morphlake.models import FullTextSearchRequest, VectorSearchRequest
 from morphlake.partitioning import domain_shard
 from morphlake.services.embeddings import ModelGateway
-from morphlake.services.extractors import chunk_text, classify, extract_text
+from morphlake.services.extractors import chunk_text, classify, create_thumbnail, extract_text
 from morphlake.services.minio_store import MinioStore
 from morphlake.services.paimon_store import PaimonStore
 
@@ -79,7 +79,13 @@ class MorphLakeService:
         created_at = datetime.now(UTC)
         object_key = self._object_key(business_domain, department, created_at, file_id, filename)
         stored = self.objects.put(object_key, body, content_type)
+        thumbnail_stored = None
         try:
+            if media_type == "image":
+                thumbnail = create_thumbnail(body, self.settings.thumbnail_max_pixels)
+                thumbnail_stored = self.objects.put(
+                    self._thumbnail_key(object_key), thumbnail, "image/jpeg"
+                )
             asset, text_segments, image_features, audio_features = self._records(
                 file_id=file_id,
                 filename=filename,
@@ -90,6 +96,7 @@ class MorphLakeService:
                 department=department,
                 created_at=created_at,
                 stored=stored,
+                thumbnail_available=thumbnail_stored is not None,
             )
             self.catalog.add(
                 asset=asset,
@@ -99,6 +106,8 @@ class MorphLakeService:
             )
             return asset
         except Exception:
+            if thumbnail_stored is not None:
+                self.objects.delete(thumbnail_stored.key)
             self.objects.delete(object_key)
             raise
 
@@ -111,6 +120,14 @@ class MorphLakeService:
     def download(self, file_id: str):
         asset = self.catalog.get_asset(file_id)
         return asset, self.objects.stream(asset["object_key"])
+
+    def preview(self, file_id: str):
+        return self.catalog.get_preview(file_id, self.settings.preview_max_chars)
+
+    def thumbnail(self, asset: dict[str, Any]):
+        if asset["media_type"] != "image":
+            raise MorphLakeError("thumbnail_not_available", "File is not an image", 404)
+        return b"".join(self.objects.stream(self._thumbnail_key(asset["object_key"])))
 
     def full_text_search(
         self,
@@ -234,6 +251,7 @@ class MorphLakeService:
         department: str,
         created_at: datetime,
         stored,
+        thumbnail_available: bool,
     ) -> tuple[
         dict[str, Any],
         list[dict[str, Any]],
@@ -243,13 +261,27 @@ class MorphLakeService:
         chunks = []
         transcript = None
         image_vector = audio_vector = None
+        summary = ""
         if media_type == "document":
             text = extract_text(filename, body)
             chunks = chunk_text(text, self.models.chunk_size, self.models.chunk_overlap)
+            summary = self.models.summarize(
+                text,
+                f"文档“{filename}”未提取到可摘要的文本内容。",
+            )
         elif media_type == "image":
-            image_vector = self.models.embed_image(body, content_type)
+            summary = self.models.describe_image(body, content_type)
+            image_vector = self.models.embed_image(body, content_type, summary)
         elif media_type == "audio":
             transcript = self.models.transcribe_audio(filename, body, content_type)
+            fallback = (
+                f"音频“{filename}”，格式 {content_type}，大小 {len(body)} 字节；"
+                "未配置语音转写模型。"
+            )
+            summary = self.models.summarize(
+                transcript or "",
+                fallback,
+            )
             audio_vector = self.models.embed_audio(body)
 
         shard = domain_shard(business_domain, self.settings.paimon_domain_shards)
@@ -266,6 +298,22 @@ class MorphLakeService:
         }
         text_segments = []
         text_spec = self.models.specs["text_embedding"]
+        if media_type in {"document", "audio"}:
+            text_segments.append(
+                {
+                    **common,
+                    "segment_id": f"{file_id}:summary",
+                    "record_type": "file",
+                    "chunk_index": None,
+                    "content_text": summary,
+                    "segment_type": "file_summary",
+                    "chunk_start": None,
+                    "chunk_end": None,
+                    "embedding_model": text_spec.model,
+                    "embedding_version": "configured",
+                    "text_embedding": self.models.embed_text(summary),
+                }
+            )
         for chunk in chunks:
             text_segments.append(
                 {
@@ -308,8 +356,8 @@ class MorphLakeService:
                     "feature_id": f"{file_id}:image:0",
                     "record_type": "file",
                     "chunk_index": None,
-                    "content_text": filename,
-                    "feature_type": "whole_image",
+                    "content_text": summary,
+                    "feature_type": "whole_image_with_thumbnail",
                     "embedding_model": image_spec.model,
                     "embedding_version": "configured",
                     "image_embedding": image_vector,
@@ -325,7 +373,7 @@ class MorphLakeService:
                     "feature_id": f"{file_id}:audio:0",
                     "record_type": "file",
                     "chunk_index": None,
-                    "content_text": transcript,
+                    "content_text": summary,
                     "feature_type": "whole_audio",
                     "start_ms": None,
                     "end_ms": None,
@@ -343,7 +391,13 @@ class MorphLakeService:
             "object_bucket": stored.bucket,
             "object_key": stored.key,
             "object_etag": stored.etag,
-            "chunk_count": len(text_segments),
+            "chunk_count": len(chunks) + (1 if transcript else 0),
+            "summary_text": summary,
+            "embedding_preview": self._embedding_preview(
+                text_segments, image_features, audio_features
+            ),
+            "embedding_dimension": self._embedding_dimension(media_type),
+            "thumbnail_available": thumbnail_available,
         }
         return asset, text_segments, image_features, audio_features
 
@@ -389,3 +443,29 @@ class MorphLakeService:
                 safe(filename) or "file",
             ]
         )
+
+    @staticmethod
+    def _thumbnail_key(object_key: str) -> str:
+        return f"{object_key}.thumbnail.jpg"
+
+    def _embedding_dimension(self, media_type: str) -> int:
+        return {
+            "document": self.settings.text_vector_dimension,
+            "image": self.settings.image_vector_dimension,
+            "audio": self.settings.audio_vector_dimension,
+        }[media_type]
+
+    @staticmethod
+    def _embedding_preview(
+        text_segments: list[dict[str, Any]],
+        image_features: list[dict[str, Any]],
+        audio_features: list[dict[str, Any]],
+    ) -> list[float] | None:
+        for rows, column in (
+            (audio_features, "audio_embedding"),
+            (image_features, "image_embedding"),
+            (text_segments, "text_embedding"),
+        ):
+            if rows:
+                return [float(value) for value in rows[0][column][:8]]
+        return None

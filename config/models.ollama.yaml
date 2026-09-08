@@ -1,6 +1,14 @@
 # Local MacBook test profile. MorphLake runs in Docker while Ollama runs on
 # macOS, so the container reaches it through host.docker.internal.
 models:
+  text_summary:
+    provider: ollama_chat
+    model: "${TEXT_SUMMARY_MODEL:-qwen2.5:7b}"
+    base_url: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
+    api_key: ""
+    timeout_seconds: 300
+    max_chars: 500
+
   text_embedding:
     provider: openai_compatible
     model: "${TEXT_EMBEDDING_MODEL:-nomic-embed-text:latest}"
