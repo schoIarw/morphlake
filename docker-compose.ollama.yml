@@ -24,6 +24,9 @@ services:
     command: ["uvicorn", "morphlake.admin_main:app", "--host", "0.0.0.0", "--port", "8081", "--workers", "1"]
     ports:
       - "8081:8081"
+    depends_on:
+      morphlake-api:
+        condition: service_healthy
     volumes:
       - ./config/database.yaml:/app/config/database.yaml:ro
       - morphlake-admin-data:/app/data

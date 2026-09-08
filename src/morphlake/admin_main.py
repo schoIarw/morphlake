@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, Response
 
 from morphlake import __version__
 from morphlake.admin import router
+from morphlake.admin_api_client import AdminApiClient, get_admin_api_client
 from morphlake.admin_store import AdminStore
 from morphlake.auth import get_admin_store
 from morphlake.config import Settings, get_settings
@@ -26,6 +27,7 @@ def create_admin_app(
     settings: Settings | None = None,
     store: AdminStore | None = None,
     metrics: Metrics | None = None,
+    api_client: AdminApiClient | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     store = store or AdminStore(settings)
@@ -43,6 +45,8 @@ def create_admin_app(
     application.include_router(router)
     application.dependency_overrides[get_settings] = lambda: settings
     application.dependency_overrides[get_admin_store] = lambda: store
+    if api_client is not None:
+        application.dependency_overrides[get_admin_api_client] = lambda: api_client
     application.state.admin_store = store
     application.state.metrics = metrics
 
@@ -53,6 +57,14 @@ def create_admin_app(
         try:
             response = await call_next(request)
             status = response.status_code
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            if request.url.path.startswith("/admin"):
+                response.headers["Cache-Control"] = "no-store"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
+            )
             return response
         finally:
             route = request.scope.get("route")

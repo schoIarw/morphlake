@@ -31,6 +31,17 @@ class Settings(BaseSettings):
     admin_db_path: Path | None = Field(None, alias="MORPHLAKE_ADMIN_DB_PATH")
     admin_username: str = Field("admin", alias="MORPHLAKE_ADMIN_USERNAME")
     admin_password: str = Field("change-me", alias="MORPHLAKE_ADMIN_PASSWORD")
+    admin_session_secret: str = Field(
+        "change-me-admin-session-secret", alias="MORPHLAKE_ADMIN_SESSION_SECRET"
+    )
+    admin_session_ttl_seconds: int = Field(
+        28_800, alias="MORPHLAKE_ADMIN_SESSION_TTL_SECONDS", ge=300
+    )
+    admin_cookie_secure: bool = Field(False, alias="MORPHLAKE_ADMIN_COOKIE_SECURE")
+    api_base_url: str = Field("http://morphlake-api:8080", alias="MORPHLAKE_API_BASE_URL")
+    admin_api_timeout_seconds: float = Field(
+        30.0, alias="MORPHLAKE_ADMIN_API_TIMEOUT_SECONDS", gt=0
+    )
     token_pepper: str = Field("change-me-in-production", alias="MORPHLAKE_TOKEN_PEPPER")
     metrics_token: str | None = Field(None, alias="MORPHLAKE_METRICS_TOKEN")
     prometheus_url: str | None = Field(None, alias="PROMETHEUS_URL")

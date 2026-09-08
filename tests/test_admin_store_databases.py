@@ -59,6 +59,11 @@ def test_network_backend_creates_database_schema_and_seed_data(
     try:
         assert store.ping()
         assert store.system_config()["database_backend"] == backend
+        assert store.system_config()["schema_version"] == "3"
+        plaintext_session, session = store.create_admin_session("pytest-admin")
+        assert store.authenticate_admin_session(plaintext_session) == session
+        store.delete_admin_session(plaintext_session)
+        assert store.authenticate_admin_session(plaintext_session) is None
         created = store.create_token(
             business_domain="risk",
             department="audit",

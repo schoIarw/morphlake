@@ -36,6 +36,9 @@ def test_five_table_defaults_and_index_settings():
     settings = Settings()
     assert settings.admin_db_config == Path("config/database.yaml")
     assert settings.admin_db_path is None
+    assert settings.api_base_url == "http://morphlake-api:8080"
+    assert settings.admin_session_ttl_seconds == 28_800
+    assert settings.admin_cookie_secure is False
     assert settings.paimon_table == "multimodal_asset_descriptor"
     assert settings.paimon_text_table == "multimodal_text_segment"
     assert settings.paimon_image_table == "multimodal_image_feature"

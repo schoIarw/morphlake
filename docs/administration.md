@@ -7,7 +7,7 @@
 | 容器 | 默认端口 | 职责 |
 | --- | --- | --- |
 | `morphlake-api` | 8080 | 业务 API、Token 验证、上传下载限流、MinIO/Paimon/模型、业务指标 |
-| `morphlake-admin` | 8081 | 管理页面、Token 生命周期及配额配置、传输统计、Prometheus 查询 |
+| `morphlake-admin` | 8081 | 登录式管理页面、API 操作台、Token 生命周期及配额配置、传输统计、Prometheus 查询 |
 
 管理数据支持 SQLite、MySQL 和 PostgreSQL，三种后端共用同一个 `AdminStore` 接口和表模型。
 SQLite 启用 WAL、`busy_timeout` 和原子事务，适合单个 Docker 主机；MySQL/PostgreSQL 使用连接池、
@@ -78,7 +78,7 @@ python scripts/encrypt_db_credentials.py encrypt
 1. SQLite 创建数据库文件；MySQL/PostgreSQL 在 `auto_create_database: true` 时创建目标库；
 2. 使用数据库级启动锁防止 API 与管理容器同时初始化产生竞争；
 3. 创建 `api_tokens`、`rate_counters`、`transfer_events`、`transfer_daily_stats`、
-   `system_config` 五张表和索引；
+   `system_config`、`admin_sessions` 六张表和索引；
 4. 写入 schema 版本、首次初始化时间、数据库类型和默认上传下载配额。
 
 MySQL 自动建库账号需要 `CREATE` 权限；PostgreSQL 账号需要 `CREATEDB` 且能连接
@@ -89,14 +89,47 @@ MySQL 自动建库账号需要 `CREATE` 权限；PostgreSQL 账号需要 `CREATE
 
 ```bash
 cp .env.example .env
-# 必须修改管理密码、Token pepper、指标 Token 和 MinIO 配置
+# 必须修改管理密码、会话密钥、Token pepper、指标 Token 和 MinIO 配置
 docker compose up --build -d
 curl http://localhost:8080/health/live
 curl http://localhost:8081/health/live
 ```
 
-浏览器访问 `http://localhost:8081/admin`，使用 `MORPHLAKE_ADMIN_USERNAME` 和
-`MORPHLAKE_ADMIN_PASSWORD` 进行 HTTP Basic 登录。
+浏览器访问 `http://localhost:8081/admin`，会自动进入登录页。使用
+`MORPHLAKE_ADMIN_USERNAME` 和 `MORPHLAKE_ADMIN_PASSWORD` 登录后，页面采用窄头部、左侧菜单、
+右侧工作区布局，并兼容桌面与移动浏览器。
+
+登录成功后，服务端在管理数据库创建随机会话；浏览器 Cookie 仅保存随机值，带 `HttpOnly`、
+`SameSite=Lax` 属性，数据库仅保存带 `MORPHLAKE_ADMIN_SESSION_SECRET` 的 HMAC-SHA256 摘要。
+所有修改操作使用会话级 CSRF token。生产 HTTPS 环境设置：
+
+```bash
+MORPHLAKE_ADMIN_SESSION_SECRET=replace-with-a-separate-long-random-secret
+MORPHLAKE_ADMIN_SESSION_TTL_SECONDS=28800
+MORPHLAKE_ADMIN_COOKIE_SECURE=true
+```
+
+## API 操作台
+
+管理容器通过 `MORPHLAKE_API_BASE_URL`（Compose 默认 `http://morphlake-api:8080`）调用现有 API，
+不直接调用 MinIO、Paimon 或模型层，不重复业务实现。左侧菜单提供：
+
+| 页面 | 转发到已有 API |
+| --- | --- |
+| 文件上传 | `POST /api/v1/files` 及 documents/images/audio 类型端点 |
+| 文件清单 | `GET /api/v1/files` |
+| 全文检索 | `POST /api/v1/search/full-text` |
+| 向量检索 | `POST /api/v1/search/vector`、`POST /api/v1/search/vector/file` |
+| 文件下载 | `GET /api/v1/files/{file_id}/download`，流式转发 |
+| API 状态 | `GET /health/ready` |
+
+这些页面要求业务 API Token。为避免反复输入，前端仅在当前浏览器标签页的 `sessionStorage` 保存
+Token，退出管理系统时清除；服务端不写入日志、页面响应或管理数据库。配置项：
+
+```bash
+MORPHLAKE_API_BASE_URL=http://morphlake-api:8080
+MORPHLAKE_ADMIN_API_TIMEOUT_SECONDS=30
+```
 
 ## Token 管理
 

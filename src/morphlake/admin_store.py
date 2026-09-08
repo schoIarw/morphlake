@@ -74,6 +74,13 @@ class RateDecision:
     reset_at_epoch: int
 
 
+@dataclass(frozen=True)
+class AdminSession:
+    username: str
+    csrf_token: str
+    expires_at: str
+
+
 METADATA = MetaData()
 
 API_TOKENS = Table(
@@ -175,6 +182,18 @@ SYSTEM_CONFIG = Table(
     Column("updated_at", String(40), nullable=False),
 )
 
+ADMIN_SESSIONS = Table(
+    "admin_sessions",
+    METADATA,
+    Column("session_hash", String(64), primary_key=True),
+    Column("username", String(255), nullable=False),
+    Column("csrf_token", String(64), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("expires_at", String(40), nullable=False),
+    Column("last_seen_at", String(40), nullable=False),
+)
+Index("idx_admin_sessions_expiry", ADMIN_SESSIONS.c.expires_at)
+
 
 class AdminStore:
     """Transactional management store supporting SQLite, MySQL, and PostgreSQL."""
@@ -210,6 +229,67 @@ class AdminStore:
         with self._engine_required().connect() as connection:
             rows = connection.execute(select(SYSTEM_CONFIG)).mappings().all()
         return {row["config_key"]: row["config_value"] for row in rows}
+
+    def create_admin_session(self, username: str) -> tuple[str, AdminSession]:
+        plaintext = secrets.token_urlsafe(48)
+        now = datetime.now(UTC)
+        expires = now + timedelta(seconds=self.settings.admin_session_ttl_seconds)
+        session = AdminSession(username, secrets.token_hex(32), expires.isoformat())
+        with self._transaction() as connection:
+            connection.execute(
+                delete(ADMIN_SESSIONS).where(ADMIN_SESSIONS.c.expires_at <= now.isoformat())
+            )
+            connection.execute(
+                insert(ADMIN_SESSIONS).values(
+                    session_hash=self._session_hash(plaintext),
+                    username=username,
+                    csrf_token=session.csrf_token,
+                    created_at=now.isoformat(),
+                    expires_at=session.expires_at,
+                    last_seen_at=now.isoformat(),
+                )
+            )
+        return plaintext, session
+
+    def authenticate_admin_session(self, plaintext: str | None) -> AdminSession | None:
+        if not plaintext:
+            return None
+        now = datetime.now(UTC)
+        with self._transaction() as connection:
+            row = (
+                connection.execute(
+                    select(ADMIN_SESSIONS).where(
+                        ADMIN_SESSIONS.c.session_hash == self._session_hash(plaintext)
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                return None
+            if datetime.fromisoformat(row["expires_at"]) <= now:
+                connection.execute(
+                    delete(ADMIN_SESSIONS).where(
+                        ADMIN_SESSIONS.c.session_hash == row["session_hash"]
+                    )
+                )
+                return None
+            connection.execute(
+                update(ADMIN_SESSIONS)
+                .where(ADMIN_SESSIONS.c.session_hash == row["session_hash"])
+                .values(last_seen_at=now.isoformat())
+            )
+        return AdminSession(row["username"], row["csrf_token"], row["expires_at"])
+
+    def delete_admin_session(self, plaintext: str | None) -> None:
+        if not plaintext:
+            return
+        with self._transaction() as connection:
+            connection.execute(
+                delete(ADMIN_SESSIONS).where(
+                    ADMIN_SESSIONS.c.session_hash == self._session_hash(plaintext)
+                )
+            )
 
     def create_token(
         self,
@@ -712,7 +792,7 @@ class AdminStore:
         self._ensure_transfer_columns(connection)
         now = datetime.now(UTC).isoformat()
         values = {
-            "schema_version": ("2", "MorphLake management schema version"),
+            "schema_version": ("3", "MorphLake management schema version"),
             "initialized_at": (now, "First successful schema initialization time"),
             "database_backend": (self.backend, "Active management database backend"),
             "default_rate_period_seconds": (
@@ -749,6 +829,11 @@ class AdminStore:
                     ["config_key"],
                 )
             )
+        connection.execute(
+            update(SYSTEM_CONFIG)
+            .where(SYSTEM_CONFIG.c.config_key == "schema_version")
+            .values(config_value="3", updated_at=now)
+        )
 
     def _ensure_transfer_columns(self, connection: Connection) -> None:
         columns = {column["name"] for column in inspect(connection).get_columns("transfer_events")}
@@ -857,6 +942,13 @@ class AdminStore:
     def _token_hash(self, plaintext: str) -> str:
         return hmac.new(
             self.settings.token_pepper.encode("utf-8"),
+            plaintext.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _session_hash(self, plaintext: str) -> str:
+        return hmac.new(
+            self.settings.admin_session_secret.encode("utf-8"),
             plaintext.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()

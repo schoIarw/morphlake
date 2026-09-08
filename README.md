@@ -165,7 +165,10 @@ curl http://localhost:8081/health/live
 ```
 
 访问 `http://localhost:8081/admin`，使用 `.env` 中的管理账号登录，创建绑定业务域和部门的
-Token。完整 Token 只显示一次：
+Token。登录后是窄头部、左侧菜单、右侧工作区的响应式管理台；文件上传、文件清单、全文检索、
+向量检索、文件下载和 API 状态均可直接在页面操作。管理容器通过
+`MORPHLAKE_API_BASE_URL=http://morphlake-api:8080` 转发到现有 API，不重复实现存储与检索逻辑。
+完整 Token 只显示一次：
 
 ```bash
 export MORPHLAKE_TOKEN='mlk_...'
@@ -175,7 +178,7 @@ curl http://localhost:8080/health/ready \
 
 容器启动时会：
 
-1. 根据配置创建管理数据库及五张管理表，并写入 schema 版本和默认配额配置；
+1. 根据配置创建管理数据库及六张管理表（含管理员会话表），并写入 schema 版本和默认配额配置；
 2. 检查并创建两个 MinIO bucket（需要账号具有相应权限）；
 3. 自动创建资产描述符、文本切片、图片特征、音频特征和传输审计五张 Paimon 表；
 4. 校验已存在 Paimon 表的字段、分区、`bucket=-1` 和 deletion-vector；
