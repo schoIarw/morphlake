@@ -63,7 +63,7 @@ def create_admin_app(
                 response.headers["Cache-Control"] = "no-store"
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; style-src 'unsafe-inline'; "
-                "script-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
+                "script-src 'unsafe-inline'; img-src 'self' data: blob:; frame-ancestors 'none'"
             )
             return response
         finally:
