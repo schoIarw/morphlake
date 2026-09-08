@@ -2,7 +2,7 @@
 
 MorphLake 是一个以 **Apache Paimon 2.0 + MinIO** 为核心的多模态数据底座。它用一个
 Python/FastAPI API 容器提供上传、清单查询、全文检索、向量检索和下载接口，独立管理容器
-提供 Token、配额、统计和监控页面；不引入 Spark、
+提供 Key、配额、统计和监控页面；不引入 Spark、
 Milvus、Elasticsearch，也不依赖常驻 Flink 作业。
 
 > 当前状态：可运行的首个版本。生产部署前需要接入实际 MinIO 地址和模型网关，并根据
@@ -33,16 +33,16 @@ flowchart TB
 | 能力 | 支持内容 |
 | --- | --- |
 | 上传 | 文档、图片、音频独立接口；另保留自动分类兼容接口 |
-| 必填元数据 | `business_domain`（业务域）、`department`（业务部门） |
+| 归属元数据 | 上传时由 API Key 自动关联 `business_domain` 和 `department` |
 | 文档处理 | 文本提取、可配置重叠切片、逐切片向量化 |
 | 图片处理 | 文件级图片向量 |
 | 音频处理 | 文件级音频向量；可选语音转写和转写文本向量 |
-| 清单查询 | 类型、日期、业务域、部门、文件名关键字 |
-| 全文检索 | 业务域、日期范围、全文关键字 |
+| 清单查询 | 类型、日期、文件名关键字；业务范围由 Key 自动限定 |
+| 全文检索 | 日期范围、全文关键字；业务范围由 Key 自动限定 |
 | 向量检索 | 上传文档/图片/音频自动向量化并返回 Paimon Top10；也支持直接提交向量 |
 | 下载 | 按 `file_id` 流式下载 MinIO 对象 |
-| 访问控制 | Token 绑定业务域/部门；支持启用、停用、删除和过期状态 |
-| 流量治理 | 按 Token 配置上传/下载周期次数及字节配额 |
+| 访问控制 | 业务域 Key 仅查询本域，默认管理 Key 可查询全域；支持查看、复制和轮换 |
+| 流量治理 | 按 Key 配置上传/下载周期次数及字节配额 |
 | 运维 | 独立 Web 管理容器、Prometheus 指标、Grafana 面板、天/周/月统计 |
 
 旧式二进制 `.doc` 会返回 415；请先转换为 `.docx`。扫描版 PDF 的 OCR 不在默认链路中，
@@ -93,6 +93,18 @@ python scripts/encrypt_db_credentials.py encrypt
 
 把命令输出的 `auth` 段复制到 `config/database.yaml`，再把
 `MORPHLAKE_DB_CREDENTIAL_KEY` 写入受保护的部署 Secret 或本机 `.env`。不要把密钥提交到 Git。
+
+首次启动前还必须分别设置管理登录、会话、Key 摘要与 Key 可逆加密密钥；四项不要复用：
+
+```bash
+MORPHLAKE_ADMIN_PASSWORD=replace-with-a-strong-password
+MORPHLAKE_ADMIN_SESSION_SECRET=replace-with-a-long-random-session-secret
+MORPHLAKE_TOKEN_PEPPER=replace-with-a-long-random-token-pepper
+MORPHLAKE_TOKEN_ENCRYPTION_SECRET=replace-with-a-separate-key-encryption-secret
+```
+
+管理数据库首次初始化会自动创建一个业务域/部门均为“管理员”的管理 Key。登录管理台后可在
+“Key 管理”页面查看和复制；该 Key 拥有全域查询与下载权限，应按管理员凭据保护。
 
 开发配置默认使用确定性的 `hash` 向量，仅用于接口和索引冒烟验证，不具备语义效果。
 生产环境应修改 `config/models.yaml`，把对应 `provider` 改为
@@ -165,10 +177,10 @@ curl http://localhost:8081/health/live
 ```
 
 访问 `http://localhost:8081/admin`，使用 `.env` 中的管理账号登录，创建绑定业务域和部门的
-Token。登录后是窄头部、左侧菜单、右侧工作区的响应式管理台；文件上传、文件清单、全文检索、
+Key。首次启动会自动创建业务域/部门均为“管理员”的全域管理 Key。登录后是窄头部、左侧菜单、右侧工作区的响应式管理台；文件上传、文件清单、全文检索、
 向量检索、文件下载和 API 状态均可直接在页面操作。管理容器通过
 `MORPHLAKE_API_BASE_URL=http://morphlake-api:8080` 转发到现有 API，不重复实现存储与检索逻辑。
-完整 Token 只显示一次：
+Key 可在管理页面查看、复制或重新生成：
 
 ```bash
 export MORPHLAKE_TOKEN='mlk_...'
@@ -189,8 +201,6 @@ curl http://localhost:8080/health/ready \
 ```bash
 curl -X POST http://localhost:8080/api/v1/files/documents \
   -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
-  -F 'business_domain=risk' \
-  -F 'department=compliance' \
   -F 'file=@./contract.pdf'
 ```
 
@@ -199,7 +209,6 @@ curl -X POST http://localhost:8080/api/v1/files/documents \
 ```bash
 curl -X POST http://localhost:8080/api/v1/search/vector/file \
   -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
-  -F 'business_domain=risk' \
   -F 'start_date=2026-01-01' \
   -F 'end_date=2026-12-31' \
   -F 'file=@./query.pdf'
@@ -209,8 +218,6 @@ curl -X POST http://localhost:8080/api/v1/search/vector/file \
 curl -G http://localhost:8080/api/v1/files \
   -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   --data-urlencode 'media_type=document' \
-  --data-urlencode 'business_domain=risk' \
-  --data-urlencode 'department=compliance' \
   --data-urlencode 'filename=contract' \
   --data-urlencode 'start_date=2026-01-01' \
   --data-urlencode 'end_date=2026-12-31'
@@ -221,7 +228,6 @@ curl -X POST http://localhost:8080/api/v1/search/full-text \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   -d '{
-    "business_domain": "risk",
     "keyword": "counterparty exposure",
     "start_date": "2026-01-01",
     "end_date": "2026-12-31",
@@ -235,7 +241,6 @@ curl -X POST http://localhost:8080/api/v1/search/full-text \
 python - <<'PY' > /tmp/vector-request.json
 import json
 print(json.dumps({
-    "business_domain": "risk",
     "vector_field": "text",
     "vector": [0.0] * 384,
     "start_date": "2026-01-01",

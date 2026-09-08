@@ -319,7 +319,7 @@ class PaimonStore:
     def full_text_search(
         self,
         *,
-        business_domain: str,
+        business_domain: str | None,
         department: str | None,
         keyword: str,
         start_date: date | None,
@@ -342,8 +342,9 @@ class PaimonStore:
                     json.dumps({"match": {"query": keyword}}, separators=(",", ":")),
                 )
                 .with_limit(fetch_limit)
-                .with_partition_filter(partition_predicate)
             )
+            if partition_predicate is not None:
+                search = search.with_partition_filter(partition_predicate)
             result = search.execute_local()
             rows = self._read(
                 TEXT_TABLE,
@@ -359,7 +360,7 @@ class PaimonStore:
     def vector_search(
         self,
         *,
-        business_domain: str,
+        business_domain: str | None,
         department: str | None,
         vector: list[float],
         vector_field: str,
@@ -384,16 +385,23 @@ class PaimonStore:
         )
         fetch_limit = max(limit * 5, 50)
         try:
-            result = (
+            search = (
                 self._raw_table(table_key)
                 .new_vector_search_builder()
                 .with_vector_column(column)
                 .with_query_vector(vector)
                 .with_limit(fetch_limit)
-                .with_filter(exact_predicate)
-                .with_partition_filter(partition_predicate)
-                .execute_local()
             )
+            if business_domain and exact_predicate is not None:
+                search = search.with_filter(exact_predicate)
+            # Paimon's local vector index currently returns no candidates for a
+            # partition filter that constrains ingest_date but leaves the leading
+            # domain_shard partition unconstrained. Domain keys can prune both;
+            # admin keys search the global index and apply exact date predicates
+            # when reading the matched rows.
+            if business_domain and partition_predicate is not None:
+                search = search.with_partition_filter(partition_predicate)
+            result = search.execute_local()
             rows = self._read(
                 table_key,
                 exact_predicate,
@@ -511,13 +519,15 @@ class PaimonStore:
     def _search_predicate(
         self,
         table_key: str,
-        business_domain: str,
+        business_domain: str | None,
         department: str | None,
         start_date: date | None,
         end_date: date | None,
     ):
         builder = self._builder(table_key)
-        predicates = self._domain_predicates(builder, business_domain)
+        predicates = []
+        if business_domain:
+            predicates.extend(self._domain_predicates(builder, business_domain))
         if department:
             predicates.append(builder.equal("department", department))
         predicates.extend(self._date_predicates(builder, start_date, end_date))
@@ -526,18 +536,20 @@ class PaimonStore:
     def _partition_predicate(
         self,
         table_key: str,
-        business_domain: str,
+        business_domain: str | None,
         start_date: date | None,
         end_date: date | None,
     ):
         raw = self._raw_table(table_key)
         builder = PredicateBuilder(raw.partition_keys_fields)
-        predicates = [
-            builder.equal(
-                "domain_shard",
-                domain_shard(business_domain, self.settings.paimon_domain_shards),
+        predicates = []
+        if business_domain:
+            predicates.append(
+                builder.equal(
+                    "domain_shard",
+                    domain_shard(business_domain, self.settings.paimon_domain_shards),
+                )
             )
-        ]
         if start_date:
             predicates.append(builder.greater_or_equal("ingest_date", start_date.isoformat()))
         if end_date:

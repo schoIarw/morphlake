@@ -29,17 +29,20 @@ def require_token(
     return store.authenticate(token)
 
 
-def enforce_scope(
-    identity: TokenIdentity,
-    business_domain: str | None,
-    department: str | None,
-) -> tuple[str, str]:
-    if business_domain and business_domain != identity.business_domain:
-        raise MorphLakeError(
-            "token_scope_mismatch", "Token cannot access the requested business domain", 403
-        )
-    if department and department != identity.department:
-        raise MorphLakeError(
-            "token_scope_mismatch", "Token cannot access the requested department", 403
-        )
+def write_scope(identity: TokenIdentity) -> tuple[str, str]:
+    """Uploads always inherit the key's configured domain and department."""
     return identity.business_domain, identity.department
+
+
+def read_scope(identity: TokenIdentity) -> tuple[str | None, str | None]:
+    """Administration keys read all data; domain keys read their entire domain."""
+    if identity.access_level == "admin":
+        return None, None
+    return identity.business_domain, None
+
+
+def enforce_asset_access(identity: TokenIdentity, business_domain: str) -> None:
+    if identity.access_level != "admin" and business_domain != identity.business_domain:
+        raise MorphLakeError(
+            "token_scope_mismatch", "Key cannot access data outside its business domain", 403
+        )

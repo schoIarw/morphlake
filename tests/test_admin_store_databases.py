@@ -59,7 +59,12 @@ def test_network_backend_creates_database_schema_and_seed_data(
     try:
         assert store.ping()
         assert store.system_config()["database_backend"] == backend
-        assert store.system_config()["schema_version"] == "3"
+        assert store.system_config()["schema_version"] == "4"
+        admin_key = next(
+            row for row in store.list_tokens(reveal=True) if row["access_level"] == "admin"
+        )
+        assert admin_key["plaintext"].startswith("mlk_")
+        assert store.authenticate(admin_key["plaintext"]).access_level == "admin"
         plaintext_session, session = store.create_admin_session("pytest-admin")
         assert store.authenticate_admin_session(plaintext_session) == session
         store.delete_admin_session(plaintext_session)

@@ -53,8 +53,6 @@ class SearchResult(BaseModel):
 
 
 class FullTextSearchRequest(BaseModel):
-    business_domain: str = Field(min_length=1, max_length=128)
-    department: str | None = Field(None, min_length=1, max_length=128)
     keyword: str = Field(min_length=1, max_length=1000)
     start_date: date | None = None
     end_date: date | None = None
@@ -68,8 +66,6 @@ class FullTextSearchRequest(BaseModel):
 
 
 class VectorSearchRequest(BaseModel):
-    business_domain: str = Field(min_length=1, max_length=128)
-    department: str | None = Field(None, min_length=1, max_length=128)
     vector: list[float] = Field(min_length=1)
     vector_field: Literal["text", "image", "audio"] = "text"
     start_date: date | None = None

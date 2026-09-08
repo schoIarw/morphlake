@@ -112,11 +112,29 @@ class MorphLakeService:
         asset = self.catalog.get_asset(file_id)
         return asset, self.objects.stream(asset["object_key"])
 
-    def full_text_search(self, request: FullTextSearchRequest):
-        return self.catalog.full_text_search(**request.model_dump())
+    def full_text_search(
+        self,
+        request: FullTextSearchRequest,
+        business_domain: str | None,
+        department: str | None,
+    ):
+        return self.catalog.full_text_search(
+            **request.model_dump(),
+            business_domain=business_domain,
+            department=department,
+        )
 
-    def vector_search(self, request: VectorSearchRequest):
-        return self.catalog.vector_search(**request.model_dump())
+    def vector_search(
+        self,
+        request: VectorSearchRequest,
+        business_domain: str | None,
+        department: str | None,
+    ):
+        return self.catalog.vector_search(
+            **request.model_dump(),
+            business_domain=business_domain,
+            department=department,
+        )
 
     def vector_search_file(
         self,
@@ -124,19 +142,17 @@ class MorphLakeService:
         filename: str,
         content_type: str | None,
         body: bytes,
-        business_domain: str,
+        business_domain: str | None,
         department: str | None = None,
         start_date=None,
         end_date=None,
     ):
         """Vectorize an uploaded query file by modality and return Paimon Top 10."""
         filename = Path(filename).name.strip()
-        business_domain = business_domain.strip()
+        business_domain = business_domain.strip() if business_domain else None
         department = department.strip() if department else None
-        if not filename or not business_domain:
-            raise MorphLakeError(
-                "invalid_vector_query", "filename and business_domain are required"
-            )
+        if not filename:
+            raise MorphLakeError("invalid_vector_query", "filename is required")
         if not body:
             raise MorphLakeError("empty_file", "Uploaded query file is empty")
         if len(body) > self.settings.max_upload_bytes:

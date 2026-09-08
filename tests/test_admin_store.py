@@ -39,22 +39,46 @@ def create_token(store: AdminStore):
 def test_token_is_hashed_and_lifecycle_is_enforced(tmp_path: Path):
     store = make_store(tmp_path)
     seeded = store.system_config()
-    assert seeded["schema_version"] == "3"
+    assert seeded["schema_version"] == "4"
     assert seeded["database_backend"] == "sqlite"
     assert seeded["default_rate_period_seconds"] == "60"
+    assert seeded["default_admin_token_id"]
     assert store.ping()
+    admin_row = next(
+        row for row in store.list_tokens(reveal=True) if row["access_level"] == "admin"
+    )
+    assert admin_row["business_domain"] == "管理员"
+    assert admin_row["department"] == "管理员"
+    assert admin_row["plaintext"].startswith("mlk_")
+    assert store.authenticate(admin_row["plaintext"]).access_level == "admin"
+    with pytest.raises(MorphLakeError) as protected:
+        store.set_token_status(admin_row["token_id"], "deleted")
+    assert protected.value.code == "admin_key_protected"
     created = create_token(store)
     row = store.list_tokens()[0]
     assert created.plaintext not in str(row)
     assert store.authenticate(created.plaintext).department == "audit"
+    revealed = next(
+        item
+        for item in store.list_tokens(reveal=True)
+        if item["token_id"] == created.identity.token_id
+    )
+    assert revealed["plaintext"] == created.plaintext
+
+    rotated = store.rotate_token(created.identity.token_id)
+    assert rotated.plaintext != created.plaintext
+    with pytest.raises(MorphLakeError) as invalid_old:
+        store.authenticate(created.plaintext)
+    assert invalid_old.value.code == "token_invalid"
+    assert store.authenticate(rotated.plaintext).business_domain == "risk"
 
     store.set_token_status(created.identity.token_id, "disabled")
     with pytest.raises(MorphLakeError, match="disabled"):
-        store.authenticate(created.plaintext)
+        store.authenticate(rotated.plaintext)
     store.set_token_status(created.identity.token_id, "active")
     store.set_token_status(created.identity.token_id, "deleted")
     with pytest.raises(MorphLakeError) as deleted:
-        store.authenticate(created.plaintext)
+        store.authenticate(rotated.plaintext)
     assert deleted.value.code == "token_deleted"
     with pytest.raises(MorphLakeError, match="cannot be changed"):
         store.set_token_status(created.identity.token_id, "active")

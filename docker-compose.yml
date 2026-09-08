@@ -1,7 +1,7 @@
 services:
   morphlake-api:
     build: .
-    image: morphlake:0.4.0
+    image: morphlake:0.5.0
     env_file: .env
     ports:
       - "8080:8080"
@@ -19,7 +19,7 @@ services:
 
   morphlake-admin:
     build: .
-    image: morphlake:0.4.0
+    image: morphlake:0.5.0
     env_file: .env
     command: ["uvicorn", "morphlake.admin_main:app", "--host", "0.0.0.0", "--port", "8081", "--workers", "1"]
     ports:

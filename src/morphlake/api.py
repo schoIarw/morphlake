@@ -13,7 +13,13 @@ from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, Up
 from fastapi.responses import StreamingResponse
 
 from morphlake.admin_store import AdminStore, TokenIdentity
-from morphlake.auth import enforce_scope, get_admin_store, require_token
+from morphlake.auth import (
+    enforce_asset_access,
+    get_admin_store,
+    read_scope,
+    require_token,
+    write_scope,
+)
 from morphlake.errors import MorphLakeError
 from morphlake.metrics import Metrics, get_metrics
 from morphlake.models import (
@@ -57,8 +63,6 @@ def ready(
 async def upload_file(
     request: Request,
     file: Annotated[UploadFile, File()],
-    business_domain: Annotated[str, Form(min_length=1, max_length=128)],
-    department: Annotated[str, Form(min_length=1, max_length=128)],
     service: Annotated[MorphLakeService, Depends(get_service)],
     identity: Annotated[TokenIdentity, Depends(require_token)],
     store: Annotated[AdminStore, Depends(get_admin_store)],
@@ -68,8 +72,6 @@ async def upload_file(
         expected_media_type=None,
         request=request,
         file=file,
-        business_domain=business_domain,
-        department=department,
         service=service,
         identity=identity,
         store=store,
@@ -82,14 +84,12 @@ async def _upload_typed_file(
     expected_media_type: str | None,
     request: Request,
     file: UploadFile,
-    business_domain: str,
-    department: str,
     service: MorphLakeService,
     identity: TokenIdentity,
     store: AdminStore,
     metrics: Metrics,
 ) -> Asset:
-    business_domain, department = enforce_scope(identity, business_domain, department)
+    business_domain, department = write_scope(identity)
     body = await file.read()
     filename = file.filename or ""
     started = time.monotonic()
@@ -148,8 +148,6 @@ async def _upload_typed_file(
 async def upload_document(
     request: Request,
     file: Annotated[UploadFile, File()],
-    business_domain: Annotated[str, Form(min_length=1, max_length=128)],
-    department: Annotated[str, Form(min_length=1, max_length=128)],
     service: Annotated[MorphLakeService, Depends(get_service)],
     identity: Annotated[TokenIdentity, Depends(require_token)],
     store: Annotated[AdminStore, Depends(get_admin_store)],
@@ -159,8 +157,6 @@ async def upload_document(
         expected_media_type="document",
         request=request,
         file=file,
-        business_domain=business_domain,
-        department=department,
         service=service,
         identity=identity,
         store=store,
@@ -172,8 +168,6 @@ async def upload_document(
 async def upload_image(
     request: Request,
     file: Annotated[UploadFile, File()],
-    business_domain: Annotated[str, Form(min_length=1, max_length=128)],
-    department: Annotated[str, Form(min_length=1, max_length=128)],
     service: Annotated[MorphLakeService, Depends(get_service)],
     identity: Annotated[TokenIdentity, Depends(require_token)],
     store: Annotated[AdminStore, Depends(get_admin_store)],
@@ -183,8 +177,6 @@ async def upload_image(
         expected_media_type="image",
         request=request,
         file=file,
-        business_domain=business_domain,
-        department=department,
         service=service,
         identity=identity,
         store=store,
@@ -196,8 +188,6 @@ async def upload_image(
 async def upload_audio(
     request: Request,
     file: Annotated[UploadFile, File()],
-    business_domain: Annotated[str, Form(min_length=1, max_length=128)],
-    department: Annotated[str, Form(min_length=1, max_length=128)],
     service: Annotated[MorphLakeService, Depends(get_service)],
     identity: Annotated[TokenIdentity, Depends(require_token)],
     store: Annotated[AdminStore, Depends(get_admin_store)],
@@ -207,8 +197,6 @@ async def upload_audio(
         expected_media_type="audio",
         request=request,
         file=file,
-        business_domain=business_domain,
-        department=department,
         service=service,
         identity=identity,
         store=store,
@@ -221,8 +209,6 @@ def list_files(
     service: Annotated[MorphLakeService, Depends(get_service)],
     identity: Annotated[TokenIdentity, Depends(require_token)],
     media_type: Annotated[str | None, Query(pattern="^(document|image|audio)$")] = None,
-    business_domain: Annotated[str | None, Query(max_length=128)] = None,
-    department: Annotated[str | None, Query(max_length=128)] = None,
     filename: Annotated[str | None, Query(max_length=255)] = None,
     start_date: date | None = None,
     end_date: date | None = None,
@@ -231,7 +217,7 @@ def list_files(
 ) -> AssetList:
     if start_date and end_date and start_date > end_date:
         raise MorphLakeError("invalid_date_range", "start_date must not be after end_date")
-    business_domain, department = enforce_scope(identity, business_domain, department)
+    business_domain, department = read_scope(identity)
     rows = service.list_assets(
         media_type=media_type,
         business_domain=business_domain,
@@ -257,7 +243,7 @@ def download_file(
 ):
     started = time.monotonic()
     asset, stream = service.download(file_id)
-    enforce_scope(identity, asset["business_domain"], asset["department"])
+    enforce_asset_access(identity, asset["business_domain"])
     _consume_rate(
         store=store,
         metrics=metrics,
@@ -313,9 +299,8 @@ def full_text_search(
     service: Annotated[MorphLakeService, Depends(get_service)],
     identity: Annotated[TokenIdentity, Depends(require_token)],
 ) -> SearchResult:
-    domain, department = enforce_scope(identity, request.business_domain, request.department)
-    request = request.model_copy(update={"business_domain": domain, "department": department})
-    rows = service.full_text_search(request)
+    domain, department = read_scope(identity)
+    rows = service.full_text_search(request, domain, department)
     items = [SearchHit(rank=index + 1, **row) for index, row in enumerate(rows)]
     return SearchResult(items=items, returned=len(items))
 
@@ -326,9 +311,8 @@ def vector_search(
     service: Annotated[MorphLakeService, Depends(get_service)],
     identity: Annotated[TokenIdentity, Depends(require_token)],
 ) -> SearchResult:
-    domain, department = enforce_scope(identity, request.business_domain, request.department)
-    request = request.model_copy(update={"business_domain": domain, "department": department})
-    rows = service.vector_search(request)
+    domain, department = read_scope(identity)
+    rows = service.vector_search(request, domain, department)
     items = [SearchHit(rank=index + 1, **row) for index, row in enumerate(rows)]
     return SearchResult(items=items, returned=len(items))
 
@@ -336,14 +320,12 @@ def vector_search(
 @router.post("/api/v1/search/vector/file", response_model=SearchResult, tags=["search"])
 async def vector_search_file(
     file: Annotated[UploadFile, File()],
-    business_domain: Annotated[str, Form(min_length=1, max_length=128)],
     service: Annotated[MorphLakeService, Depends(get_service)],
     identity: Annotated[TokenIdentity, Depends(require_token)],
-    department: Annotated[str | None, Form(min_length=1, max_length=128)] = None,
     start_date: Annotated[date | None, Form()] = None,
     end_date: Annotated[date | None, Form()] = None,
 ) -> SearchResult:
-    business_domain, department = enforce_scope(identity, business_domain, department)
+    business_domain, department = read_scope(identity)
     body = await file.read()
     rows = await asyncio.to_thread(
         service.vector_search_file,

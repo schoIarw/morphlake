@@ -100,6 +100,9 @@ def test_admin_login_session_layout_and_token_lifecycle(tmp_path: Path):
     assert '<main class="content">' in dashboard.text
     assert "文件上传" in dashboard.text
     assert "向量检索" in dashboard.text
+    keys_page = client.get("/admin/tokens")
+    assert "全域管理" in keys_page.text
+    assert "key-copy" in keys_page.text
 
     created = client.post(
         "/admin/tokens",
@@ -123,6 +126,12 @@ def test_admin_login_session_layout_and_token_lifecycle(tmp_path: Path):
     row = store.list_tokens()[0]
     assert row["assignee_name"] == "Alice"
     token_id = row["token_id"]
+    plaintext = next(
+        item["plaintext"] for item in store.list_tokens(reveal=True) if item["token_id"] == token_id
+    )
+    visible = client.get("/admin/tokens")
+    assert plaintext in visible.text
+    assert "复制" in visible.text
     limits = client.post(
         f"/admin/tokens/{token_id}/limits",
         data={
@@ -146,6 +155,16 @@ def test_admin_login_session_layout_and_token_lifecycle(tmp_path: Path):
         == 303
     )
     assert store.list_tokens()[0]["status"] == "disabled"
+    rotated = client.post(
+        f"/admin/tokens/{token_id}/rotate",
+        data={"csrf": csrf},
+        follow_redirects=False,
+    )
+    assert rotated.status_code == 303
+    new_plaintext = next(
+        item["plaintext"] for item in store.list_tokens(reveal=True) if item["token_id"] == token_id
+    )
+    assert new_plaintext != plaintext
 
     logout = client.post("/admin/logout", data={"csrf": csrf}, follow_redirects=False)
     assert logout.status_code == 303
@@ -167,7 +186,9 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
     ):
         response = client.get(path)
         assert response.status_code == 200
-        assert "API Token" in response.text
+        assert "API Key" in response.text
+        assert 'name="business_domain"' not in response.text
+        assert 'name="department"' not in response.text
 
     upload = client.post(
         "/admin/api/upload",
@@ -175,8 +196,6 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
             "csrf": csrf,
             "api_token": token,
             "mode": "document",
-            "business_domain": "risk",
-            "department": "audit",
         },
         files={"file": ("report.pdf", b"pdf", "application/pdf")},
     )
@@ -190,8 +209,6 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
             "csrf": csrf,
             "api_token": token,
             "media_type": "document",
-            "business_domain": "risk",
-            "department": "audit",
             "filename": "report",
             "start_date": "2026-01-01",
             "end_date": "2026-12-31",
@@ -208,8 +225,6 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
         data={
             "csrf": csrf,
             "api_token": token,
-            "business_domain": "risk",
-            "department": "audit",
             "keyword": "contract",
             "start_date": "",
             "end_date": "",
@@ -224,8 +239,6 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
         data={
             "csrf": csrf,
             "api_token": token,
-            "business_domain": "risk",
-            "department": "",
             "vector": "0.1, 0.2 0.3",
             "vector_field": "text",
             "start_date": "",
@@ -241,8 +254,6 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
         data={
             "csrf": csrf,
             "api_token": token,
-            "business_domain": "risk",
-            "department": "audit",
             "start_date": "",
             "end_date": "",
         },

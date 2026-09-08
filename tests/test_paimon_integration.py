@@ -142,6 +142,36 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
     assert len(listed) == 1
     assert len(full_text) == 2
     assert len(vector) == 2
+    global_list = store.list_assets(
+        media_type="document",
+        business_domain=None,
+        department=None,
+        filename=None,
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 9, 1),
+        limit=10,
+        offset=0,
+    )
+    global_full_text = store.full_text_search(
+        business_domain=None,
+        department=None,
+        keyword="liquidity",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 9, 1),
+        limit=10,
+    )
+    global_vector = store.vector_search(
+        business_domain=None,
+        department=None,
+        vector=[1.0, 0.0, 0.0, 0.0],
+        vector_field="text",
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 9, 1),
+        limit=10,
+    )
+    assert len(global_list) == 3
+    assert len(global_full_text) == 3
+    assert len(global_vector) == 3
     page = store.list_assets(
         media_type="document",
         business_domain="risk",

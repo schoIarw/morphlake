@@ -43,6 +43,9 @@ class Settings(BaseSettings):
         30.0, alias="MORPHLAKE_ADMIN_API_TIMEOUT_SECONDS", gt=0
     )
     token_pepper: str = Field("change-me-in-production", alias="MORPHLAKE_TOKEN_PEPPER")
+    token_encryption_secret: str = Field(
+        "change-me-token-encryption-secret", alias="MORPHLAKE_TOKEN_ENCRYPTION_SECRET"
+    )
     metrics_token: str | None = Field(None, alias="MORPHLAKE_METRICS_TOKEN")
     prometheus_url: str | None = Field(None, alias="PROMETHEUS_URL")
     health_check_interval_seconds: int = Field(

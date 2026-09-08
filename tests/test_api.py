@@ -12,6 +12,11 @@ from morphlake.services.extractors import classify
 
 
 class FakeService:
+    def __init__(self):
+        self.list_filters = None
+        self.full_text_scope = None
+        self.vector_scope = None
+
     def initialize(self):
         return None
 
@@ -34,7 +39,8 @@ class FakeService:
             "chunk_count": 1,
         }
 
-    def list_assets(self, **_):
+    def list_assets(self, **filters):
+        self.list_filters = filters
         return []
 
     def download(self, file_id):
@@ -52,10 +58,12 @@ class FakeService:
             iter([b"hello"]),
         )
 
-    def full_text_search(self, _):
+    def full_text_search(self, request, business_domain, department):
+        self.full_text_scope = (request, business_domain, department)
         return []
 
-    def vector_search(self, _):
+    def vector_search(self, request, business_domain, department):
+        self.vector_scope = (request, business_domain, department)
         return []
 
     def vector_search_file(self, **_):
@@ -102,10 +110,12 @@ def build_client(
         upload_bytes_limit=10_000,
         download_bytes_limit=10_000,
     )
+    service = FakeService()
     test_client = TestClient(
-        create_app(settings, FakeService(), admin_store=store, initialize=False),
+        create_app(settings, service, admin_store=store, initialize=False),
         headers={"Authorization": f"Bearer {created.plaintext}"},
     )
+    test_client.app.state.fake_service = service
     return test_client, store, created
 
 
@@ -122,19 +132,70 @@ def test_upload_contract_scope_and_audit(tmp_path: Path):
     test_client, store, _ = build_client(tmp_path)
     response = test_client.post(
         "/api/v1/files",
-        data={"business_domain": "risk", "department": "audit"},
         files={"file": ("a.txt", b"hello", "text/plain")},
     )
     assert response.status_code == 201
     assert response.json()["file_id"] == "file-1"
+    assert response.json()["business_domain"] == "risk"
+    assert response.json()["department"] == "audit"
     event = store.recent_transfers()[0]
     assert event["operation"] == "upload"
     assert event["byte_count"] == 5
     assert event["status"] == "success"
 
-    forbidden = test_client.get("/api/v1/files?business_domain=finance")
-    assert forbidden.status_code == 403
-    assert forbidden.json()["error"]["code"] == "token_scope_mismatch"
+    assert test_client.get("/api/v1/files").status_code == 200
+    filters = test_client.app.state.fake_service.list_filters
+    assert filters["business_domain"] == "risk"
+    assert filters["department"] is None
+
+
+def test_domain_and_admin_keys_receive_different_read_scopes(tmp_path: Path):
+    test_client, store, _ = build_client(tmp_path)
+    service = test_client.app.state.fake_service
+
+    domain_search = test_client.post(
+        "/api/v1/search/full-text", json={"keyword": "contract", "limit": 10}
+    )
+    assert domain_search.status_code == 200
+    assert service.full_text_scope[1:] == ("risk", None)
+
+    admin_key = next(
+        row["plaintext"] for row in store.list_tokens(reveal=True) if row["access_level"] == "admin"
+    )
+    admin_headers = {"Authorization": f"Bearer {admin_key}"}
+    assert test_client.get("/api/v1/files", headers=admin_headers).status_code == 200
+    assert service.list_filters["business_domain"] is None
+    assert service.list_filters["department"] is None
+    admin_search = test_client.post(
+        "/api/v1/search/vector",
+        headers=admin_headers,
+        json={"vector": [0.1], "vector_field": "text"},
+    )
+    assert admin_search.status_code == 200
+    assert service.vector_scope[1:] == (None, None)
+
+
+def test_domain_key_cannot_download_another_domain(tmp_path: Path):
+    test_client, store, _ = build_client(tmp_path)
+    finance = store.create_token(
+        business_domain="finance",
+        department="accounting",
+        assignee_name="Bob",
+        phone="13900000000",
+        notes="test",
+        allocated_by="pytest",
+        period_seconds=60,
+        upload_requests_limit=10,
+        download_requests_limit=10,
+        upload_bytes_limit=10_000,
+        download_bytes_limit=10_000,
+    )
+    denied = test_client.get(
+        "/api/v1/files/file-1/download",
+        headers={"Authorization": f"Bearer {finance.plaintext}"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "token_scope_mismatch"
 
 
 def test_modality_upload_contracts(tmp_path: Path):
@@ -147,7 +208,6 @@ def test_modality_upload_contracts(tmp_path: Path):
     for path, filename, body, content_type, expected in cases:
         response = test_client.post(
             f"/api/v1/files/{path}",
-            data={"business_domain": "risk", "department": "audit"},
             files={"file": (filename, body, content_type)},
         )
         assert response.status_code == 201
@@ -159,7 +219,6 @@ def test_query_file_vector_search_contract(tmp_path: Path):
     response = test_client.post(
         "/api/v1/search/vector/file",
         data={
-            "business_domain": "risk",
             "start_date": "2026-01-01",
             "end_date": "2026-12-31",
         },
@@ -168,6 +227,46 @@ def test_query_file_vector_search_contract(tmp_path: Path):
     assert response.status_code == 200
     assert response.json()["returned"] == 1
     assert response.json()["items"][0]["rank"] == 1
+
+
+def test_openapi_contract_does_not_expose_scope_fields(tmp_path: Path):
+    test_client, _, _ = build_client(tmp_path)
+    schema = test_client.get(
+        "/openapi.json",
+        auth=("admin", "change-me"),
+        headers={"Authorization": ""},
+    ).json()
+
+    def resolve(request_schema):
+        reference = request_schema.get("$ref")
+        if not reference:
+            return request_schema
+        return schema["components"]["schemas"][reference.rsplit("/", 1)[-1]]
+
+    for path in (
+        "/api/v1/files",
+        "/api/v1/files/documents",
+        "/api/v1/files/images",
+        "/api/v1/files/audio",
+        "/api/v1/search/vector/file",
+    ):
+        body = schema["paths"][path]["post"]["requestBody"]["content"]["multipart/form-data"][
+            "schema"
+        ]
+        properties = resolve(body).get("properties", {})
+        assert "business_domain" not in properties
+        assert "department" not in properties
+
+    list_parameters = {
+        parameter["name"] for parameter in schema["paths"]["/api/v1/files"]["get"]["parameters"]
+    }
+    assert "business_domain" not in list_parameters
+    assert "department" not in list_parameters
+
+    for component in ("FullTextSearchRequest", "VectorSearchRequest"):
+        properties = schema["components"]["schemas"][component]["properties"]
+        assert "business_domain" not in properties
+        assert "department" not in properties
 
 
 def test_token_state_errors_are_distinct(tmp_path: Path):
@@ -194,7 +293,6 @@ def test_token_state_errors_are_distinct(tmp_path: Path):
 def test_upload_rate_limit_and_retry_after(tmp_path: Path):
     test_client, store, _ = build_client(tmp_path, upload_requests=1)
     values = {
-        "data": {"business_domain": "risk", "department": "audit"},
         "files": {"file": ("a.txt", b"hello", "text/plain")},
     }
     assert test_client.post("/api/v1/files", **values).status_code == 201
@@ -221,7 +319,7 @@ def test_download_metrics_and_validation(tmp_path: Path):
 
     invalid = test_client.post(
         "/api/v1/search/full-text",
-        json={"business_domain": "risk", "keyword": ""},
+        json={"keyword": ""},
     )
     assert invalid.status_code == 422
     assert invalid.json()["error"]["code"] == "invalid_request"

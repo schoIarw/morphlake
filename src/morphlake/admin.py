@@ -121,16 +121,16 @@ def dashboard(
     downloads = sum(row["request_count"] for row in stats if row["operation"] == "download")
     body = f"""
     <div class="cards">
-      {_card("有效 Token", sum(row["status"] == "active" for row in tokens), "身份授权")}
+      {_card("有效 Key", sum(row["status"] == "active" for row in tokens), "身份授权")}
       {_card("今日上传", uploads, "请求")}
       {_card("今日下载", downloads, "请求")}
       {_card("待同步审计", store.unsynced_event_count(), "Paimon outbox")}
     </div>
     <section class="panel welcome"><div><span class="eyebrow">MULTIMODAL DATA FOUNDATION</span>
-      <h2>欢迎使用 MorphLake</h2><p>管理 Token、查看传输与监控，或通过左侧能力菜单直接调用 API 服务。</p></div>
+      <h2>欢迎使用 MorphLake</h2><p>管理 Key、查看传输与监控，或通过左侧能力菜单直接调用 API 服务。</p></div>
       <a class="button" href="/admin/api/upload">上传多模态文件</a></section>
     <div class="quick-grid">
-      {_quick("文件清单", "按类型、日期、业务域、部门和文件名查询", "/admin/api/files")}
+      {_quick("文件清单", "Key 自动限定权限范围，按类型、日期和文件名查询", "/admin/api/files")}
       {_quick("全文检索", "按关键字检索文档切片", "/admin/api/full-text")}
       {_quick("向量检索", "输入向量或上传文件查询 Top 10", "/admin/api/vector")}
     </div>"""
@@ -143,10 +143,10 @@ def tokens_page(
     store: Annotated[AdminStore, Depends(get_admin_store)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> HTMLResponse:
-    rows = "".join(_token_row(row, session.csrf_token) for row in store.list_tokens())
+    rows = "".join(_token_row(row, session.csrf_token) for row in store.list_tokens(reveal=True))
     body = f"""
-    <section class="panel"><div class="section-head"><div><h2>分配 Token</h2>
-      <p>Token 固定绑定业务域和部门，明文仅显示一次。</p></div></div>
+    <section class="panel"><div class="section-head"><div><h2>分配业务域 Key</h2>
+      <p>Key 固定绑定业务域和部门；上传自动继承归属，查询自动限制到该业务域。</p></div></div>
       <form method="post" action="/admin/tokens" class="grid-form">
         {_csrf_input(session)}
         {_input("业务域", "business_domain", required=True, maxlength=128)}
@@ -160,14 +160,15 @@ def tokens_page(
         {_input("周期下载字节", "download_bytes_limit", "number", settings.default_download_bytes, min=0, required=True)}
         {_input("过期时间（可选）", "expires_at", "datetime-local")}
         <label class="wide">备注<textarea name="notes" maxlength="1000" placeholder="用途、应用名称或交付说明"></textarea></label>
-        <div class="wide form-actions"><button type="submit">生成 Token</button><span class="hint">配额填 0 表示不限制</span></div>
+        <div class="wide form-actions"><button type="submit">生成 Key</button><span class="hint">配额填 0 表示不限制</span></div>
       </form>
     </section>
-    <section class="panel"><h2>已分配 Token</h2><div class="table-wrap"><table><thead><tr>
-      <th>前缀</th><th>业务范围</th><th>使用人</th><th>手机</th><th>备注</th><th>状态</th>
+    <section class="panel"><h2>已分配 Key</h2><p class="hint">管理 Key 可查询全部数据；业务域 Key 仅能查询所属业务域。</p>
+      <div class="table-wrap"><table><thead><tr>
+      <th>Key</th><th>权限</th><th>业务范围</th><th>使用人</th><th>手机</th><th>备注</th><th>状态</th>
       <th>创建/过期</th><th>限流</th><th>操作</th><th></th>
-      </tr></thead><tbody>{rows or _empty_row(10)}</tbody></table></div></section>"""
-    return HTMLResponse(_page("Token 管理", body, session, settings, "tokens"))
+      </tr></thead><tbody>{rows or _empty_row(11)}</tbody></table></div></section>"""
+    return HTMLResponse(_page("Key 管理", body, session, settings, "tokens"))
 
 
 @router.post("/tokens", response_class=HTMLResponse)
@@ -207,11 +208,11 @@ def create_token(
         download_bytes_limit=download_bytes_limit,
     )
     body = f"""<section class="panel token-created"><span class="success-mark">✓</span>
-      <h2>Token 创建成功</h2><p>请立即复制并安全交付，系统不会再次显示完整 Token。</p>
+      <h2>Key 创建成功</h2><p>可立即复制；后续也可在 Key 管理页安全查看。</p>
       <pre class="secret">{html.escape(created.plaintext)}</pre>
       <p class="hint">范围：{html.escape(created.identity.business_domain)} / {html.escape(created.identity.department)}</p>
-      <a class="button" href="/admin/tokens">返回 Token 管理</a></section>"""
-    return HTMLResponse(_page("Token 创建成功", body, session, settings, "tokens"), status_code=201)
+      <a class="button" href="/admin/tokens">返回 Key 管理</a></section>"""
+    return HTMLResponse(_page("Key 创建成功", body, session, settings, "tokens"), status_code=201)
 
 
 @router.post("/tokens/{token_id}/status/{action}")
@@ -254,6 +255,18 @@ def update_token_limits(
     return RedirectResponse("/admin/tokens", status_code=303)
 
 
+@router.post("/tokens/{token_id}/rotate")
+def rotate_token(
+    token_id: str,
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    csrf: Annotated[str, Form()],
+) -> RedirectResponse:
+    _verify_csrf(csrf, session)
+    store.rotate_token(token_id)
+    return RedirectResponse("/admin/tokens", status_code=303)
+
+
 @router.get("/api/upload", response_class=HTMLResponse)
 def upload_page(
     session: Annotated[AdminSession, Depends(require_admin_session)],
@@ -262,7 +275,7 @@ def upload_page(
     body = (
         _api_intro(
             "上传与向量化",
-            "文件由现有 API 写入 MinIO，并按类型提取内容、切片和向量化后写入 Paimon。",
+            "业务域和部门自动取自 Key。文件由现有 API 写入 MinIO，并完成提取、切片和向量化。",
         )
         + f"""
     <section class="panel"><form method="post" action="/admin/api/upload"
@@ -271,8 +284,6 @@ def upload_page(
       <label>上传接口<select name="mode"><option value="auto">自动识别</option>
       <option value="document">文档</option><option value="image">图片</option>
       <option value="audio">音频</option></select></label>
-      {_input("业务域", "business_domain", required=True)}
-      {_input("部门", "department", required=True)}
       <label class="wide">选择文件<input type="file" name="file" required></label>
       <div class="wide form-actions"><button>上传并向量化</button></div>
     </form></section>"""
@@ -288,8 +299,6 @@ def upload_action(
     csrf: Annotated[str, Form()],
     api_token: Annotated[str, Form()],
     mode: Annotated[str, Form()],
-    business_domain: Annotated[str, Form()],
-    department: Annotated[str, Form()],
     file: Annotated[UploadFile, File()],
 ) -> HTMLResponse:
     _verify_csrf(csrf, session)
@@ -305,7 +314,6 @@ def upload_action(
         "POST",
         paths[mode],
         api_token,
-        data={"business_domain": business_domain, "department": department},
         file=(
             file.filename or "upload",
             file.file,
@@ -328,7 +336,7 @@ def files_page(
     body = (
         _api_intro(
             "文件清单",
-            "调用 GET /api/v1/files，可组合业务范围、类型、日期和文件名筛选。",
+            "查询范围自动取自 Key；可按文件类型、日期和文件名筛选。管理 Key 可查询全库。",
         )
         + f"""
     <section class="panel"><form method="post" action="/admin/api/files" class="grid-form">
@@ -336,8 +344,6 @@ def files_page(
       <label>文件类型<select name="media_type"><option value="">全部</option>
       <option value="document">文档</option><option value="image">图片</option>
       <option value="audio">音频</option></select></label>
-      {_input("业务域（可选）", "business_domain")}
-      {_input("部门（可选）", "department")}
       {_input("文件名关键字", "filename")}
       {_input("开始日期", "start_date", "date")}
       {_input("结束日期", "end_date", "date")}
@@ -357,8 +363,6 @@ def files_action(
     csrf: Annotated[str, Form()],
     api_token: Annotated[str, Form()],
     media_type: Annotated[str, Form()] = "",
-    business_domain: Annotated[str, Form()] = "",
-    department: Annotated[str, Form()] = "",
     filename: Annotated[str, Form()] = "",
     start_date: Annotated[str, Form()] = "",
     end_date: Annotated[str, Form()] = "",
@@ -369,8 +373,6 @@ def files_action(
     params = _compact(
         {
             "media_type": media_type,
-            "business_domain": business_domain,
-            "department": department,
             "filename": filename,
             "start_date": start_date,
             "end_date": end_date,
@@ -390,7 +392,7 @@ def full_text_page(
     session: Annotated[AdminSession, Depends(require_admin_session)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> HTMLResponse:
-    body = _api_intro("全文检索", "检索 Paimon 文本切片索引，可限定业务域、部门和日期范围。")
+    body = _api_intro("全文检索", "检索范围自动取自 Key，仅需填写关键字和必要的日期范围。")
     body += _search_form(
         session,
         "/admin/api/full-text",
@@ -408,9 +410,7 @@ def full_text_action(
     client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
     csrf: Annotated[str, Form()],
     api_token: Annotated[str, Form()],
-    business_domain: Annotated[str, Form()],
     keyword: Annotated[str, Form()],
-    department: Annotated[str, Form()] = "",
     start_date: Annotated[str, Form()] = "",
     end_date: Annotated[str, Form()] = "",
     limit: Annotated[int, Form(ge=1, le=200)] = 20,
@@ -418,8 +418,6 @@ def full_text_action(
     _verify_csrf(csrf, session)
     payload = _compact(
         {
-            "business_domain": business_domain,
-            "department": department,
             "keyword": keyword,
             "start_date": start_date,
             "end_date": end_date,
@@ -445,8 +443,6 @@ def vector_page(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> HTMLResponse:
     common = f"""{_csrf_input(session)}{_api_token_input()}
-      {_input("业务域", "business_domain", required=True)}
-      {_input("部门（可选）", "department")}
       {_input("开始日期", "start_date", "date")}
       {_input("结束日期", "end_date", "date")}"""
     body = (
@@ -479,10 +475,8 @@ def vector_action(
     client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
     csrf: Annotated[str, Form()],
     api_token: Annotated[str, Form()],
-    business_domain: Annotated[str, Form()],
     vector: Annotated[str, Form()],
     vector_field: Annotated[str, Form()] = "text",
-    department: Annotated[str, Form()] = "",
     start_date: Annotated[str, Form()] = "",
     end_date: Annotated[str, Form()] = "",
     limit: Annotated[int, Form(ge=1, le=200)] = 10,
@@ -498,8 +492,6 @@ def vector_action(
         raise MorphLakeError("invalid_vector", "Vector must not be empty", 400)
     payload = _compact(
         {
-            "business_domain": business_domain,
-            "department": department,
             "vector": values,
             "vector_field": vector_field,
             "start_date": start_date,
@@ -527,17 +519,13 @@ def vector_file_action(
     client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
     csrf: Annotated[str, Form()],
     api_token: Annotated[str, Form()],
-    business_domain: Annotated[str, Form()],
     file: Annotated[UploadFile, File()],
-    department: Annotated[str, Form()] = "",
     start_date: Annotated[str, Form()] = "",
     end_date: Annotated[str, Form()] = "",
 ) -> HTMLResponse:
     _verify_csrf(csrf, session)
     data = _compact(
         {
-            "business_domain": business_domain,
-            "department": department,
             "start_date": start_date,
             "end_date": end_date,
         }
@@ -739,8 +727,6 @@ def monitoring_page(
 def _search_form(session: AdminSession, action: str, special: str, limit: int) -> str:
     return f"""<section class="panel"><form method="post" action="{action}"
       class="grid-form">{_csrf_input(session)}{_api_token_input()}
-      {_input("业务域", "business_domain", required=True)}
-      {_input("部门（可选）", "department")}
       {_input("开始日期", "start_date", "date")}
       {_input("结束日期", "end_date", "date")}{special}
       {_input("返回条数", "limit", "number", limit, min=1, max=200)}
@@ -798,9 +784,9 @@ def _csrf_input(session: AdminSession) -> str:
 
 
 def _api_token_input() -> str:
-    return """<label class="wide token-field">API Token
+    return """<label class="wide token-field">API Key
       <input class="api-token" type="password" name="api_token" required autocomplete="off"
-      placeholder="mlk_…"><small>仅保存在当前浏览器标签页，不写入管理数据库</small></label>"""
+      placeholder="mlk_…"><small>仅保存在当前浏览器标签页；业务范围由 Key 自动确定</small></label>"""
 
 
 def _input(
@@ -838,7 +824,22 @@ def _token_row(row: dict[str, Any], csrf: str) -> str:
     token_id = html.escape(row["token_id"])
     action = "enable" if row["status"] == "disabled" else "disable"
     action_text = "启用" if action == "enable" else "停用"
-    return f"""<tr><td><code>{html.escape(row["token_prefix"])}</code></td>
+    plaintext = row.get("plaintext")
+    if plaintext:
+        key_view = f"""<div class="key-view"><input id="key-{token_id}" type="password"
+          value="{html.escape(plaintext)}" readonly><button type="button" class="secondary key-toggle"
+          data-target="key-{token_id}">查看</button><button type="button" class="secondary key-copy"
+          data-target="key-{token_id}">复制</button></div>"""
+    else:
+        key_view = """<span class="hint">历史 Key 无法恢复</span>"""
+    permission = "全域管理" if row["access_level"] == "admin" else "业务域"
+    delete_form = ""
+    if row["access_level"] != "admin":
+        delete_form = f"""<form class="inline" method="post"
+          action="/admin/tokens/{token_id}/status/delete"><input type="hidden" name="csrf"
+          value="{csrf}"><button class="danger">删除</button></form>"""
+    return f"""<tr><td>{key_view}<code>{html.escape(row["token_prefix"])}</code></td>
+      <td><span class="status-pill {"admin-key" if row["access_level"] == "admin" else ""}">{permission}</span></td>
       <td>{html.escape(row["business_domain"])}<br><span class="hint">{html.escape(row["department"])}</span></td>
       <td>{html.escape(row["assignee_name"])}</td><td>{html.escape(row["phone"])}</td>
       <td>{html.escape(row["notes"])}</td><td><span class="status-pill {row["status"]}">{row["status"]}</span></td>
@@ -854,8 +855,9 @@ def _token_row(row: dict[str, Any], csrf: str) -> str:
       <button>保存</button></form></details></td>
       <td><form class="inline" method="post" action="/admin/tokens/{token_id}/status/{action}">
       <input type="hidden" name="csrf" value="{csrf}"><button class="secondary">{action_text}</button></form></td>
-      <td><form class="inline" method="post" action="/admin/tokens/{token_id}/status/delete">
-      <input type="hidden" name="csrf" value="{csrf}"><button class="danger">删除</button></form></td></tr>"""
+      <td><form class="inline" method="post" action="/admin/tokens/{token_id}/rotate">
+      <input type="hidden" name="csrf" value="{csrf}"><button class="secondary">重新生成</button></form>
+      {delete_form}</td></tr>"""
 
 
 def _prometheus_value(result: list[dict[str, Any]]) -> str:
@@ -891,7 +893,7 @@ def _page(
     active: str,
 ) -> str:
     groups = [
-        ("管理", [("dashboard", "工作台", "/admin"), ("tokens", "Token 管理", "/admin/tokens")]),
+        ("管理", [("dashboard", "工作台", "/admin"), ("tokens", "Key 管理", "/admin/tokens")]),
         (
             "数据能力",
             [
@@ -936,7 +938,15 @@ def _page(
     <h1>{html.escape(title)}</h1></div></div>{body}</main>
     <script>document.querySelectorAll('.api-token').forEach(function(el){{
     el.value=sessionStorage.getItem('morphlakeApiToken')||'';
-    el.addEventListener('input',function(){{sessionStorage.setItem('morphlakeApiToken',el.value)}})}});</script>
+    el.addEventListener('input',function(){{sessionStorage.setItem('morphlakeApiToken',el.value)}})}});
+    document.querySelectorAll('.key-toggle').forEach(function(button){{button.addEventListener('click',function(){{
+    var input=document.getElementById(button.dataset.target);var hidden=input.type==='password';
+    input.type=hidden?'text':'password';button.textContent=hidden?'隐藏':'查看'}})}});
+    document.querySelectorAll('.key-copy').forEach(function(button){{button.addEventListener('click',function(){{
+    var input=document.getElementById(button.dataset.target);var done=function(){{button.textContent='已复制';
+    setTimeout(function(){{button.textContent='复制'}},1200)}};
+    if(navigator.clipboard&&window.isSecureContext){{navigator.clipboard.writeText(input.value).then(done)}}else{{
+    input.type='text';input.select();document.execCommand('copy');done()}}}})}});</script>
     </body></html>"""
 
 
@@ -949,6 +959,7 @@ _CSS = """
 .content{margin-left:224px;padding:82px 28px 40px;max-width:1680px}.page-head{display:flex;justify-content:space-between;align-items:end;margin-bottom:19px}.page-head h1{font-size:26px;margin:2px 0}.eyebrow{color:var(--blue);font-size:10px;font-weight:800;letter-spacing:.15em}.panel,.intro,.quick,.card{background:var(--white);border:1px solid var(--line);border-radius:12px;box-shadow:0 5px 18px #263b6810}.panel{padding:22px;margin:0 0 18px}.panel h2,.intro h2{margin:0 0 5px;font-size:18px}.panel p,.intro p{color:var(--muted);margin:4px 0 16px}.section-head{display:flex;align-items:center;justify-content:space-between}.intro{padding:20px 22px;margin-bottom:18px;background:linear-gradient(115deg,#fff,#f1f5ff)}
 .cards{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:15px;margin-bottom:18px}.card{padding:18px;border-top:3px solid var(--blue)}.card span,.card small{display:block;color:var(--muted)}.card strong{display:block;font-size:28px;margin:5px 0}.welcome{display:flex;justify-content:space-between;align-items:center;padding:28px}.welcome p{margin-bottom:0}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:15px}.quick{display:flex;flex-direction:column;padding:20px;text-decoration:none;color:var(--ink);transition:.16s}.quick:hover{transform:translateY(-2px);border-color:#b8c7fa}.quick strong{font-size:16px}.quick span{color:var(--muted);margin:7px 0 14px}.quick b{color:var(--blue);font-size:12px}
 .grid-form{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:15px}.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}.split .grid-form{grid-template-columns:1fr 1fr}.wide{grid-column:1/-1}label{display:block;color:#4d596c;font-size:13px;font-weight:600}input,textarea,select{display:block;width:100%;margin-top:6px;padding:10px 11px;border:1px solid #ccd3df;border-radius:8px;background:#fff;color:var(--ink);font:inherit;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px #3b66f51c}textarea{min-height:90px;resize:vertical}label small,.hint{color:var(--muted);font-size:12px;font-weight:400}.token-field{padding:12px;background:#f6f8fd;border-radius:9px}.form-actions{display:flex;align-items:center;gap:14px}
+.key-view{display:grid;grid-template-columns:minmax(190px,1fr) auto auto;gap:5px;min-width:330px;margin-bottom:5px}.key-view input{margin:0;padding:7px 8px}.key-view button{padding:7px 9px}.admin-key{background:#e8edff;color:var(--blue2)}
 button,.button{display:inline-block;border:0;border-radius:8px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;padding:10px 17px;text-decoration:none;font-weight:650;cursor:pointer}.secondary{background:#eef2ff;color:var(--blue2)}.danger{background:#fff0f1;color:var(--red)}.inline{display:inline}.table-wrap{overflow:auto;margin-top:12px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#f8f9fc;color:#596579;font-size:12px}td{color:#344054}.empty{text-align:center!important;color:var(--muted);padding:30px!important}.status-pill{display:inline-block;padding:4px 9px;border-radius:20px;background:#eef2f7;font-size:12px}.status-pill.ok,.status-pill.active{background:#e7f8ee;color:var(--green)}.status-pill.error,.status-pill.deleted{background:#fff0f1;color:var(--red)}.status-pill.disabled{background:#fff6dc;color:var(--amber)}.result-head{margin-bottom:12px}.tabs{display:flex;gap:7px}.tabs a{padding:5px 10px;background:#eef2ff;border-radius:7px;text-decoration:none}.limit-form{min-width:330px;display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:12px}.alert{padding:12px 14px;background:#fff3dc;border:1px solid #f0cf88;border-radius:9px;color:#775310;margin-bottom:15px}pre{white-space:pre-wrap;word-break:break-all;background:#111827;color:#dbe7ff;padding:16px;border-radius:9px;max-height:460px;overflow:auto}.secret{font-size:16px}.token-created{text-align:center;max-width:760px;margin:40px auto}.success-mark{display:grid;place-items:center;width:52px;height:52px;margin:0 auto 12px;border-radius:50%;background:#e7f8ee;color:var(--green);font-size:26px}
 .login-body{min-height:100vh;background:radial-gradient(circle at 15% 15%,#4168ec 0,#183387 28%,#0e1729 70%);display:grid;place-items:center;padding:24px}.login-shell{width:min(960px,100%);display:grid;grid-template-columns:1.1fr .9fr;overflow:hidden;border-radius:20px;box-shadow:0 30px 80px #0006}.login-brand{color:#fff;padding:65px 55px;background:linear-gradient(145deg,#264ed3cc,#101c3de8)}.login-brand .eyebrow{color:#b9c9ff}.login-brand h1{font-size:36px;line-height:1.25;margin:22px 0 12px}.login-brand p{color:#c9d5ff}.login-card{background:#fff;padding:55px 48px;display:flex;flex-direction:column;justify-content:center}.login-card h2{font-size:25px;margin:6px 0}.login-card p{color:var(--muted);margin:0 0 20px}.login-card form{display:grid;gap:15px}.login-button{width:100%;margin-top:5px}.login-card>small{color:var(--muted);margin-top:18px;text-align:center}
 @media(max-width:980px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}}@media(max-width:760px){.topbar{padding:0 14px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:58px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 8px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:8px 10px}.content{margin-left:0;padding:124px 14px 30px}.grid-form,.split .grid-form,.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.welcome{align-items:flex-start;gap:18px;flex-direction:column}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:38px 28px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import secrets
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
@@ -54,6 +56,7 @@ class TokenIdentity:
     assignee_name: str
     phone: str
     status: str
+    access_level: str
     period_seconds: int
     upload_requests_limit: int
     download_requests_limit: int
@@ -89,6 +92,8 @@ API_TOKENS = Table(
     Column("token_id", String(36), primary_key=True),
     Column("token_hash", String(64), nullable=False, unique=True),
     Column("token_prefix", String(16), nullable=False),
+    Column("token_ciphertext", Text),
+    Column("access_level", String(16), nullable=False),
     Column("business_domain", String(255), nullable=False),
     Column("department", String(255), nullable=False),
     Column("assignee_name", String(255), nullable=False),
@@ -106,6 +111,7 @@ API_TOKENS = Table(
     Column("upload_bytes_limit", BigInteger, nullable=False),
     Column("download_bytes_limit", BigInteger, nullable=False),
     CheckConstraint("status IN ('active','disabled','deleted')", name="ck_api_tokens_status"),
+    CheckConstraint("access_level IN ('admin','domain')", name="ck_api_tokens_access_level"),
 )
 Index(
     "idx_api_tokens_scope",
@@ -306,6 +312,7 @@ class AdminStore:
         upload_bytes_limit: int,
         download_bytes_limit: int,
         expires_at: str | None = None,
+        access_level: str = "domain",
     ) -> CreatedToken:
         values = [business_domain, department, assignee_name, phone]
         if any(not value.strip() for value in values):
@@ -322,6 +329,8 @@ class AdminStore:
         ]
         if period_seconds <= 0 or any(value < 0 for value in limits[1:]):
             raise MorphLakeError("invalid_rate_limit", "Rate limits must be non-negative")
+        if access_level not in {"admin", "domain"}:
+            raise MorphLakeError("invalid_access_level", "Unsupported key access level")
 
         token_id = str(uuid.uuid4())
         token_prefix = secrets.token_hex(4)
@@ -335,6 +344,7 @@ class AdminStore:
             assignee_name=assignee_name.strip(),
             phone=phone.strip(),
             status="active",
+            access_level=access_level,
             period_seconds=period_seconds,
             upload_requests_limit=upload_requests_limit,
             download_requests_limit=download_requests_limit,
@@ -347,6 +357,8 @@ class AdminStore:
                     token_id=token_id,
                     token_hash=self._token_hash(plaintext),
                     token_prefix=token_prefix,
+                    token_ciphertext=self._encrypt_token(plaintext),
+                    access_level=access_level,
                     business_domain=identity.business_domain,
                     department=identity.department,
                     assignee_name=identity.assignee_name,
@@ -393,13 +405,55 @@ class AdminStore:
             )
         return self._identity(row)
 
-    def list_tokens(self, *, include_deleted: bool = False) -> list[dict[str, Any]]:
+    def list_tokens(
+        self, *, include_deleted: bool = False, reveal: bool = False
+    ) -> list[dict[str, Any]]:
         statement = select(API_TOKENS).order_by(API_TOKENS.c.created_at.desc())
         if not include_deleted:
             statement = statement.where(API_TOKENS.c.status != "deleted")
         with self._engine_required().connect() as connection:
             rows = connection.execute(statement).mappings().all()
-        return [dict(row) for row in rows]
+        values = []
+        for row in rows:
+            item = dict(row)
+            ciphertext = item.pop("token_ciphertext", None)
+            item.pop("token_hash", None)
+            if reveal:
+                item["plaintext"] = self._decrypt_token(ciphertext)
+            values.append(item)
+        return values
+
+    def rotate_token(self, token_id: str) -> CreatedToken:
+        token_prefix = secrets.token_hex(4)
+        plaintext = f"mlk_{token_prefix}_{secrets.token_urlsafe(32)}"
+        with self._transaction() as connection:
+            row = (
+                connection.execute(
+                    select(API_TOKENS).where(
+                        and_(
+                            API_TOKENS.c.token_id == token_id,
+                            API_TOKENS.c.status != "deleted",
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                raise MorphLakeError("token_not_found", "Active key does not exist", 404)
+            connection.execute(
+                update(API_TOKENS)
+                .where(API_TOKENS.c.token_id == token_id)
+                .values(
+                    token_hash=self._token_hash(plaintext),
+                    token_prefix=token_prefix,
+                    token_ciphertext=self._encrypt_token(plaintext),
+                    updated_at=datetime.now(UTC).isoformat(),
+                )
+            )
+        values = dict(row)
+        values["token_prefix"] = token_prefix
+        return CreatedToken(identity=self._identity(values), plaintext=plaintext)
 
     def set_token_status(self, token_id: str, status: str) -> None:
         if status not in {"active", "disabled", "deleted"}:
@@ -408,15 +462,26 @@ class AdminStore:
         if status != "deleted":
             criteria = and_(criteria, API_TOKENS.c.status != "deleted")
         with self._transaction() as connection:
+            existing_row = (
+                connection.execute(
+                    select(API_TOKENS.c.status, API_TOKENS.c.access_level).where(
+                        API_TOKENS.c.token_id == token_id
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if status == "deleted" and existing_row and existing_row["access_level"] == "admin":
+                raise MorphLakeError(
+                    "admin_key_protected", "The default administration key cannot be deleted", 409
+                )
             result = connection.execute(
                 update(API_TOKENS)
                 .where(criteria)
                 .values(status=status, updated_at=datetime.now(UTC).isoformat())
             )
             if result.rowcount != 1:
-                existing = connection.execute(
-                    select(API_TOKENS.c.status).where(API_TOKENS.c.token_id == token_id)
-                ).scalar_one_or_none()
+                existing = existing_row["status"] if existing_row else None
                 if existing == "deleted":
                     raise MorphLakeError("token_deleted", "Deleted tokens cannot be changed", 409)
                 raise MorphLakeError("token_not_found", "Token does not exist", 404)
@@ -790,9 +855,10 @@ class AdminStore:
     def _create_and_seed(self, connection: Connection) -> None:
         METADATA.create_all(connection, checkfirst=True)
         self._ensure_transfer_columns(connection)
+        self._ensure_token_columns(connection)
         now = datetime.now(UTC).isoformat()
         values = {
-            "schema_version": ("3", "MorphLake management schema version"),
+            "schema_version": ("4", "MorphLake management schema version"),
             "initialized_at": (now, "First successful schema initialization time"),
             "database_backend": (self.backend, "Active management database backend"),
             "default_rate_period_seconds": (
@@ -832,7 +898,74 @@ class AdminStore:
         connection.execute(
             update(SYSTEM_CONFIG)
             .where(SYSTEM_CONFIG.c.config_key == "schema_version")
-            .values(config_value="3", updated_at=now)
+            .values(config_value="4", updated_at=now)
+        )
+        self._ensure_default_admin_token(connection, now)
+
+    def _ensure_token_columns(self, connection: Connection) -> None:
+        columns = {column["name"] for column in inspect(connection).get_columns("api_tokens")}
+        if "token_ciphertext" not in columns:
+            connection.exec_driver_sql("ALTER TABLE api_tokens ADD COLUMN token_ciphertext TEXT")
+        if "access_level" not in columns:
+            connection.exec_driver_sql("ALTER TABLE api_tokens ADD COLUMN access_level VARCHAR(16)")
+            connection.execute(
+                update(API_TOKENS)
+                .where(API_TOKENS.c.access_level.is_(None))
+                .values(access_level="domain")
+            )
+
+    def _ensure_default_admin_token(self, connection: Connection, now: str) -> None:
+        marker = connection.execute(
+            select(SYSTEM_CONFIG.c.config_value).where(
+                SYSTEM_CONFIG.c.config_key == "default_admin_token_id"
+            )
+        ).scalar_one_or_none()
+        if marker:
+            return
+        existing = connection.execute(
+            select(API_TOKENS.c.token_id).where(API_TOKENS.c.access_level == "admin").limit(1)
+        ).scalar_one_or_none()
+        token_id = existing
+        if token_id is None:
+            token_id = str(uuid.uuid4())
+            token_prefix = secrets.token_hex(4)
+            plaintext = f"mlk_{token_prefix}_{secrets.token_urlsafe(32)}"
+            connection.execute(
+                insert(API_TOKENS).values(
+                    token_id=token_id,
+                    token_hash=self._token_hash(plaintext),
+                    token_prefix=token_prefix,
+                    token_ciphertext=self._encrypt_token(plaintext),
+                    access_level="admin",
+                    business_domain="管理员",
+                    department="管理员",
+                    assignee_name="系统管理员",
+                    phone="管理员",
+                    notes="首次启动自动创建的全域管理 Key",
+                    status="active",
+                    allocated_by="system-init",
+                    created_at=now,
+                    updated_at=now,
+                    expires_at=None,
+                    last_used_at=None,
+                    period_seconds=self.settings.default_rate_period_seconds,
+                    upload_requests_limit=0,
+                    download_requests_limit=0,
+                    upload_bytes_limit=0,
+                    download_bytes_limit=0,
+                )
+            )
+        connection.execute(
+            self._insert_do_nothing(
+                SYSTEM_CONFIG,
+                {
+                    "config_key": "default_admin_token_id",
+                    "config_value": token_id,
+                    "description": "First-start all-domain administration key identifier",
+                    "updated_at": now,
+                },
+                ["config_key"],
+            )
         )
 
     def _ensure_transfer_columns(self, connection: Connection) -> None:
@@ -953,6 +1086,21 @@ class AdminStore:
             hashlib.sha256,
         ).hexdigest()
 
+    def _encrypt_token(self, plaintext: str) -> str:
+        return self._token_cipher().encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+    def _decrypt_token(self, ciphertext: str | None) -> str | None:
+        if not ciphertext:
+            return None
+        try:
+            return self._token_cipher().decrypt(ciphertext.encode("ascii")).decode("utf-8")
+        except (InvalidToken, ValueError):
+            return None
+
+    def _token_cipher(self) -> Fernet:
+        digest = hashlib.sha256(self.settings.token_encryption_secret.encode("utf-8")).digest()
+        return Fernet(base64.urlsafe_b64encode(digest))
+
     @staticmethod
     def _identity(row: Mapping[str, Any]) -> TokenIdentity:
         return TokenIdentity(
@@ -963,6 +1111,7 @@ class AdminStore:
             assignee_name=row["assignee_name"],
             phone=row["phone"],
             status=row["status"],
+            access_level=row["access_level"],
             period_seconds=row["period_seconds"],
             upload_requests_limit=row["upload_requests_limit"],
             download_requests_limit=row["download_requests_limit"],
