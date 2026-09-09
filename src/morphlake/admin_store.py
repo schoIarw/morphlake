@@ -454,6 +454,37 @@ class AdminStore:
             values.append(item)
         return values
 
+    def list_scope_options(self) -> list[dict[str, str]]:
+        """Return known business-domain/department pairs for administration filters.
+
+        Token rows are retained after deletion and therefore remain useful for
+        historical asset filters. Transfer records cover scopes created before
+        the current token registry was introduced.
+        """
+        with self._engine_required().connect() as connection:
+            token_rows = connection.execute(
+                select(API_TOKENS.c.business_domain, API_TOKENS.c.department)
+                .where(API_TOKENS.c.access_level == "domain")
+                .distinct()
+            ).all()
+            transfer_rows = connection.execute(
+                select(
+                    TRANSFER_EVENTS.c.business_domain,
+                    TRANSFER_EVENTS.c.department,
+                )
+                .where(TRANSFER_EVENTS.c.business_domain != "管理员")
+                .distinct()
+            ).all()
+        scopes = {
+            (str(row.business_domain).strip(), str(row.department).strip())
+            for row in [*token_rows, *transfer_rows]
+            if row.business_domain and row.department
+        }
+        return [
+            {"business_domain": domain, "department": department}
+            for domain, department in sorted(scopes)
+        ]
+
     def rotate_token(self, token_id: str) -> CreatedToken:
         token_prefix = secrets.token_hex(4)
         plaintext = f"mlk_{token_prefix}_{secrets.token_urlsafe(32)}"

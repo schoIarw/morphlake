@@ -138,6 +138,10 @@ def test_admin_login_session_layout_and_token_lifecycle(tmp_path: Path):
     keys_page = client.get("/admin/tokens")
     assert "全域管理" in keys_page.text
     assert "key-copy" in keys_page.text
+    assert 'list="known-business-domains"' in keys_page.text
+    assert 'list="known-departments"' in keys_page.text
+    assert 'id="scope-create-business-domain"' in keys_page.text
+    assert "createScopeDomain.addEventListener('input'" in keys_page.text
 
     created = client.post(
         "/admin/tokens",
@@ -207,7 +211,21 @@ def test_admin_login_session_layout_and_token_lifecycle(tmp_path: Path):
 
 
 def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
-    client, _, api = build_admin(tmp_path)
+    client, store, api = build_admin(tmp_path)
+    create_token = store.create_token(
+        business_domain="risk",
+        department="audit",
+        assignee_name="Alice",
+        phone="13800000000",
+        notes="UI scope option",
+        allocated_by="pytest",
+        period_seconds=60,
+        upload_requests_limit=10,
+        download_requests_limit=10,
+        upload_bytes_limit=1000,
+        download_bytes_limit=1000,
+    )
+    assert create_token.identity.business_domain == "risk"
     csrf = login(client)
     token = "mlk_secret_business_token"
 
@@ -226,6 +244,13 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
             assert "业务域（可选）" in response.text
             assert "描述/概要模糊匹配" in response.text
             assert "下一页" in response.text
+            assert '<select id="scope-business-domain"' in response.text
+            assert '<select id="scope-department"' in response.text
+            assert '<option value="risk"' in response.text
+            assert '<option value="audit"' in response.text
+            assert "data-departments=" in response.text
+            assert ".grid-form{display:flex" in response.text
+            assert "height:34px" in response.text
         else:
             assert "API Key" in response.text
             assert 'name="business_domain"' not in response.text

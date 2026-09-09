@@ -56,6 +56,7 @@ def test_token_is_hashed_and_lifecycle_is_enforced(tmp_path: Path):
         store.set_token_status(admin_row["token_id"], "deleted")
     assert protected.value.code == "admin_key_protected"
     created = create_token(store)
+    assert store.list_scope_options() == [{"business_domain": "risk", "department": "audit"}]
     row = store.list_tokens()[0]
     assert created.plaintext not in str(row)
     assert store.authenticate(created.plaintext).department == "audit"
@@ -78,6 +79,7 @@ def test_token_is_hashed_and_lifecycle_is_enforced(tmp_path: Path):
         store.authenticate(rotated.plaintext)
     store.set_token_status(created.identity.token_id, "active")
     store.set_token_status(created.identity.token_id, "deleted")
+    assert store.list_scope_options() == [{"business_domain": "risk", "department": "audit"}]
     with pytest.raises(MorphLakeError) as deleted:
         store.authenticate(rotated.plaintext)
     assert deleted.value.code == "token_deleted"
