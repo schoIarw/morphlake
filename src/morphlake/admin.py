@@ -9,7 +9,7 @@ import json
 import math
 import re
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from urllib.parse import urlencode, urlsplit
 
@@ -280,6 +280,7 @@ def rotate_token(
 
 
 RATE_WINDOWS = (1, 2, 4, 8)
+BOARD_REFRESH_INTERVALS = ((30, "中 (30秒)"), (10, "快 (10秒)"), (60, "慢 (60秒)"))
 
 
 @router.get("/limits", response_class=HTMLResponse)
@@ -288,87 +289,283 @@ def limits_page(
     store: Annotated[AdminStore, Depends(get_admin_store)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> HTMLResponse:
-    limit_rows = "".join(_limit_row(row, session.csrf_token) for row in store.list_tokens())
-    rate_panels = "".join(
-        _rate_panel(window, store.transfer_rates(window)) for window in RATE_WINDOWS
-    )
+    tokens = store.list_tokens()
+    limit_rows = "".join(_limit_row(row) for row in tokens)
     body = f"""<section class="panel"><div class="section-head"><div><h2>限额配置</h2>
-      <p>每个 Key 的限流周期与配额；填 0 表示不限制。保存后立即生效。</p></div></div>
+      <p>统一配置每个 Key 的限流周期与配额；填 0 表示不限制。修改后点击底部“保存全部限额”一次性生效。</p></div></div>
+      <form method="post" action="/admin/limits/save">
+      {_csrf_input(session)}
       <div class="table-wrap"><table><thead><tr><th>Key</th><th>业务范围</th>
       <th>周期（秒）</th><th>上传次数</th><th>上传字节</th><th>下载次数</th><th>下载字节</th>
-      <th></th></tr></thead><tbody>{limit_rows or _empty_row(8)}</tbody></table></div></section>
-    <section class="panel"><div class="section-head"><div><h2>实时传输速率</h2>
-      <p>按传输统计表聚合近 1/2/4/8 小时每 Key 的请求数与字节速率，每 30 秒自动刷新。</p>
-      </div></div><div class="rate-grid">{rate_panels}</div></section>
-    <section class="panel"><div class="section-head"><div><h2>历史传输速率</h2>
-      <p>按小时分桶查询指定时间段内每 Key 的传输速率。</p></div></div>
-      <form method="post" action="/admin/limits/history" class="grid-form">
-      {_csrf_input(session)}
-      {_input("开始时间", "start", "datetime-local", required=True)}
-      {_input("结束时间", "end", "datetime-local", required=True)}
-      <label>窗口小时<select name="window_hours"><option value="1">1 小时</option>
-      <option value="2">2 小时</option><option value="4">4 小时</option>
-      <option value="8">8 小时</option><option value="24">24 小时</option></select></label>
-      <div class="wide form-actions"><button>查询历史速率</button></div></form></section>
-    <script>
-    (function(){{
-      const windows={list(RATE_WINDOWS)};
-      const fmt=bytes=>{{if(!bytes)return '0 B';const units=['B','KB','MB','GB'];
-        const i=Math.min(units.length-1,Math.floor(Math.log(bytes)/Math.log(1024)));
-        return (bytes/Math.pow(1024,i)).toFixed(i?1:0)+' '+units[i];}};
-      function render(window,rows,generatedAt){{
-        const panel=document.getElementById('rate-panel-'+window);
-        if(!panel)return;
-        const body=panel.querySelector('tbody');if(!body)return;
-        body.textContent='';
-        if(!rows.length){{const tr=document.createElement('tr');
-          const td=document.createElement('td');td.colSpan=5;td.className='empty';
-          td.textContent='窗口内无传输';tr.appendChild(td);body.appendChild(tr);}}
-        else{{for(const row of rows){{const tr=document.createElement('tr');
-          const cells=[row.token_prefix,row.business_domain+'/'+row.department,
-            String(row.request_count),fmt(row.byte_count),row.bytes_per_second.toFixed(2)+' B/s'];
-          for(const text of cells){{const td=document.createElement('td');
-            td.textContent=text;if(text.startsWith(row.token_prefix)){{
-              const code=document.createElement('code');code.textContent=text;
-              td.textContent='';td.appendChild(code);}}
-            tr.appendChild(td);}}body.appendChild(tr);}}}}
-        const meta=document.getElementById('rate-meta-'+window);
-        if(meta&&generatedAt){{meta.textContent='更新于 '+generatedAt.replace('T',' ').slice(0,19)+' UTC';}}
-      }}
-      function refresh(){{windows.forEach(window=>fetch('/admin/limits/rates?window='+window,{{
-        headers:{{'Accept':'application/json'}}}}).then(r=>r.json()).then(d=>render(d.window,d.rows,d.generated_at)).catch(()=>{{}}));}}
-      refresh();setInterval(refresh,30000);
-    }})();
-    </script>"""
-    return HTMLResponse(_page("限额管理", body, session, settings, "limits"))
+      </tr></thead><tbody>{limit_rows or _empty_row(7)}</tbody></table></div>
+      <div class="form-actions" style="margin-top:12px;"><button>保存全部限额</button></div>
+      </form></section>"""
+    return HTMLResponse(_page("限额配置", body, session, settings, "limits"))
 
 
-@router.get("/limits/rates", response_class=JSONResponse)
-def limits_rates(
+@router.post("/limits/save")
+async def limits_save(
     session: Annotated[AdminSession, Depends(require_admin_session)],
     store: Annotated[AdminStore, Depends(get_admin_store)],
-    window: Annotated[int, Query(ge=1, le=24)] = 2,
-) -> JSONResponse:
-    return JSONResponse(
-        {
-            "window": window,
-            "rows": store.transfer_rates(window),
-            "generated_at": datetime.now(UTC).isoformat(),
-        }
-    )
+    request: Request,
+) -> RedirectResponse:
+    form = await request.form()
+    _verify_csrf(form.get("csrf", ""), session)
+    for token in store.list_tokens():
+        token_id = token["token_id"]
+        prefix = f"limits[{token_id}]"
+        try:
+            period_seconds = int(form.get(f"{prefix}[period_seconds]", token["period_seconds"]))
+            upload_requests_limit = int(
+                form.get(f"{prefix}[upload_requests_limit]", token["upload_requests_limit"])
+            )
+            download_requests_limit = int(
+                form.get(f"{prefix}[download_requests_limit]", token["download_requests_limit"])
+            )
+            upload_bytes_limit = int(
+                form.get(f"{prefix}[upload_bytes_limit]", token["upload_bytes_limit"])
+            )
+            download_bytes_limit = int(
+                form.get(f"{prefix}[download_bytes_limit]", token["download_bytes_limit"])
+            )
+        except (TypeError, ValueError):
+            continue
+        store.update_token_limits(
+            token_id,
+            period_seconds=period_seconds,
+            upload_requests_limit=upload_requests_limit,
+            download_requests_limit=download_requests_limit,
+            upload_bytes_limit=upload_bytes_limit,
+            download_bytes_limit=download_bytes_limit,
+        )
+    return RedirectResponse("/admin/limits", status_code=303)
 
 
-@router.post("/limits/history", response_class=HTMLResponse)
-def limits_history(
+@router.get("/limit-board", response_class=HTMLResponse)
+def limit_board_page(
     session: Annotated[AdminSession, Depends(require_admin_session)],
     store: Annotated[AdminStore, Depends(get_admin_store)],
     settings: Annotated[Settings, Depends(get_settings)],
-    csrf: Annotated[str, Form()],
-    start: Annotated[str, Form()],
-    end: Annotated[str, Form()],
-    window_hours: Annotated[int, Form(ge=1, le=24)] = 1,
 ) -> HTMLResponse:
-    _verify_csrf(csrf, session)
+    tokens = store.list_tokens()
+    token_options = "".join(
+        f'<option value="{html.escape(t["token_id"])}">{html.escape(t["token_prefix"])} · {html.escape(t["business_domain"])}/{html.escape(t["department"])}</option>'
+        for t in tokens
+    )
+    window_options = "".join(
+        f'<option value="{w}"{" selected" if w == 4 else ""}>最近 {w} 小时</option>'
+        for w in RATE_WINDOWS
+    )
+    refresh_options = "".join(
+        f'<option value="{secs}">{label}</option>' for secs, label in BOARD_REFRESH_INTERVALS
+    )
+    limits_json = json.dumps(
+        [
+            {
+                "token_id": t["token_id"],
+                "token_prefix": t["token_prefix"],
+                "business_domain": t["business_domain"],
+                "department": t["department"],
+                "period_seconds": t["period_seconds"],
+                "upload_bytes_limit": t["upload_bytes_limit"],
+                "download_bytes_limit": t["download_bytes_limit"],
+                "upload_requests_limit": t["upload_requests_limit"],
+                "download_requests_limit": t["download_requests_limit"],
+            }
+            for t in tokens
+        ]
+    )
+    body = f"""<section class="panel board-panel">
+      <div class="board-head">
+        <div class="board-title"><span class="board-icon">⏱</span>
+          <h2>限额看板</h2>
+          <span class="board-badge" id="board-badge">被限流 0 / 共 {len(tokens)}</span>
+        </div>
+        <div class="board-controls">
+          <div class="board-tabs"><button type="button" class="active" data-mode="realtime">实时</button>
+          <button type="button" data-mode="history">历史</button></div>
+          <div class="board-realtime-controls">
+            <select id="board-window">{window_options}</select>
+            <select id="board-refresh">{refresh_options}</select>
+            <button type="button" id="board-auto-toggle" class="active">自动刷新中</button>
+          </div>
+          <div class="board-history-controls" style="display:none;">
+            <input type="datetime-local" id="board-start"> ~
+            <input type="datetime-local" id="board-end">
+            <button type="button" id="board-history-query">历史数据</button>
+          </div>
+        </div>
+      </div>
+      <div class="board-filters">
+        <span class="filter-label">筛选</span>
+        <select id="board-token-filter"><option value="">全部 Key</option>{token_options}</select>
+        <input type="text" id="board-prefix-filter" placeholder="Account 模糊匹配（至少7位）" maxlength="16">
+      </div>
+      <div class="board-chart-wrap">
+        <canvas id="board-chart" width="1200" height="420"></canvas>
+        <div class="board-empty" id="board-empty" style="display:none;">
+          <strong>暂无数据</strong><p>当前周期内没有消费日志</p>
+        </div>
+      </div>
+      <div class="board-legend" id="board-legend"></div>
+    </section>
+    <script>
+    (function(){{
+      const limits={limits_json};
+      const limitRate=t=>{{
+        const p=t.period_seconds||1;
+        const bytes=((t.upload_bytes_limit||0)+(t.download_bytes_limit||0))/p;
+        const reqs=((t.upload_requests_limit||0)+(t.download_requests_limit||0))/p;
+        return {{bytes,reqs}};
+      }};
+      const palette=['#4F6DF5','#16A34A','#F59E0B','#EF4444','#8B5CF6','#06B6D4','#EC4899','#84CC16'];
+      const canvas=document.getElementById('board-chart');
+      const ctx=canvas.getContext('2d');
+      const emptyEl=document.getElementById('board-empty');
+      const legendEl=document.getElementById('board-legend');
+      const badgeEl=document.getElementById('board-badge');
+      let currentData=null;let autoTimer=null;let mode='realtime';
+
+      function fmtBytes(b){{if(!b)return '0 B';const u=['B','KB','MB','GB','TB'];
+        const i=Math.min(u.length-1,Math.floor(Math.log(b)/Math.log(1024)));
+        return (b/Math.pow(1024,i)).toFixed(i?1:0)+' '+u[i];}}
+      function fmtRate(bps){{return fmtBytes(bps)+'/s';}}
+      function bucketLabel(b){{return b.length>13?b.slice(5,16):b.slice(5,13);}}
+
+      function filteredSeries(data){{
+        const tid=document.getElementById('board-token-filter').value;
+        const prefix=document.getElementById('board-prefix-filter').value.trim().toLowerCase();
+        return data.series.filter(s=>{{
+          if(tid&&s.token_id!==tid)return false;
+          if(prefix&&prefix.length>=7&&!s.token_prefix.toLowerCase().includes(prefix))return false;
+          return true;
+        }});
+      }}
+
+      function draw(data){{
+        currentData=data;
+        const series=filteredSeries(data);
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        if(!series.length||!data.buckets.length){{
+          emptyEl.style.display='flex';legendEl.innerHTML='';return;
+        }}
+        emptyEl.style.display='none';
+        const W=canvas.width,H=canvas.height;
+        const pad={{l:72,r:24,t:20,b:44}};
+        const plotW=W-pad.l-pad.r,plotH=H-pad.t-pad.b;
+        let maxVal=0;
+        series.forEach(s=>s.bytes_per_second.forEach(v=>{{if(v>maxVal)maxVal=v;}}));
+        limits.forEach(t=>{{const lr=limitRate(t);if(lr.bytes>maxVal)maxVal=lr.bytes;}});
+        if(maxVal<=0)maxVal=1;
+        maxVal*=1.15;
+        ctx.strokeStyle='#E5E7EB';ctx.fillStyle='#6B7280';ctx.font='11px sans-serif';ctx.lineWidth=1;
+        for(let i=0;i<=4;i++){{
+          const y=pad.t+plotH*(1-i/4);
+          ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();
+          ctx.textAlign='right';ctx.fillText(fmtRate(maxVal*i/4),pad.l-8,y+4);
+        }}
+        const n=data.buckets.length;
+        const xAt=i=>pad.l+(n<=1?plotW/2:plotW*i/(n-1));
+        const step=Math.max(1,Math.ceil(n/8));
+        ctx.textAlign='center';
+        for(let i=0;i<n;i+=step){{
+          ctx.fillText(bucketLabel(data.buckets[i]),xAt(i),H-pad.b+18);
+        }}
+        let throttled=0;
+        series.forEach((s,idx)=>{{
+          const color=palette[idx%palette.length];
+          ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();
+          s.bytes_per_second.forEach((v,i)=>{{
+            const x=xAt(i),y=pad.t+plotH*(1-v/maxVal);
+            if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+          }});
+          ctx.stroke();
+          const total=s.bytes_per_second.reduce((a,b)=>a+b,0)/n;
+          const lim=limits.find(l=>l.token_id===s.token_id);
+          if(lim){{
+            const lr=limitRate(lim);
+            if(lr.bytes>0){{
+              ctx.strokeStyle=color;ctx.setLineDash([6,4]);ctx.lineWidth=1.5;ctx.globalAlpha=0.7;
+              const ly=pad.t+plotH*(1-lr.bytes/maxVal);
+              ctx.beginPath();ctx.moveTo(pad.l,ly);ctx.lineTo(W-pad.r,ly);ctx.stroke();
+              ctx.setLineDash([]);ctx.globalAlpha=1;
+              if(total>lr.bytes)throttled++;
+            }}
+          }}
+        }});
+        legendEl.innerHTML=series.map((s,idx)=>{{
+          const color=palette[idx%palette.length];
+          const lim=limits.find(l=>l.token_id===s.token_id);
+          const lr=lim?limitRate(lim):null;
+          return `<span class="legend-item"><i style="background:${{color}}"></i>${{s.token_prefix}} · ${{s.business_domain}}/${{s.department}}${{lr&&lr.bytes>0?' <small>限额 '+fmtRate(lr.bytes)+'</small>':''}}</span>`;
+        }}).join('');
+        badgeEl.textContent='被限流 '+throttled+' / 共 '+limits.length;
+      }}
+
+      function fetchRealtime(){{
+        const w=document.getElementById('board-window').value;
+        fetch('/admin/limit-board/rates?window='+w,{{headers:{{'Accept':'application/json'}}}})
+          .then(r=>r.json()).then(d=>draw(d)).catch(()=>{{}});
+      }}
+      function fetchHistory(){{
+        const s=document.getElementById('board-start').value;
+        const e=document.getElementById('board-end').value;
+        if(!s||!e)return;
+        fetch('/admin/limit-board/history?start='+encodeURIComponent(s)+'&end='+encodeURIComponent(e),
+          {{headers:{{'Accept':'application/json'}}}}).then(r=>r.json()).then(d=>draw(d)).catch(()=>{{}});
+      }}
+      function setAuto(on){{
+        const btn=document.getElementById('board-auto-toggle');
+        if(autoTimer){{clearInterval(autoTimer);autoTimer=null;}}
+        if(on&&mode==='realtime'){{
+          const secs=parseInt(document.getElementById('board-refresh').value,10)||30;
+          autoTimer=setInterval(fetchRealtime,secs*1000);
+          btn.classList.add('active');btn.textContent='自动刷新中';
+        }}else{{btn.classList.remove('active');btn.textContent='已暂停';}}
+      }}
+
+      document.querySelectorAll('.board-tabs button').forEach(btn=>btn.addEventListener('click',()=>{{
+        document.querySelectorAll('.board-tabs button').forEach(b=>b.classList.remove('active'));
+        btn.classList.add('active');mode=btn.dataset.mode;
+        document.querySelector('.board-realtime-controls').style.display=mode==='realtime'?'':'none';
+        document.querySelector('.board-history-controls').style.display=mode==='history'?'':'none';
+        setAuto(mode==='realtime');
+        if(mode==='history')fetchHistory();else fetchRealtime();
+      }}));
+      document.getElementById('board-window').addEventListener('change',fetchRealtime);
+      document.getElementById('board-refresh').addEventListener('change',()=>setAuto(true));
+      document.getElementById('board-auto-toggle').addEventListener('click',()=>setAuto(autoTimer===null));
+      document.getElementById('board-history-query').addEventListener('click',fetchHistory);
+      document.getElementById('board-token-filter').addEventListener('change',()=>{{if(currentData)draw(currentData);}});
+      document.getElementById('board-prefix-filter').addEventListener('input',()=>{{if(currentData)draw(currentData);}});
+      fetchRealtime();setAuto(true);
+    }})();
+    </script>"""
+    return HTMLResponse(_page("限额看板", body, session, settings, "limit-board"))
+
+
+@router.get("/limit-board/rates", response_class=JSONResponse)
+def limit_board_rates(
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    window: Annotated[int, Query(ge=1, le=24)] = 4,
+) -> JSONResponse:
+    end = datetime.now(UTC)
+    start = end - timedelta(hours=window)
+    bucket = "minute" if window <= 2 else "hour"
+    data = store.transfer_rate_series(start=start.isoformat(), end=end.isoformat(), bucket=bucket)
+    data["window"] = window
+    data["generated_at"] = end.isoformat()
+    return JSONResponse(data)
+
+
+@router.get("/limit-board/history", response_class=JSONResponse)
+def limit_board_history(
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    start: Annotated[str, Query()],
+    end: Annotated[str, Query()],
+) -> JSONResponse:
     try:
         start_iso = datetime.fromisoformat(start).replace(tzinfo=UTC).isoformat()
         end_iso = datetime.fromisoformat(end).replace(tzinfo=UTC).isoformat()
@@ -376,15 +573,9 @@ def limits_history(
         raise MorphLakeError("invalid_datetime", "开始/结束时间格式不正确", 400) from exc
     if start_iso > end_iso:
         raise MorphLakeError("invalid_date_range", "开始时间不得晚于结束时间", 400)
-    rows = store.transfer_rate_history(start=start_iso, end=end_iso, window_hours=window_hours)
-    result_rows = "".join(_history_rate_row(row) for row in rows) or _empty_row(6)
-    body = f"""<section class="panel"><div class="section-head"><div><h2>历史传输速率</h2>
-      <p>{html.escape(start)} → {html.escape(end)}，按 {window_hours} 小时分桶</p></div>
-      <a class="button secondary" href="/admin/limits">返回限额管理</a></div>
-      <div class="table-wrap"><table><thead><tr><th>小时桶</th><th>Key</th><th>业务范围</th>
-      <th>请求数</th><th>字节</th><th>速率</th></tr></thead>
-      <tbody>{result_rows}</tbody></table></div></section>"""
-    return HTMLResponse(_page("限额管理", body, session, settings, "limits"))
+    data = store.transfer_rate_series(start=start_iso, end=end_iso, bucket="hour")
+    data["generated_at"] = datetime.now(UTC).isoformat()
+    return JSONResponse(data)
 
 
 @router.get("/api/upload", response_class=HTMLResponse)
@@ -1305,7 +1496,7 @@ def _card(title: str, value: Any, note: str = "") -> str:
       <strong>{html.escape(str(value))}</strong><small>{html.escape(note)}</small></div>"""
 
 
-def _limit_row(row: dict[str, Any], csrf: str) -> str:
+def _limit_row(row: dict[str, Any]) -> str:
     token_id = html.escape(row["token_id"])
     prefix = html.escape(row["token_prefix"])
     scope = (
@@ -1320,43 +1511,11 @@ def _limit_row(row: dict[str, Any], csrf: str) -> str:
         ("download_bytes_limit", "download_bytes_limit", 0),
     )
     cells = "".join(
-        f"""<td><input class="limit-input" form="limit-form-{token_id}" type="number"
-          name="{name}" value="{row[key]}" min="{minimum}" required></td>"""
+        f"""<td><input class="limit-input" type="number"
+          name="limits[{token_id}][{name}]" value="{row[key]}" min="{minimum}" required></td>"""
         for name, key, minimum in fields
     )
-    return f"""<tr><td><code>{prefix}</code></td><td>{scope}</td>{cells}
-      <td><form id="limit-form-{token_id}" method="post"
-      action="/admin/tokens/{token_id}/limits"><input type="hidden" name="csrf"
-      value="{csrf}"><button form="limit-form-{token_id}">保存</button></form></td></tr>"""
-
-
-def _rate_panel(window: int, rows: list[dict[str, Any]]) -> str:
-    body = (
-        "".join(
-            f"""<tr><td><code>{html.escape(row["token_prefix"])}</code></td>
-        <td>{html.escape(row["business_domain"])}/{html.escape(row["department"])}</td>
-        <td>{row["request_count"]}</td><td>{html.escape(_human_bytes(row["byte_count"]))}</td>
-        <td>{row["bytes_per_second"]:.2f} B/s</td></tr>"""
-            for row in rows
-        )
-        or '<tr><td colspan="5" class="empty">窗口内无传输</td></tr>'
-    )
-    return f"""<section class="panel rate-panel" id="rate-panel-{window}">
-      <div class="section-head"><div><h3>近 {window} 小时</h3>
-      <span class="hint" id="rate-meta-{window}"></span></div></div>
-      <div class="table-wrap"><table><thead><tr><th>Key</th><th>业务范围</th><th>请求数</th>
-      <th>字节</th><th>速率</th></tr></thead><tbody>{body}</tbody></table></div></section>"""
-
-
-def _history_rate_row(row: dict[str, Any]) -> str:
-    try:
-        bucket = _browser_datetime(datetime.fromisoformat(row["hour_bucket"] + ":00:00+00:00"))
-    except ValueError:
-        bucket = html.escape(row["hour_bucket"])
-    return f"""<tr><td>{bucket}</td><td><code>{html.escape(row["token_prefix"])}</code></td>
-      <td>{html.escape(row["business_domain"])}/{html.escape(row["department"])}</td>
-      <td>{row["request_count"]}</td><td>{html.escape(_human_bytes(row["byte_count"]))}</td>
-      <td>{row["bytes_per_second"]:.2f} B/s</td></tr>"""
+    return f"<tr><td><code>{prefix}</code></td><td>{scope}</td>{cells}</tr>"
 
 
 def _transfer_detail_rows(rows: list[dict[str, Any]]) -> str:
@@ -1444,7 +1603,8 @@ def _page(
             [
                 ("dashboard", "工作台", "/admin"),
                 ("tokens", "Key 管理", "/admin/tokens"),
-                ("limits", "限额管理", "/admin/limits"),
+                ("limits", "限额配置", "/admin/limits"),
+                ("limit-board", "限额看板", "/admin/limit-board"),
             ],
         ),
         (
@@ -1642,7 +1802,9 @@ _CSS = """
 .topbar{height:64px;background:var(--white);border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 20px;position:fixed;z-index:20;top:0;left:0;right:0}.brand{display:flex;align-items:center;gap:8px;color:var(--ink);text-decoration:none}.brand b{font-size:16px}.brand em{font-style:normal;color:var(--muted);border-left:1px solid var(--line);padding-left:9px}.logo-mark{display:grid;place-items:center;width:44px;height:44px;border-radius:12px;background:var(--blue);color:#fff;font-weight:800;font-size:20px}.logo-mark.small{width:32px;height:32px;border-radius:9px;font-size:14px}.top-actions{display:flex;align-items:center;gap:8px;color:var(--muted)}.top-actions form{margin:0}.api-target{padding:4px 9px;background:#f2f3f5;border-radius:16px;font-size:11px}.avatar{display:grid;place-items:center;width:28px;height:28px;background:#eef2ff;color:var(--blue2);border-radius:50%;font-weight:700}.link-button{border:0;background:transparent;color:var(--muted);padding:5px 7px;cursor:pointer}
 .sidebar{position:fixed;z-index:10;top:64px;bottom:0;left:0;width:var(--sidebar);background:var(--white);border-right:1px solid var(--line);padding:12px 8px;overflow:auto}.nav-group{margin-bottom:13px}.nav-group small{display:block;color:#8a93a3;font-size:11px;letter-spacing:.04em;padding:6px 12px}.nav-group a{display:flex;align-items:center;gap:9px;color:#4f596b;text-decoration:none;padding:8px 11px;margin:3px 0;border-radius:7px;transition:.15s}.nav-group a:hover{background:#f4f6fb;color:var(--blue2)}.nav-group a.active{background:#eef2ff;color:var(--blue2);font-weight:600}.nav-dot{width:6px;height:6px;border-radius:50%;background:#a5adba}.active .nav-dot{background:var(--blue);box-shadow:0 0 0 3px #3b65f620}
 .content{margin-left:var(--sidebar);padding:80px 18px 28px;max-width:1720px}.page-head{display:flex;justify-content:space-between;align-items:end;margin-bottom:12px}.page-head h1{font-size:22px;line-height:1.3;margin:1px 0}.eyebrow{color:var(--blue);font-size:9px;font-weight:800;letter-spacing:.12em}.panel,.intro,.quick,.card{background:var(--white);border:1px solid var(--line);border-radius:16px;box-shadow:0 1px 2px #1c243408}.panel{padding:16px;margin:0 0 12px}.panel h2,.intro h2{margin:0 0 4px;font-size:16px}.panel p,.intro p{color:var(--muted);margin:3px 0 11px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.intro{padding:14px 16px;margin-bottom:12px}.intro p{margin-bottom:0}
-.cards{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-bottom:12px}.card{padding:14px}.card span,.card small{display:block;color:var(--muted)}.card strong{display:block;font-size:24px;margin:3px 0}.rate-grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:10px}.rate-panel{padding:12px;margin:0}.rate-panel h3{margin:0 0 2px;font-size:14px}.limit-input{width:96px;min-width:96px}.welcome{display:flex;justify-content:space-between;align-items:center;padding:18px}.welcome p{margin-bottom:0}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick{display:flex;flex-direction:column;padding:16px;text-decoration:none;color:var(--ink);transition:.15s}.quick:hover{border-color:#c8d3fa;background:#fbfcff}.quick strong{font-size:15px}.quick span{color:var(--muted);margin:5px 0 10px}.quick b{color:var(--blue);font-size:12px}
+.cards{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-bottom:12px}.card{padding:14px}.card span,.card small{display:block;color:var(--muted)}.card strong{display:block;font-size:24px;margin:3px 0}.limit-input{width:96px;min-width:96px}
+.board-panel{padding:0;overflow:hidden}.board-head{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;padding:16px 20px 12px;border-bottom:1px solid var(--border)}.board-title{display:flex;align-items:center;gap:10px}.board-title h2{margin:0;font-size:18px}.board-icon{font-size:18px}.board-badge{background:#DCFCE7;color:#166534;border-radius:12px;padding:2px 10px;font-size:12px;font-weight:600}.board-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.board-tabs{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}.board-tabs button{border:none;background:#fff;padding:6px 16px;cursor:pointer;font-size:13px;color:var(--muted)}.board-tabs button.active{background:var(--blue2);color:var(--blue);font-weight:600}.board-controls select,.board-controls input[type=datetime-local]{border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:13px;background:#fff}.board-controls button{border:1px solid var(--border);background:#fff;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px}.board-controls button.active{background:#EFF6FF;color:#2563EB;border-color:#BFDBFE;font-weight:600}
+.board-filters{display:flex;align-items:center;gap:10px;padding:10px 20px;border-bottom:1px solid var(--border);background:#FAFAFA}.filter-label{color:var(--muted);font-size:13px}.board-filters select,.board-filters input{border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:13px;min-width:160px}.board-chart-wrap{position:relative;padding:16px 20px;min-height:320px}#board-chart{width:100%;height:auto;display:block}.board-empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:var(--muted)}.board-empty strong{font-size:18px;color:var(--text)}.board-legend{display:flex;flex-wrap:wrap;gap:14px;padding:0 20px 16px}.legend-item{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text)}.legend-item i{width:14px;height:3px;border-radius:2px;display:inline-block}.legend-item small{color:var(--muted)}.welcome{display:flex;justify-content:space-between;align-items:center;padding:18px}.welcome p{margin-bottom:0}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick{display:flex;flex-direction:column;padding:16px;text-decoration:none;color:var(--ink);transition:.15s}.quick:hover{border-color:#c8d3fa;background:#fbfcff}.quick strong{font-size:15px}.quick span{color:var(--muted);margin:5px 0 10px}.quick b{color:var(--blue);font-size:12px}
 .grid-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 12px}.grid-form>label{flex:1 1 185px;min-width:160px;max-width:300px}.grid-form>.wide{flex:2 1 360px;max-width:none}.grid-form>.token-field{flex-basis:100%;max-width:none}.grid-form>.form-actions{flex:0 0 auto;min-width:auto;max-width:none}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}.wide{min-width:0}label{display:block;color:#515b6d;font-size:12px;font-weight:600}input,textarea,select{display:block;width:100%;height:34px;margin-top:4px;padding:5px 9px;border:1px solid #d7dbe3;border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;line-height:1.35;outline:none}input[type=file]{padding:4px 7px}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px #3b65f618}textarea{height:64px;min-height:64px;resize:vertical;padding-top:7px}label small,.hint{color:var(--muted);font-size:11px;font-weight:400}.token-field{padding:9px 11px;background:#f7f8fb;border-radius:9px}.form-actions{display:flex;align-items:center;gap:8px;min-height:34px}
 .key-view{display:grid;grid-template-columns:auto;gap:4px;margin-bottom:4px}.key-view button{min-height:30px;padding:4px 8px}.admin-key{background:#eef2ff;color:var(--blue2)}
 button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;border:0;border-radius:7px;background:var(--blue);color:#fff;padding:6px 13px;text-decoration:none;font-family:inherit;font-size:13px;font-weight:600;line-height:1.2;cursor:pointer}button:hover,.button:hover{background:var(--blue2)}button:disabled{cursor:wait;opacity:.7}.secondary{background:#f1f3f7;color:#46536a}.secondary:hover{background:#e7eaf0;color:#253047}.danger{background:#fff0f1;color:var(--red)}.danger:hover{background:#ffe4e6}.inline{display:inline}.spinner{display:inline-block;width:13px;height:13px;margin-right:7px;border:2px solid #ffffff70;border-top-color:#fff;border-radius:50%;vertical-align:-2px;animation:spin .72s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
@@ -1650,5 +1812,5 @@ button,.button{display:inline-flex;align-items:center;justify-content:center;min
 .table-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-top:12px}.page-size-form{display:flex;align-items:flex-end;gap:6px}.page-size-form label{min-width:105px}.page-size-form select{height:30px;margin-top:2px}.page-size-form button{min-height:30px;padding:4px 9px}.pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px}.page-link{padding:5px 10px;border-radius:7px;background:#f1f3f7;text-decoration:none}.page-link.disabled{color:#a5adba;background:#f7f8fa}.notice-success{padding:9px 12px;margin-bottom:12px;border:1px solid #bce5ca;border-radius:8px;background:#edf9f1;color:var(--green)}
 .media-modal{width:min(920px,92vw);max-height:88vh;padding:0;border:0;border-radius:16px;box-shadow:0 24px 70px #10182755}.media-modal::backdrop{background:#10182799}.modal-head{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line)}.modal-head h2{margin:0;font-size:16px}.modal-close{width:30px;height:30px;min-height:30px;padding:0;border-radius:50%;background:#f1f3f7;color:var(--ink);font-size:20px}.modal-body{padding:16px;max-height:calc(88vh - 55px);overflow:auto}.modal-image{display:block;max-width:100%;max-height:72vh;margin:auto;border-radius:8px}.modal-body audio{display:block;width:min(680px,100%);margin:30px auto}.text-preview{display:grid;gap:12px}.text-preview section{padding:13px;border:1px solid var(--line);border-radius:10px}.text-preview h3{margin:0 0 7px}.text-preview p{white-space:pre-wrap}.text-preview pre{max-height:50vh}.empty{text-align:center!important;color:var(--muted);padding:24px!important}.status-pill{display:inline-block;padding:3px 8px;border-radius:16px;background:#f1f3f7;font-size:11px}.match-rate{color:var(--green);font-weight:600}.status-pill.ok,.status-pill.active{background:#e7f8ee;color:var(--green)}.status-pill.error,.status-pill.deleted{background:#fff0f1;color:var(--red)}.status-pill.disabled{background:#fff6dc;color:var(--amber)}.result-head{margin-bottom:9px}.tabs{display:flex;gap:6px}.tabs a{padding:4px 8px;background:#f1f3f7;border-radius:7px;text-decoration:none}.limit-form{min-width:310px;display:grid;grid-template-columns:1fr 1fr;gap:7px;padding:10px}.alert{padding:9px 12px;background:#fff7e8;border:1px solid #f1d59b;border-radius:8px;color:#775310;margin-bottom:11px}pre{white-space:pre-wrap;word-break:break-all;background:#151a24;color:#dbe7ff;padding:13px;border-radius:9px;max-height:460px;overflow:auto}.secret{font-size:14px}.token-created{text-align:center;max-width:720px;margin:30px auto}.success-mark{display:grid;place-items:center;width:46px;height:46px;margin:0 auto 10px;border-radius:50%;background:#e7f8ee;color:var(--green);font-size:23px}
 .login-body{min-height:100vh;background:#f4f5f7;display:grid;place-items:center;padding:20px}.login-shell{width:min(860px,100%);display:grid;grid-template-columns:1fr .9fr;overflow:hidden;border:1px solid var(--line);border-radius:18px;background:#fff;box-shadow:0 18px 55px #27324a18}.login-brand{color:#fff;padding:52px 44px;background:#315ee8}.login-brand .eyebrow{color:#dbe4ff}.login-brand h1{font-size:31px;line-height:1.25;margin:18px 0 10px}.login-brand p{color:#dbe4ff}.login-card{background:#fff;padding:44px 40px;display:flex;flex-direction:column;justify-content:center}.login-card h2{font-size:22px;margin:5px 0}.login-card p{color:var(--muted);margin:0 0 15px}.login-card form{display:grid;gap:11px}.login-button{width:100%;margin-top:3px}.login-card>small{color:var(--muted);margin-top:14px;text-align:center}
-@media(max-width:1000px){.cards{grid-template-columns:repeat(2,1fr)}.rate-grid{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}.grid-form>label{max-width:none}}@media(max-width:760px){.topbar{padding:0 12px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:64px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 7px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:7px 9px}.content{margin-left:0;padding:124px 10px 24px}.grid-form{display:grid;grid-template-columns:1fr}.grid-form>label,.grid-form>.wide,.grid-form>.form-actions{max-width:none}.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.rate-grid{grid-template-columns:1fr}.welcome{align-items:flex-start;gap:14px;flex-direction:column}.table-footer{align-items:stretch;flex-direction:column}.pagination{justify-content:flex-start}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:34px 25px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}
+@media(max-width:1000px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}.grid-form>label{max-width:none}}@media(max-width:760px){.topbar{padding:0 12px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:64px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 7px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:7px 9px}.content{margin-left:0;padding:124px 10px 24px}.grid-form{display:grid;grid-template-columns:1fr}.grid-form>label,.grid-form>.wide,.grid-form>.form-actions{max-width:none}.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.welcome{align-items:flex-start;gap:14px;flex-direction:column}.table-footer{align-items:stretch;flex-direction:column}.pagination{justify-content:flex-start}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:34px 25px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}
 """

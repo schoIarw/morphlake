@@ -947,6 +947,94 @@ class AdminStore:
             history.append(item)
         return history
 
+    def transfer_rate_series(self, *, start: str, end: str, bucket: str = "hour") -> dict[str, Any]:
+        """Time-series of per-key transfer rates over [start, end].
+
+        Buckets are either hourly (substr length 13) or per-minute (length 16).
+        The full bucket axis is materialized and missing buckets are zero-filled
+        so every series has the same length as ``buckets``. Each row carries
+        byte_count, request_count and bytes_per_second aligned by bucket.
+        """
+        if bucket not in ("hour", "minute"):
+            raise MorphLakeError("invalid_bucket", "bucket must be hour or minute", 400)
+        length = 13 if bucket == "hour" else 16
+        bucket_seconds = 3600 if bucket == "hour" else 60
+        bucket_expr = func.substr(TRANSFER_EVENTS.c.occurred_at, 1, length)
+        statement = (
+            select(
+                bucket_expr.label("bucket"),
+                TRANSFER_EVENTS.c.token_id,
+                TRANSFER_EVENTS.c.token_prefix,
+                TRANSFER_EVENTS.c.business_domain,
+                TRANSFER_EVENTS.c.department,
+                func.count().label("request_count"),
+                func.sum(TRANSFER_EVENTS.c.byte_count).label("byte_count"),
+            )
+            .where(
+                and_(
+                    TRANSFER_EVENTS.c.occurred_at >= start,
+                    TRANSFER_EVENTS.c.occurred_at <= end,
+                )
+            )
+            .group_by(
+                bucket_expr,
+                TRANSFER_EVENTS.c.token_id,
+                TRANSFER_EVENTS.c.token_prefix,
+                TRANSFER_EVENTS.c.business_domain,
+                TRANSFER_EVENTS.c.department,
+            )
+            .order_by(bucket_expr.asc())
+        )
+        with self._engine_required().connect() as connection:
+            rows = connection.execute(statement).mappings().all()
+        try:
+            start_dt = datetime.fromisoformat(start)
+            end_dt = datetime.fromisoformat(end)
+        except ValueError as exc:
+            raise MorphLakeError(
+                "invalid_datetime", "start/end must be ISO timestamps", 400
+            ) from exc
+        if bucket == "hour":
+            start_dt = start_dt.replace(minute=0, second=0, microsecond=0)
+            step = timedelta(hours=1)
+        else:
+            start_dt = start_dt.replace(second=0, microsecond=0)
+            step = timedelta(minutes=1)
+        buckets: list[str] = []
+        cur = start_dt
+        while cur <= end_dt:
+            buckets.append(cur.isoformat()[:length])
+            cur += step
+        series_map: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            tid = row["token_id"]
+            if tid not in series_map:
+                series_map[tid] = {
+                    "token_id": tid,
+                    "token_prefix": row["token_prefix"],
+                    "business_domain": row["business_domain"],
+                    "department": row["department"],
+                    "byte_count": {b: 0 for b in buckets},
+                    "request_count": {b: 0 for b in buckets},
+                }
+            series_map[tid]["byte_count"][row["bucket"]] = int(row["byte_count"] or 0)
+            series_map[tid]["request_count"][row["bucket"]] = int(row["request_count"] or 0)
+        series = []
+        for tid, s in series_map.items():
+            byte_values = [s["byte_count"][b] for b in buckets]
+            series.append(
+                {
+                    "token_id": tid,
+                    "token_prefix": s["token_prefix"],
+                    "business_domain": s["business_domain"],
+                    "department": s["department"],
+                    "byte_count": byte_values,
+                    "request_count": [s["request_count"][b] for b in buckets],
+                    "bytes_per_second": [round(v / bucket_seconds, 2) for v in byte_values],
+                }
+            )
+        return {"buckets": buckets, "series": series, "bucket_seconds": bucket_seconds}
+
     def recent_transfers(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._engine_required().connect() as connection:
             rows = (

@@ -434,7 +434,7 @@ def test_admin_is_independent_and_exports_metrics(tmp_path: Path):
     assert metrics.headers["x-content-type-options"] == "nosniff"
 
 
-def test_limits_page_splits_menu_and_shows_rates_and_history(tmp_path: Path):
+def test_limits_config_unified_save_and_limit_board(tmp_path: Path):
     client, store, _ = build_admin(tmp_path)
     created = store.create_token(
         business_domain="risk",
@@ -463,59 +463,74 @@ def test_limits_page_splits_menu_and_shows_rates_and_history(tmp_path: Path):
         user_agent="pytest-agent",
     )
     login(client)
+
+    # 限额配置页：统一保存按钮，无每行保存，无速率面板
     page = client.get("/admin/limits")
     assert page.status_code == 200
-    assert 'href="/admin/limits"' in page.text
-    assert "近 1 小时" in page.text
-    assert "近 8 小时" in page.text
-    assert 'id="limit-form-' in page.text
-    assert 'action="/admin/limits/history"' in page.text
-    assert "setInterval(refresh,30000)" in page.text
+    assert "保存全部限额" in page.text
+    assert 'form="limit-form-' not in page.text
+    assert "rate-panel" not in page.text
+    assert "limits[" in page.text
 
-    rates = client.get("/admin/limits/rates?window=2")
-    assert rates.status_code == 200
-    payload = rates.json()
-    assert payload["window"] == 2
-    assert payload["rows"][0]["request_count"] == 1
-    assert payload["rows"][0]["byte_count"] == 2048
-    assert payload["rows"][0]["bytes_per_second"] > 0
-
+    # 统一保存所有 key 的限额
     csrf = page.text.split('name="csrf" value="', 1)[1].split('"', 1)[0]
-    history = client.post(
-        "/admin/limits/history",
+    token_id = next(row["token_id"] for row in store.list_tokens())
+    saved = client.post(
+        "/admin/limits/save",
         data={
             "csrf": csrf,
-            "start": "2026-09-09T00:00",
-            "end": "2026-09-09T23:59",
-            "window_hours": "1",
+            f"limits[{token_id}][period_seconds]": "120",
+            f"limits[{token_id}][upload_requests_limit]": "20",
+            f"limits[{token_id}][download_requests_limit]": "30",
+            f"limits[{token_id}][upload_bytes_limit]": "12000",
+            f"limits[{token_id}][download_bytes_limit]": "12000",
         },
+        follow_redirects=False,
     )
-    assert history.status_code == 200
-    assert "B/s" in history.text
-    assert "browser-datetime" in history.text
+    assert saved.status_code == 303
+    assert saved.headers["location"] == "/admin/limits"
+    assert store.list_tokens()[0]["period_seconds"] == 120
 
+    # 限额看板页
+    board = client.get("/admin/limit-board")
+    assert board.status_code == 200
+    assert "限额看板" in board.text
+    assert 'data-mode="realtime"' in board.text
+    assert 'data-mode="history"' in board.text
+    assert 'id="board-chart"' in board.text
+    assert "board-token-filter" in board.text
+    assert "board-prefix-filter" in board.text
+    assert "board-auto-toggle" in board.text
+    assert "board-badge" in board.text
+
+    # 看板实时 JSON
+    rates = client.get("/admin/limit-board/rates?window=4")
+    assert rates.status_code == 200
+    payload = rates.json()
+    assert payload["window"] == 4
+    assert len(payload["buckets"]) >= 2
+    assert len(payload["series"]) == 1
+    assert sum(payload["series"][0]["byte_count"]) == 2048
+    assert any(v > 0 for v in payload["series"][0]["bytes_per_second"])
+
+    # 看板历史 JSON
+    history = client.get("/admin/limit-board/history?start=2026-09-09T00:00&end=2026-09-09T23:59")
+    assert history.status_code == 200
+    hist = history.json()
+    assert len(hist["buckets"]) == 24
+    assert len(hist["series"]) == 1
+
+    # Key 管理页无限流列
     tokens_page = client.get("/admin/tokens").text
     assert "<th>限流</th>" not in tokens_page
     assert "key-copy" in tokens_page
 
+    # 传输统计页 IP 列
     transfers = client.get("/admin/transfers").text
     assert "<th>IP</th>" in transfers
     assert "10.0.0.8" in transfers
     assert "<th>User-Agent</th>" in transfers
 
-    token_id = next(row["token_id"] for row in store.list_tokens())
-    updated = client.post(
-        f"/admin/tokens/{token_id}/limits",
-        data={
-            "csrf": csrf,
-            "period_seconds": "120",
-            "upload_requests_limit": "11",
-            "download_requests_limit": "22",
-            "upload_bytes_limit": "1100",
-            "download_bytes_limit": "2200",
-        },
-        follow_redirects=False,
-    )
-    assert updated.status_code == 303
-    assert updated.headers["location"] == "/admin/limits"
-    assert store.list_tokens()[0]["period_seconds"] == 120
+    # 导航包含两个独立菜单
+    assert 'href="/admin/limits"' in board.text
+    assert 'href="/admin/limit-board"' in board.text

@@ -189,3 +189,31 @@ def test_transfer_rate_history_buckets_by_hour(tmp_path: Path):
     assert history[0]["byte_count"] == 2048
     assert history[0]["hour_bucket"] == now.isoformat()[:13]
     assert history[0]["bytes_per_second"] == round(2048 / 3600, 2)
+
+
+def test_transfer_rate_series_zero_fills_buckets(tmp_path: Path):
+    store = make_store(tmp_path)
+    identity = store.authenticate(create_token(store).plaintext)
+    store.record_transfer(
+        identity=identity,
+        operation="upload",
+        filename="report.pdf",
+        byte_count=2048,
+        duration_ms=100,
+        status="success",
+        file_id="file-1",
+        media_type="document",
+    )
+    now = datetime.now(UTC)
+    start = (now - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
+    end = now
+    data = store.transfer_rate_series(start=start.isoformat(), end=end.isoformat(), bucket="hour")
+    assert len(data["buckets"]) >= 2
+    assert len(data["series"]) == 1
+    series = data["series"][0]
+    assert len(series["byte_count"]) == len(data["buckets"])
+    assert sum(series["byte_count"]) == 2048
+    assert any(v == 0 for v in series["byte_count"])
+    assert any(v > 0 for v in series["bytes_per_second"])
+    with pytest.raises(MorphLakeError, match="bucket"):
+        store.transfer_rate_series(start=start.isoformat(), end=end.isoformat(), bucket="day")
