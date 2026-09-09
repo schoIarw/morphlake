@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from morphlake.config import Settings
-from morphlake.errors import ConfigurationError
+from morphlake.errors import ConfigurationError, NotFoundError, StorageError
 from morphlake.partitioning import domain_shard
 from morphlake.services.paimon_store import PaimonStore
 
@@ -349,3 +350,188 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
     incompatible = settings.model_copy(update={"text_vector_dimension": 8})
     with pytest.raises(ConfigurationError, match="dimension must be 8"):
         PaimonStore(incompatible).initialize()
+
+
+def test_list_assets_page_paginates_by_offset_without_full_load(tmp_path: Path):
+    settings = Settings(
+        PAIMON_WAREHOUSE=str(tmp_path / "warehouse"),
+        PAIMON_DATABASE="morphlake_test",
+        PAIMON_TABLE="assets",
+        PAIMON_TEXT_TABLE="text_segments",
+        PAIMON_IMAGE_TABLE="image_features",
+        PAIMON_AUDIO_TABLE="audio_features",
+        PAIMON_AUDIT_TABLE="transfer_audit",
+        PAIMON_DELETION_TABLE="file_deletions",
+        PAIMON_TEXT_VECTOR_DIMENSION=4,
+        PAIMON_IMAGE_VECTOR_DIMENSION=4,
+        PAIMON_AUDIO_VECTOR_DIMENSION=4,
+        PAIMON_VECTOR_INDEX_TYPE="ivf-sq",
+    )
+    store = PaimonStore(settings)
+    store.initialize()
+    shard = domain_shard("risk", settings.paimon_domain_shards)
+    for index in range(5):
+        created = f"2026-08-{30 - index:02d}T00:00:00+00:00"
+        store.add(
+            asset={
+                "file_id": f"file-{index}",
+                "business_domain": "risk",
+                "department": "audit",
+                "domain_shard": shard,
+                "ingest_date": created[:10],
+                "created_at": created,
+                "filename": f"report-{index}.txt",
+                "media_type": "document",
+                "content_type": "text/plain",
+                "file_size": 12,
+                "object_bucket": "data",
+                "object_key": f"risk/report-{index}.txt",
+                "object_etag": "etag",
+                "chunk_count": 0,
+                "content_sha256": "abc",
+            },
+            text_segments=[],
+            image_features=[],
+            audio_features=[],
+        )
+    page_0, total_0 = store.list_assets_page(
+        media_type=None,
+        business_domain="risk",
+        department="audit",
+        filename=None,
+        description=None,
+        start_date=None,
+        end_date=None,
+        limit=2,
+        offset=0,
+    )
+    page_1, total_1 = store.list_assets_page(
+        media_type=None,
+        business_domain="risk",
+        department="audit",
+        filename=None,
+        description=None,
+        start_date=None,
+        end_date=None,
+        limit=2,
+        offset=2,
+    )
+    page_2, total_2 = store.list_assets_page(
+        media_type=None,
+        business_domain="risk",
+        department="audit",
+        filename=None,
+        description=None,
+        start_date=None,
+        end_date=None,
+        limit=2,
+        offset=4,
+    )
+    beyond, total_beyond = store.list_assets_page(
+        media_type=None,
+        business_domain="risk",
+        department="audit",
+        filename=None,
+        description=None,
+        start_date=None,
+        end_date=None,
+        limit=2,
+        offset=10,
+    )
+    assert total_0 == total_1 == total_2 == total_beyond == 5
+    assert [row["file_id"] for row in page_0] == ["file-0", "file-1"]
+    assert [row["file_id"] for row in page_1] == ["file-2", "file-3"]
+    assert [row["file_id"] for row in page_2] == ["file-4"]
+    assert beyond == []
+
+
+def test_add_compensates_half_published_asset_with_tombstone(tmp_path: Path, monkeypatch):
+    settings = Settings(
+        PAIMON_WAREHOUSE=str(tmp_path / "warehouse"),
+        PAIMON_DATABASE="morphlake_test",
+        PAIMON_TABLE="assets",
+        PAIMON_TEXT_TABLE="text_segments",
+        PAIMON_IMAGE_TABLE="image_features",
+        PAIMON_AUDIO_TABLE="audio_features",
+        PAIMON_AUDIT_TABLE="transfer_audit",
+        PAIMON_DELETION_TABLE="file_deletions",
+        PAIMON_TEXT_VECTOR_DIMENSION=4,
+        PAIMON_IMAGE_VECTOR_DIMENSION=4,
+        PAIMON_AUDIO_VECTOR_DIMENSION=4,
+        PAIMON_VECTOR_INDEX_TYPE="ivf-sq",
+    )
+    store = PaimonStore(settings)
+    store.initialize()
+    shard = domain_shard("risk", settings.paimon_domain_shards)
+    asset = {
+        "file_id": "file-1",
+        "business_domain": "risk",
+        "department": "audit",
+        "domain_shard": shard,
+        "ingest_date": "2026-08-30",
+        "created_at": "2026-08-30T00:00:00+00:00",
+        "filename": "report.txt",
+        "media_type": "document",
+        "content_type": "text/plain",
+        "file_size": 12,
+        "object_bucket": "data",
+        "object_key": "risk/report.txt",
+        "object_etag": "etag",
+        "chunk_count": 1,
+        "content_sha256": "abc",
+    }
+    real_require = store._require_table
+
+    def failing_require(table_key):
+        table = real_require(table_key)
+        if table_key == "text":
+            table = SimpleNamespace(
+                raw_table=table.raw_table,
+                add=lambda arrow: (_ for _ in ()).throw(RuntimeError("commit failed")),
+            )
+        return table
+
+    monkeypatch.setattr(store, "_require_table", failing_require)
+    with pytest.raises(StorageError, match="Paimon write failed"):
+        store.add(
+            asset=asset,
+            text_segments=[
+                {
+                    "segment_id": "file-1:summary",
+                    "file_id": "file-1",
+                    "business_domain": "risk",
+                    "department": "audit",
+                    "domain_shard": shard,
+                    "ingest_date": "2026-08-30",
+                    "created_at": "2026-08-30T00:00:00+00:00",
+                    "filename": "report.txt",
+                    "media_type": "document",
+                    "record_type": "file",
+                    "chunk_index": None,
+                    "content_text": "liquidity overview",
+                    "segment_type": "file_summary",
+                    "chunk_start": None,
+                    "chunk_end": None,
+                    "embedding_model": "test",
+                    "embedding_version": "1",
+                    "text_embedding": [1.0, 0.0, 0.0, 0.0],
+                }
+            ],
+            image_features=[],
+            audio_features=[],
+        )
+    with pytest.raises(NotFoundError, match="does not exist"):
+        store.get_asset("file-1")
+    page, total = store.list_assets_page(
+        media_type=None,
+        business_domain="risk",
+        department="audit",
+        filename=None,
+        description=None,
+        start_date=None,
+        end_date=None,
+        limit=10,
+        offset=0,
+    )
+    assert total == 0
+    assert page == []

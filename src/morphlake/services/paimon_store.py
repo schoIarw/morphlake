@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
@@ -15,6 +16,8 @@ from pypaimon.multimodal import connect
 from morphlake.config import Settings
 from morphlake.errors import ConfigurationError, NotFoundError, StorageError
 from morphlake.partitioning import domain_shard
+
+LOGGER = logging.getLogger(__name__)
 
 ASSET_TABLE = "asset"
 TEXT_TABLE = "text"
@@ -233,20 +236,45 @@ class PaimonStore:
         image_features: list[dict[str, Any]],
         audio_features: list[dict[str, Any]],
     ) -> None:
-        """Write features first, then publish the asset descriptor last."""
+        """Publish the asset descriptor and its searchable feature rows.
+
+        The asset row is committed first as the publish marker so a failed
+        feature commit can be compensated; all batches are converted to Arrow
+        and validated before any table commits so malformed rows can never
+        produce partial writes. If a commit still fails after the asset was
+        published, a deletion tombstone hides the half-published file so it
+        never surfaces in listings or searches.
+        """
         writes = (
+            (ASSET_TABLE, [asset], asset_schema(self.settings)),
             (TEXT_TABLE, text_segments, text_schema(self.settings)),
             (IMAGE_TABLE, image_features, image_schema(self.settings)),
             (AUDIO_TABLE, audio_features, audio_schema(self.settings)),
-            (ASSET_TABLE, [asset], asset_schema(self.settings)),
         )
+        prepared = []
+        for table_key, rows, schema in writes:
+            if not rows:
+                continue
+            try:
+                prepared.append((table_key, pa.Table.from_pylist(rows, schema=schema)))
+            except Exception as exc:
+                raise StorageError(
+                    f"Paimon write validation failed for {table_key}: {exc}"
+                ) from exc
+        committed: list[str] = []
         try:
             with self._lock:
-                for table_key, rows, schema in writes:
-                    if rows:
-                        arrow = pa.Table.from_pylist(rows, schema=schema)
-                        self._require_table(table_key).add(arrow)
+                for table_key, arrow in prepared:
+                    self._require_table(table_key).add(arrow)
+                    committed.append(table_key)
         except Exception as exc:
+            if ASSET_TABLE in committed:
+                try:
+                    self._write_tombstones([asset])
+                except Exception:
+                    LOGGER.exception(
+                        "Compensating tombstone failed for file_id=%s", asset["file_id"]
+                    )
             raise StorageError(f"Paimon write failed: {exc}") from exc
 
     def maintain_indexes(self) -> None:
@@ -362,10 +390,13 @@ class PaimonStore:
                 return [], 0
             predicates.append(builder.is_in("file_id", summary_file_ids))
         predicates.extend(self._date_predicates(builder, start_date, end_date))
-        rows = self._read(
+        # Pass 1: materialize only the narrow sort keys (file_id, created_at) to
+        # compute the exact total and the requested page's identifiers. Full
+        # rows are never loaded for the whole filtered set.
+        keys = self._read(
             ASSET_TABLE,
             PredicateBuilder.and_predicates(predicates),
-            columns=PUBLIC_COLUMNS,
+            columns=["file_id", "created_at"],
             limit=None,
         )
         deleted = self._deleted_file_ids_for_scope(
@@ -375,10 +406,24 @@ class PaimonStore:
             start_date=start_date,
             end_date=end_date,
         )
-        rows = [row for row in rows if row["file_id"] not in deleted]
-        rows.sort(key=lambda row: (row["created_at"], row["file_id"]), reverse=True)
-        total = len(rows)
-        return self._enrich_assets(rows[offset : offset + limit]), total
+        keys = [row for row in keys if row["file_id"] not in deleted]
+        total = len(keys)
+        keys.sort(key=lambda row: (row["created_at"], row["file_id"]), reverse=True)
+        page_ids = [row["file_id"] for row in keys[offset : offset + limit]]
+        if not page_ids:
+            return [], total
+        # Pass 2: fetch full rows only for the requested page, preserving the
+        # sorted order established in pass 1.
+        builder = self._builder(ASSET_TABLE)
+        page_rows = self._read(
+            ASSET_TABLE,
+            builder.is_in("file_id", page_ids),
+            columns=PUBLIC_COLUMNS,
+            limit=len(page_ids),
+        )
+        by_id = {row["file_id"]: row for row in page_rows}
+        items = [by_id[file_id] for file_id in page_ids if file_id in by_id]
+        return self._enrich_assets(items), total
 
     def get_asset(self, file_id: str) -> dict[str, Any]:
         builder = self._builder(ASSET_TABLE)
@@ -412,18 +457,22 @@ class PaimonStore:
         return [by_id[file_id] for file_id in file_ids]
 
     def delete_assets(self, assets: list[dict[str, Any]]) -> None:
-        if not assets:
-            return
+        """Record an append-only tombstone so every read path hides the files."""
+        try:
+            self._write_tombstones(assets)
+        except Exception as exc:
+            raise StorageError(f"Paimon deletion write failed: {exc}") from exc
+
+    def _deletion_rows(self, assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
         deleted_at = datetime.now(UTC).isoformat()
-        rows = [
+        return [
             {
                 "file_id": asset["file_id"],
                 "business_domain": asset["business_domain"],
                 "department": asset["department"],
-                "domain_shard": domain_shard(
-                    asset["business_domain"], self.settings.paimon_domain_shards
-                ),
-                "ingest_date": str(asset["created_at"])[:10],
+                "domain_shard": asset.get("domain_shard")
+                or domain_shard(asset["business_domain"], self.settings.paimon_domain_shards),
+                "ingest_date": asset.get("ingest_date") or str(asset["created_at"])[:10],
                 "deleted_at": deleted_at,
                 "filename": asset["filename"],
                 "media_type": asset["media_type"],
@@ -431,13 +480,15 @@ class PaimonStore:
             }
             for asset in assets
         ]
-        try:
-            with self._lock:
-                self._require_table(DELETION_TABLE).add(
-                    pa.Table.from_pylist(rows, schema=deletion_schema(self.settings))
-                )
-        except Exception as exc:
-            raise StorageError(f"Paimon deletion write failed: {exc}") from exc
+
+    def _write_tombstones(self, assets: list[dict[str, Any]]) -> None:
+        if not assets:
+            return
+        rows = self._deletion_rows(assets)
+        with self._lock:
+            self._require_table(DELETION_TABLE).add(
+                pa.Table.from_pylist(rows, schema=deletion_schema(self.settings))
+            )
 
     def get_preview(self, file_id: str, max_chars: int) -> dict[str, Any]:
         asset = self._enrich_assets([self.get_asset(file_id)])[0]
@@ -763,7 +814,7 @@ class PaimonStore:
     def _vector_preview(vector: Any) -> list[float] | None:
         if vector is None:
             return None
-        return [float(value) for value in vector[:8]]
+        return [float(value) for value in vector[:4]]
 
     def _read(
         self,

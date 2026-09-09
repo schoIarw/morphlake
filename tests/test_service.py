@@ -141,7 +141,7 @@ def test_image_upload_creates_summary_thumbnail_and_preview_vector(tmp_path: Pat
     )
     assert result["summary_text"].startswith("图片文件")
     assert result["thumbnail_available"] is True
-    assert len(result["embedding_preview"]) == 5
+    assert len(result["embedding_preview"]) == 4
     assert len(objects.values) == 2
     assert any(key.endswith(".thumbnail.jpg") for key in objects.values)
     assert catalog.text_segments[0]["segment_type"] == "file_summary"
@@ -166,7 +166,7 @@ def test_audio_upload_always_has_text_summary(tmp_path: Path):
         department="audit",
     )
     assert "未配置语音转写模型" in result["summary_text"]
-    assert len(result["embedding_preview"]) == 6
+    assert len(result["embedding_preview"]) == 4
     assert catalog.text_segments[0]["segment_type"] == "file_summary"
     assert catalog.audio_features[0]["content_text"] == result["summary_text"]
 
@@ -183,6 +183,24 @@ def test_upload_compensates_object_on_paimon_failure(tmp_path: Path):
             department="audit",
         )
     assert len(objects.deleted) == 1
+
+
+def test_upload_cleanup_failure_does_not_mask_original_error(tmp_path: Path):
+    objects = FakeObjects()
+
+    def delete(key):
+        raise RuntimeError("minio unavailable")
+
+    objects.delete = delete
+    service = MorphLakeService(settings(), objects, FakeCatalog(fail=True), models(tmp_path))
+    with pytest.raises(RuntimeError, match="commit failed"):
+        service.upload(
+            filename="report.txt",
+            content_type="text/plain",
+            body=b"content",
+            business_domain="risk",
+            department="audit",
+        )
 
 
 def test_upload_rejects_empty_body(tmp_path: Path):

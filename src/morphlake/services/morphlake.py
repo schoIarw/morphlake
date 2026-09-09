@@ -109,9 +109,17 @@ class MorphLakeService:
             )
             return asset
         except Exception:
+            # Best-effort object cleanup: a cleanup failure must not mask the
+            # original upload error, so each removal is logged and swallowed.
             if thumbnail_stored is not None:
-                self.objects.delete(thumbnail_stored.key)
-            self.objects.delete(object_key)
+                try:
+                    self.objects.delete(thumbnail_stored.key)
+                except Exception:
+                    LOGGER.exception("Thumbnail cleanup failed for object %s", thumbnail_stored.key)
+            try:
+                self.objects.delete(object_key)
+            except Exception:
+                LOGGER.exception("Object cleanup failed for object %s", object_key)
             raise
 
     def list_assets(self, **filters):
@@ -502,5 +510,5 @@ class MorphLakeService:
             (text_segments, "text_embedding"),
         ):
             if rows:
-                return [float(value) for value in rows[0][column][:8]]
+                return [float(value) for value in rows[0][column][:4]]
         return None
