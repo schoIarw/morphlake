@@ -855,6 +855,98 @@ class AdminStore:
             rows = connection.execute(statement).mappings().all()
         return [dict(row) for row in rows]
 
+    def transfer_rates(self, window_hours: int) -> list[dict[str, Any]]:
+        """Aggregate the transfer log over the last N hours per key.
+
+        Returns one row per token with request/byte counts and the realized
+        transfer rate in bytes per second across the window, ordered by bytes
+        descending. occurred_at is a uniform UTC ISO string, so lexicographic
+        comparison is a valid time filter.
+        """
+        if window_hours < 1:
+            raise MorphLakeError("invalid_window", "window_hours must be >= 1", 400)
+        start = (datetime.now(UTC) - timedelta(hours=window_hours)).isoformat()
+        statement = (
+            select(
+                TRANSFER_EVENTS.c.token_id,
+                TRANSFER_EVENTS.c.token_prefix,
+                TRANSFER_EVENTS.c.business_domain,
+                TRANSFER_EVENTS.c.department,
+                func.count().label("request_count"),
+                func.sum(TRANSFER_EVENTS.c.byte_count).label("byte_count"),
+                func.sum(TRANSFER_EVENTS.c.duration_ms).label("duration_ms"),
+            )
+            .where(TRANSFER_EVENTS.c.occurred_at >= start)
+            .group_by(
+                TRANSFER_EVENTS.c.token_id,
+                TRANSFER_EVENTS.c.token_prefix,
+                TRANSFER_EVENTS.c.business_domain,
+                TRANSFER_EVENTS.c.department,
+            )
+            .order_by(func.sum(TRANSFER_EVENTS.c.byte_count).desc())
+        )
+        with self._engine_required().connect() as connection:
+            rows = connection.execute(statement).mappings().all()
+        seconds = window_hours * 3600
+        rates = []
+        for row in rows:
+            item = dict(row)
+            item["byte_count"] = int(item["byte_count"] or 0)
+            item["request_count"] = int(item["request_count"] or 0)
+            item["bytes_per_second"] = round(item["byte_count"] / seconds, 2)
+            rates.append(item)
+        return rates
+
+    def transfer_rate_history(
+        self, *, start: str, end: str, window_hours: int = 1
+    ) -> list[dict[str, Any]]:
+        """Historical per-key rates bucketed by hour.
+
+        occurred_at is truncated to the hour bucket, so each row carries the
+        bucket, the token, request/byte counts, and the realized bytes/second
+        over that bucket's window. Rows are ordered newest bucket first, then
+        by bytes descending within the bucket.
+        """
+        if window_hours < 1:
+            raise MorphLakeError("invalid_window", "window_hours must be >= 1", 400)
+        hour_bucket = func.substr(TRANSFER_EVENTS.c.occurred_at, 1, 13)
+        statement = (
+            select(
+                hour_bucket.label("hour_bucket"),
+                TRANSFER_EVENTS.c.token_id,
+                TRANSFER_EVENTS.c.token_prefix,
+                TRANSFER_EVENTS.c.business_domain,
+                TRANSFER_EVENTS.c.department,
+                func.count().label("request_count"),
+                func.sum(TRANSFER_EVENTS.c.byte_count).label("byte_count"),
+            )
+            .where(
+                and_(
+                    TRANSFER_EVENTS.c.occurred_at >= start,
+                    TRANSFER_EVENTS.c.occurred_at <= end,
+                )
+            )
+            .group_by(
+                hour_bucket,
+                TRANSFER_EVENTS.c.token_id,
+                TRANSFER_EVENTS.c.token_prefix,
+                TRANSFER_EVENTS.c.business_domain,
+                TRANSFER_EVENTS.c.department,
+            )
+            .order_by(hour_bucket.desc(), func.sum(TRANSFER_EVENTS.c.byte_count).desc())
+        )
+        with self._engine_required().connect() as connection:
+            rows = connection.execute(statement).mappings().all()
+        seconds = window_hours * 3600
+        history = []
+        for row in rows:
+            item = dict(row)
+            item["byte_count"] = int(item["byte_count"] or 0)
+            item["request_count"] = int(item["request_count"] or 0)
+            item["bytes_per_second"] = round(item["byte_count"] / seconds, 2)
+            history.append(item)
+        return history
+
     def recent_transfers(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._engine_required().connect() as connection:
             rows = (

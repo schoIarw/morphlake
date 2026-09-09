@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -135,3 +136,56 @@ def test_transfer_outbox_and_period_stats(tmp_path: Path):
     assert stats[0]["byte_count"] == 123
     store.mark_events_synced([event_id])
     assert store.unsynced_event_count() == 0
+
+
+def test_transfer_rates_aggregate_per_key_over_window(tmp_path: Path):
+    store = make_store(tmp_path)
+    identity = store.authenticate(create_token(store).plaintext)
+    for operation, byte_count in (("upload", 2048), ("download", 1024), ("upload", 512)):
+        store.record_transfer(
+            identity=identity,
+            operation=operation,
+            filename="report.pdf",
+            byte_count=byte_count,
+            duration_ms=100,
+            status="success",
+            file_id="file-1",
+            media_type="document",
+            client_ip="10.0.0.8",
+            user_agent="pytest",
+        )
+    rates = store.transfer_rates(24)
+    assert len(rates) == 1
+    assert rates[0]["request_count"] == 3
+    assert rates[0]["byte_count"] == 3584
+    assert rates[0]["bytes_per_second"] > 0
+    assert rates[0]["bytes_per_second"] == round(3584 / (24 * 3600), 2)
+    with pytest.raises(MorphLakeError, match="window_hours"):
+        store.transfer_rates(0)
+
+
+def test_transfer_rate_history_buckets_by_hour(tmp_path: Path):
+    store = make_store(tmp_path)
+    identity = store.authenticate(create_token(store).plaintext)
+    store.record_transfer(
+        identity=identity,
+        operation="upload",
+        filename="report.pdf",
+        byte_count=2048,
+        duration_ms=100,
+        status="success",
+        file_id="file-1",
+        media_type="document",
+        client_ip="10.0.0.8",
+    )
+    now = datetime.now(UTC)
+    history = store.transfer_rate_history(
+        start=(now - timedelta(hours=1)).isoformat(),
+        end=(now + timedelta(minutes=1)).isoformat(),
+        window_hours=1,
+    )
+    assert len(history) == 1
+    assert history[0]["request_count"] == 1
+    assert history[0]["byte_count"] == 2048
+    assert history[0]["hour_bucket"] == now.isoformat()[:13]
+    assert history[0]["bytes_per_second"] == round(2048 / 3600, 2)

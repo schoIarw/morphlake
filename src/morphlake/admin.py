@@ -175,11 +175,11 @@ def tokens_page(
         <div class="wide form-actions"><button type="submit">生成 Key</button><span class="hint">配额填 0 表示不限制</span></div>
       </form>
     </section>
-    <section class="panel"><h2>已分配 Key</h2><p class="hint">管理 Key 可查询全部数据；业务域 Key 仅能查询所属业务域。</p>
+    <section class="panel"><h2>已分配 Key</h2><p class="hint">管理 Key 可查询全部数据；业务域 Key 仅能查询所属业务域。限额配置已移至“限额管理”。</p>
       <div class="table-wrap"><table><thead><tr>
       <th>Key</th><th>权限</th><th>业务范围</th><th>使用人</th><th>手机</th><th>备注</th><th>状态</th>
-      <th>创建/过期</th><th>限流</th><th>操作</th><th></th>
-      </tr></thead><tbody>{rows or _empty_row(11)}</tbody></table></div></section>"""
+      <th>创建/过期</th><th>操作</th>
+      </tr></thead><tbody>{rows or _empty_row(9)}</tbody></table></div></section>"""
     return HTMLResponse(_page("Key 管理", body, session, settings, "tokens"))
 
 
@@ -264,7 +264,7 @@ def update_token_limits(
         upload_bytes_limit=upload_bytes_limit,
         download_bytes_limit=download_bytes_limit,
     )
-    return RedirectResponse("/admin/tokens", status_code=303)
+    return RedirectResponse("/admin/limits", status_code=303)
 
 
 @router.post("/tokens/{token_id}/rotate")
@@ -277,6 +277,114 @@ def rotate_token(
     _verify_csrf(csrf, session)
     store.rotate_token(token_id)
     return RedirectResponse("/admin/tokens", status_code=303)
+
+
+RATE_WINDOWS = (1, 2, 4, 8)
+
+
+@router.get("/limits", response_class=HTMLResponse)
+def limits_page(
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> HTMLResponse:
+    limit_rows = "".join(_limit_row(row, session.csrf_token) for row in store.list_tokens())
+    rate_panels = "".join(
+        _rate_panel(window, store.transfer_rates(window)) for window in RATE_WINDOWS
+    )
+    body = f"""<section class="panel"><div class="section-head"><div><h2>限额配置</h2>
+      <p>每个 Key 的限流周期与配额；填 0 表示不限制。保存后立即生效。</p></div></div>
+      <div class="table-wrap"><table><thead><tr><th>Key</th><th>业务范围</th>
+      <th>周期（秒）</th><th>上传次数</th><th>上传字节</th><th>下载次数</th><th>下载字节</th>
+      <th></th></tr></thead><tbody>{limit_rows or _empty_row(8)}</tbody></table></div></section>
+    <section class="panel"><div class="section-head"><div><h2>实时传输速率</h2>
+      <p>按传输统计表聚合近 1/2/4/8 小时每 Key 的请求数与字节速率，每 30 秒自动刷新。</p>
+      </div></div><div class="rate-grid">{rate_panels}</div></section>
+    <section class="panel"><div class="section-head"><div><h2>历史传输速率</h2>
+      <p>按小时分桶查询指定时间段内每 Key 的传输速率。</p></div></div>
+      <form method="post" action="/admin/limits/history" class="grid-form">
+      {_csrf_input(session)}
+      {_input("开始时间", "start", "datetime-local", required=True)}
+      {_input("结束时间", "end", "datetime-local", required=True)}
+      <label>窗口小时<select name="window_hours"><option value="1">1 小时</option>
+      <option value="2">2 小时</option><option value="4">4 小时</option>
+      <option value="8">8 小时</option><option value="24">24 小时</option></select></label>
+      <div class="wide form-actions"><button>查询历史速率</button></div></form></section>
+    <script>
+    (function(){{
+      const windows={list(RATE_WINDOWS)};
+      const fmt=bytes=>{{if(!bytes)return '0 B';const units=['B','KB','MB','GB'];
+        const i=Math.min(units.length-1,Math.floor(Math.log(bytes)/Math.log(1024)));
+        return (bytes/Math.pow(1024,i)).toFixed(i?1:0)+' '+units[i];}};
+      function render(window,rows,generatedAt){{
+        const panel=document.getElementById('rate-panel-'+window);
+        if(!panel)return;
+        const body=panel.querySelector('tbody');if(!body)return;
+        body.textContent='';
+        if(!rows.length){{const tr=document.createElement('tr');
+          const td=document.createElement('td');td.colSpan=5;td.className='empty';
+          td.textContent='窗口内无传输';tr.appendChild(td);body.appendChild(tr);}}
+        else{{for(const row of rows){{const tr=document.createElement('tr');
+          const cells=[row.token_prefix,row.business_domain+'/'+row.department,
+            String(row.request_count),fmt(row.byte_count),row.bytes_per_second.toFixed(2)+' B/s'];
+          for(const text of cells){{const td=document.createElement('td');
+            td.textContent=text;if(text.startsWith(row.token_prefix)){{
+              const code=document.createElement('code');code.textContent=text;
+              td.textContent='';td.appendChild(code);}}
+            tr.appendChild(td);}}body.appendChild(tr);}}}}
+        const meta=document.getElementById('rate-meta-'+window);
+        if(meta&&generatedAt){{meta.textContent='更新于 '+generatedAt.replace('T',' ').slice(0,19)+' UTC';}}
+      }}
+      function refresh(){{windows.forEach(window=>fetch('/admin/limits/rates?window='+window,{{
+        headers:{{'Accept':'application/json'}}}}).then(r=>r.json()).then(d=>render(d.window,d.rows,d.generated_at)).catch(()=>{{}}));}}
+      refresh();setInterval(refresh,30000);
+    }})();
+    </script>"""
+    return HTMLResponse(_page("限额管理", body, session, settings, "limits"))
+
+
+@router.get("/limits/rates", response_class=JSONResponse)
+def limits_rates(
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    window: Annotated[int, Query(ge=1, le=24)] = 2,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "window": window,
+            "rows": store.transfer_rates(window),
+            "generated_at": datetime.now(UTC).isoformat(),
+        }
+    )
+
+
+@router.post("/limits/history", response_class=HTMLResponse)
+def limits_history(
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    csrf: Annotated[str, Form()],
+    start: Annotated[str, Form()],
+    end: Annotated[str, Form()],
+    window_hours: Annotated[int, Form(ge=1, le=24)] = 1,
+) -> HTMLResponse:
+    _verify_csrf(csrf, session)
+    try:
+        start_iso = datetime.fromisoformat(start).replace(tzinfo=UTC).isoformat()
+        end_iso = datetime.fromisoformat(end).replace(tzinfo=UTC).isoformat()
+    except ValueError as exc:
+        raise MorphLakeError("invalid_datetime", "开始/结束时间格式不正确", 400) from exc
+    if start_iso > end_iso:
+        raise MorphLakeError("invalid_date_range", "开始时间不得晚于结束时间", 400)
+    rows = store.transfer_rate_history(start=start_iso, end=end_iso, window_hours=window_hours)
+    result_rows = "".join(_history_rate_row(row) for row in rows) or _empty_row(6)
+    body = f"""<section class="panel"><div class="section-head"><div><h2>历史传输速率</h2>
+      <p>{html.escape(start)} → {html.escape(end)}，按 {window_hours} 小时分桶</p></div>
+      <a class="button secondary" href="/admin/limits">返回限额管理</a></div>
+      <div class="table-wrap"><table><thead><tr><th>小时桶</th><th>Key</th><th>业务范围</th>
+      <th>请求数</th><th>字节</th><th>速率</th></tr></thead>
+      <tbody>{result_rows}</tbody></table></div></section>"""
+    return HTMLResponse(_page("限额管理", body, session, settings, "limits"))
 
 
 @router.get("/api/upload", response_class=HTMLResponse)
@@ -811,30 +919,18 @@ def transfers_page(
             "byte_count",
         ],
     )
-    detail_rows = _rows(
-        store.recent_transfers(),
-        [
-            "occurred_at",
-            "token_prefix",
-            "operation",
-            "business_domain",
-            "department",
-            "filename",
-            "byte_count",
-            "status",
-            "error_code",
-        ],
-    )
+    detail_rows = _transfer_detail_rows(store.recent_transfers())
     body = f"""<section class="panel"><div class="section-head"><h2>周期统计</h2>
       <div class="tabs"><a href="?period=day">天</a><a href="?period=week">周</a>
       <a href="?period=month">月</a></div></div><div class="table-wrap"><table>
       <thead><tr><th>Token</th><th>业务域</th><th>部门</th><th>操作</th><th>状态</th>
       <th>条数</th><th>字节数</th></tr></thead><tbody>{stat_rows or _empty_row(7)}</tbody>
       </table></div></section><section class="panel"><h2>最近传输明细</h2>
-      <p class="hint">管理库保留近期缓存，长期明细同步到 Paimon。</p>
+      <p class="hint">管理库保留近期缓存，长期明细同步到 Paimon；每笔记录含来源 IP 与 User-Agent。</p>
       <div class="table-wrap"><table><thead><tr><th>时间</th><th>Token</th><th>操作</th>
       <th>业务域</th><th>部门</th><th>文件</th><th>字节</th><th>状态</th><th>错误</th>
-      </tr></thead><tbody>{detail_rows or _empty_row(9)}</tbody></table></div></section>"""
+      <th>IP</th><th>User-Agent</th>
+      </tr></thead><tbody>{detail_rows or _empty_row(11)}</tbody></table></div></section>"""
     return HTMLResponse(_page("传输统计", body, session, settings, "transfers"))
 
 
@@ -1209,6 +1305,77 @@ def _card(title: str, value: Any, note: str = "") -> str:
       <strong>{html.escape(str(value))}</strong><small>{html.escape(note)}</small></div>"""
 
 
+def _limit_row(row: dict[str, Any], csrf: str) -> str:
+    token_id = html.escape(row["token_id"])
+    prefix = html.escape(row["token_prefix"])
+    scope = (
+        f"{html.escape(row['business_domain'])}<br>"
+        f'<span class="hint">{html.escape(row["department"])}</span>'
+    )
+    fields = (
+        ("period_seconds", "period_seconds", 1),
+        ("upload_requests_limit", "upload_requests_limit", 0),
+        ("upload_bytes_limit", "upload_bytes_limit", 0),
+        ("download_requests_limit", "download_requests_limit", 0),
+        ("download_bytes_limit", "download_bytes_limit", 0),
+    )
+    cells = "".join(
+        f"""<td><input class="limit-input" form="limit-form-{token_id}" type="number"
+          name="{name}" value="{row[key]}" min="{minimum}" required></td>"""
+        for name, key, minimum in fields
+    )
+    return f"""<tr><td><code>{prefix}</code></td><td>{scope}</td>{cells}
+      <td><form id="limit-form-{token_id}" method="post"
+      action="/admin/tokens/{token_id}/limits"><input type="hidden" name="csrf"
+      value="{csrf}"><button form="limit-form-{token_id}">保存</button></form></td></tr>"""
+
+
+def _rate_panel(window: int, rows: list[dict[str, Any]]) -> str:
+    body = (
+        "".join(
+            f"""<tr><td><code>{html.escape(row["token_prefix"])}</code></td>
+        <td>{html.escape(row["business_domain"])}/{html.escape(row["department"])}</td>
+        <td>{row["request_count"]}</td><td>{html.escape(_human_bytes(row["byte_count"]))}</td>
+        <td>{row["bytes_per_second"]:.2f} B/s</td></tr>"""
+            for row in rows
+        )
+        or '<tr><td colspan="5" class="empty">窗口内无传输</td></tr>'
+    )
+    return f"""<section class="panel rate-panel" id="rate-panel-{window}">
+      <div class="section-head"><div><h3>近 {window} 小时</h3>
+      <span class="hint" id="rate-meta-{window}"></span></div></div>
+      <div class="table-wrap"><table><thead><tr><th>Key</th><th>业务范围</th><th>请求数</th>
+      <th>字节</th><th>速率</th></tr></thead><tbody>{body}</tbody></table></div></section>"""
+
+
+def _history_rate_row(row: dict[str, Any]) -> str:
+    try:
+        bucket = _browser_datetime(datetime.fromisoformat(row["hour_bucket"] + ":00:00+00:00"))
+    except ValueError:
+        bucket = html.escape(row["hour_bucket"])
+    return f"""<tr><td>{bucket}</td><td><code>{html.escape(row["token_prefix"])}</code></td>
+      <td>{html.escape(row["business_domain"])}/{html.escape(row["department"])}</td>
+      <td>{row["request_count"]}</td><td>{html.escape(_human_bytes(row["byte_count"]))}</td>
+      <td>{row["bytes_per_second"]:.2f} B/s</td></tr>"""
+
+
+def _transfer_detail_rows(rows: list[dict[str, Any]]) -> str:
+    return "".join(
+        f"""<tr><td>{_browser_datetime(row.get("occurred_at"))}</td>
+        <td><code>{html.escape(row.get("token_prefix") or "")}</code></td>
+        <td>{html.escape(row.get("operation") or "")}</td>
+        <td>{html.escape(row.get("business_domain") or "")}</td>
+        <td>{html.escape(row.get("department") or "")}</td>
+        <td><span class="text-clip" title="{html.escape(row.get("filename") or "")}">{html.escape(row.get("filename") or "")}</span></td>
+        <td>{html.escape(_human_bytes(row.get("byte_count")))}</td>
+        <td><span class="status-pill {html.escape(row.get("status") or "")}">{html.escape(row.get("status") or "")}</span></td>
+        <td>{html.escape(row.get("error_code") or "")}</td>
+        <td>{html.escape(row["client_ip"]) if row.get("client_ip") else '<span class="hint">—</span>'}</td>
+        <td><span class="text-clip" title="{html.escape(row.get("user_agent") or "")}">{html.escape(row.get("user_agent") or "")}</span></td></tr>"""
+        for row in rows
+    )
+
+
 def _token_row(row: dict[str, Any], csrf: str) -> str:
     token_id = html.escape(row["token_id"])
     action = "enable" if row["status"] == "disabled" else "disable"
@@ -1232,15 +1399,6 @@ def _token_row(row: dict[str, Any], csrf: str) -> str:
       <td>{html.escape(row["assignee_name"])}</td><td>{html.escape(row["phone"])}</td>
       <td>{html.escape(row["notes"])}</td><td><span class="status-pill {row["status"]}">{row["status"]}</span></td>
       <td>{_browser_datetime(row["created_at"])}<br><span class="hint">{expires}</span></td>
-      <td><details><summary>{row["period_seconds"]} 秒</summary>
-      <form method="post" action="/admin/tokens/{token_id}/limits" class="limit-form">
-      <input type="hidden" name="csrf" value="{csrf}">
-      {_input("周期秒", "period_seconds", "number", row["period_seconds"], min=1, required=True)}
-      {_input("上传次数", "upload_requests_limit", "number", row["upload_requests_limit"], min=0, required=True)}
-      {_input("上传字节", "upload_bytes_limit", "number", row["upload_bytes_limit"], min=0, required=True)}
-      {_input("下载次数", "download_requests_limit", "number", row["download_requests_limit"], min=0, required=True)}
-      {_input("下载字节", "download_bytes_limit", "number", row["download_bytes_limit"], min=0, required=True)}
-      <button>保存</button></form></details></td>
       <td><form class="inline" method="post" action="/admin/tokens/{token_id}/status/{action}">
       <input type="hidden" name="csrf" value="{csrf}"><button class="secondary">{action_text}</button></form></td>
       <td><form class="inline" method="post" action="/admin/tokens/{token_id}/rotate">
@@ -1281,7 +1439,14 @@ def _page(
     active: str,
 ) -> str:
     groups = [
-        ("管理", [("dashboard", "工作台", "/admin"), ("tokens", "Key 管理", "/admin/tokens")]),
+        (
+            "管理",
+            [
+                ("dashboard", "工作台", "/admin"),
+                ("tokens", "Key 管理", "/admin/tokens"),
+                ("limits", "限额管理", "/admin/limits"),
+            ],
+        ),
         (
             "数据能力",
             [
@@ -1477,7 +1642,7 @@ _CSS = """
 .topbar{height:64px;background:var(--white);border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 20px;position:fixed;z-index:20;top:0;left:0;right:0}.brand{display:flex;align-items:center;gap:8px;color:var(--ink);text-decoration:none}.brand b{font-size:16px}.brand em{font-style:normal;color:var(--muted);border-left:1px solid var(--line);padding-left:9px}.logo-mark{display:grid;place-items:center;width:44px;height:44px;border-radius:12px;background:var(--blue);color:#fff;font-weight:800;font-size:20px}.logo-mark.small{width:32px;height:32px;border-radius:9px;font-size:14px}.top-actions{display:flex;align-items:center;gap:8px;color:var(--muted)}.top-actions form{margin:0}.api-target{padding:4px 9px;background:#f2f3f5;border-radius:16px;font-size:11px}.avatar{display:grid;place-items:center;width:28px;height:28px;background:#eef2ff;color:var(--blue2);border-radius:50%;font-weight:700}.link-button{border:0;background:transparent;color:var(--muted);padding:5px 7px;cursor:pointer}
 .sidebar{position:fixed;z-index:10;top:64px;bottom:0;left:0;width:var(--sidebar);background:var(--white);border-right:1px solid var(--line);padding:12px 8px;overflow:auto}.nav-group{margin-bottom:13px}.nav-group small{display:block;color:#8a93a3;font-size:11px;letter-spacing:.04em;padding:6px 12px}.nav-group a{display:flex;align-items:center;gap:9px;color:#4f596b;text-decoration:none;padding:8px 11px;margin:3px 0;border-radius:7px;transition:.15s}.nav-group a:hover{background:#f4f6fb;color:var(--blue2)}.nav-group a.active{background:#eef2ff;color:var(--blue2);font-weight:600}.nav-dot{width:6px;height:6px;border-radius:50%;background:#a5adba}.active .nav-dot{background:var(--blue);box-shadow:0 0 0 3px #3b65f620}
 .content{margin-left:var(--sidebar);padding:80px 18px 28px;max-width:1720px}.page-head{display:flex;justify-content:space-between;align-items:end;margin-bottom:12px}.page-head h1{font-size:22px;line-height:1.3;margin:1px 0}.eyebrow{color:var(--blue);font-size:9px;font-weight:800;letter-spacing:.12em}.panel,.intro,.quick,.card{background:var(--white);border:1px solid var(--line);border-radius:16px;box-shadow:0 1px 2px #1c243408}.panel{padding:16px;margin:0 0 12px}.panel h2,.intro h2{margin:0 0 4px;font-size:16px}.panel p,.intro p{color:var(--muted);margin:3px 0 11px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.intro{padding:14px 16px;margin-bottom:12px}.intro p{margin-bottom:0}
-.cards{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-bottom:12px}.card{padding:14px}.card span,.card small{display:block;color:var(--muted)}.card strong{display:block;font-size:24px;margin:3px 0}.welcome{display:flex;justify-content:space-between;align-items:center;padding:18px}.welcome p{margin-bottom:0}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick{display:flex;flex-direction:column;padding:16px;text-decoration:none;color:var(--ink);transition:.15s}.quick:hover{border-color:#c8d3fa;background:#fbfcff}.quick strong{font-size:15px}.quick span{color:var(--muted);margin:5px 0 10px}.quick b{color:var(--blue);font-size:12px}
+.cards{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-bottom:12px}.card{padding:14px}.card span,.card small{display:block;color:var(--muted)}.card strong{display:block;font-size:24px;margin:3px 0}.rate-grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:10px}.rate-panel{padding:12px;margin:0}.rate-panel h3{margin:0 0 2px;font-size:14px}.limit-input{width:96px;min-width:96px}.welcome{display:flex;justify-content:space-between;align-items:center;padding:18px}.welcome p{margin-bottom:0}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick{display:flex;flex-direction:column;padding:16px;text-decoration:none;color:var(--ink);transition:.15s}.quick:hover{border-color:#c8d3fa;background:#fbfcff}.quick strong{font-size:15px}.quick span{color:var(--muted);margin:5px 0 10px}.quick b{color:var(--blue);font-size:12px}
 .grid-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 12px}.grid-form>label{flex:1 1 185px;min-width:160px;max-width:300px}.grid-form>.wide{flex:2 1 360px;max-width:none}.grid-form>.token-field{flex-basis:100%;max-width:none}.grid-form>.form-actions{flex:0 0 auto;min-width:auto;max-width:none}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}.wide{min-width:0}label{display:block;color:#515b6d;font-size:12px;font-weight:600}input,textarea,select{display:block;width:100%;height:34px;margin-top:4px;padding:5px 9px;border:1px solid #d7dbe3;border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;line-height:1.35;outline:none}input[type=file]{padding:4px 7px}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px #3b65f618}textarea{height:64px;min-height:64px;resize:vertical;padding-top:7px}label small,.hint{color:var(--muted);font-size:11px;font-weight:400}.token-field{padding:9px 11px;background:#f7f8fb;border-radius:9px}.form-actions{display:flex;align-items:center;gap:8px;min-height:34px}
 .key-view{display:grid;grid-template-columns:auto;gap:4px;margin-bottom:4px}.key-view button{min-height:30px;padding:4px 8px}.admin-key{background:#eef2ff;color:var(--blue2)}
 button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;border:0;border-radius:7px;background:var(--blue);color:#fff;padding:6px 13px;text-decoration:none;font-family:inherit;font-size:13px;font-weight:600;line-height:1.2;cursor:pointer}button:hover,.button:hover{background:var(--blue2)}button:disabled{cursor:wait;opacity:.7}.secondary{background:#f1f3f7;color:#46536a}.secondary:hover{background:#e7eaf0;color:#253047}.danger{background:#fff0f1;color:var(--red)}.danger:hover{background:#ffe4e6}.inline{display:inline}.spinner{display:inline-block;width:13px;height:13px;margin-right:7px;border:2px solid #ffffff70;border-top-color:#fff;border-radius:50%;vertical-align:-2px;animation:spin .72s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
@@ -1485,5 +1650,5 @@ button,.button{display:inline-flex;align-items:center;justify-content:center;min
 .table-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-top:12px}.page-size-form{display:flex;align-items:flex-end;gap:6px}.page-size-form label{min-width:105px}.page-size-form select{height:30px;margin-top:2px}.page-size-form button{min-height:30px;padding:4px 9px}.pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px}.page-link{padding:5px 10px;border-radius:7px;background:#f1f3f7;text-decoration:none}.page-link.disabled{color:#a5adba;background:#f7f8fa}.notice-success{padding:9px 12px;margin-bottom:12px;border:1px solid #bce5ca;border-radius:8px;background:#edf9f1;color:var(--green)}
 .media-modal{width:min(920px,92vw);max-height:88vh;padding:0;border:0;border-radius:16px;box-shadow:0 24px 70px #10182755}.media-modal::backdrop{background:#10182799}.modal-head{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line)}.modal-head h2{margin:0;font-size:16px}.modal-close{width:30px;height:30px;min-height:30px;padding:0;border-radius:50%;background:#f1f3f7;color:var(--ink);font-size:20px}.modal-body{padding:16px;max-height:calc(88vh - 55px);overflow:auto}.modal-image{display:block;max-width:100%;max-height:72vh;margin:auto;border-radius:8px}.modal-body audio{display:block;width:min(680px,100%);margin:30px auto}.text-preview{display:grid;gap:12px}.text-preview section{padding:13px;border:1px solid var(--line);border-radius:10px}.text-preview h3{margin:0 0 7px}.text-preview p{white-space:pre-wrap}.text-preview pre{max-height:50vh}.empty{text-align:center!important;color:var(--muted);padding:24px!important}.status-pill{display:inline-block;padding:3px 8px;border-radius:16px;background:#f1f3f7;font-size:11px}.match-rate{color:var(--green);font-weight:600}.status-pill.ok,.status-pill.active{background:#e7f8ee;color:var(--green)}.status-pill.error,.status-pill.deleted{background:#fff0f1;color:var(--red)}.status-pill.disabled{background:#fff6dc;color:var(--amber)}.result-head{margin-bottom:9px}.tabs{display:flex;gap:6px}.tabs a{padding:4px 8px;background:#f1f3f7;border-radius:7px;text-decoration:none}.limit-form{min-width:310px;display:grid;grid-template-columns:1fr 1fr;gap:7px;padding:10px}.alert{padding:9px 12px;background:#fff7e8;border:1px solid #f1d59b;border-radius:8px;color:#775310;margin-bottom:11px}pre{white-space:pre-wrap;word-break:break-all;background:#151a24;color:#dbe7ff;padding:13px;border-radius:9px;max-height:460px;overflow:auto}.secret{font-size:14px}.token-created{text-align:center;max-width:720px;margin:30px auto}.success-mark{display:grid;place-items:center;width:46px;height:46px;margin:0 auto 10px;border-radius:50%;background:#e7f8ee;color:var(--green);font-size:23px}
 .login-body{min-height:100vh;background:#f4f5f7;display:grid;place-items:center;padding:20px}.login-shell{width:min(860px,100%);display:grid;grid-template-columns:1fr .9fr;overflow:hidden;border:1px solid var(--line);border-radius:18px;background:#fff;box-shadow:0 18px 55px #27324a18}.login-brand{color:#fff;padding:52px 44px;background:#315ee8}.login-brand .eyebrow{color:#dbe4ff}.login-brand h1{font-size:31px;line-height:1.25;margin:18px 0 10px}.login-brand p{color:#dbe4ff}.login-card{background:#fff;padding:44px 40px;display:flex;flex-direction:column;justify-content:center}.login-card h2{font-size:22px;margin:5px 0}.login-card p{color:var(--muted);margin:0 0 15px}.login-card form{display:grid;gap:11px}.login-button{width:100%;margin-top:3px}.login-card>small{color:var(--muted);margin-top:14px;text-align:center}
-@media(max-width:1000px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}.grid-form>label{max-width:none}}@media(max-width:760px){.topbar{padding:0 12px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:64px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 7px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:7px 9px}.content{margin-left:0;padding:124px 10px 24px}.grid-form{display:grid;grid-template-columns:1fr}.grid-form>label,.grid-form>.wide,.grid-form>.form-actions{max-width:none}.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.welcome{align-items:flex-start;gap:14px;flex-direction:column}.table-footer{align-items:stretch;flex-direction:column}.pagination{justify-content:flex-start}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:34px 25px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}
+@media(max-width:1000px){.cards{grid-template-columns:repeat(2,1fr)}.rate-grid{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}.grid-form>label{max-width:none}}@media(max-width:760px){.topbar{padding:0 12px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:64px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 7px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:7px 9px}.content{margin-left:0;padding:124px 10px 24px}.grid-form{display:grid;grid-template-columns:1fr}.grid-form>label,.grid-form>.wide,.grid-form>.form-actions{max-width:none}.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.rate-grid{grid-template-columns:1fr}.welcome{align-items:flex-start;gap:14px;flex-direction:column}.table-footer{align-items:stretch;flex-direction:column}.pagination{justify-content:flex-start}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:34px 25px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}
 """

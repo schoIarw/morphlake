@@ -432,3 +432,90 @@ def test_admin_is_independent_and_exports_metrics(tmp_path: Path):
     assert 'morphlake_component_up{component="management_db"} 1.0' in metrics.text
     assert 'morphlake_management_db_info{backend="sqlite"} 1.0' in metrics.text
     assert metrics.headers["x-content-type-options"] == "nosniff"
+
+
+def test_limits_page_splits_menu_and_shows_rates_and_history(tmp_path: Path):
+    client, store, _ = build_admin(tmp_path)
+    created = store.create_token(
+        business_domain="risk",
+        department="audit",
+        assignee_name="Alice",
+        phone="13800000000",
+        notes="UI limits scope",
+        allocated_by="pytest",
+        period_seconds=60,
+        upload_requests_limit=10,
+        download_requests_limit=10,
+        upload_bytes_limit=1000,
+        download_bytes_limit=1000,
+    )
+    identity = store.authenticate(created.plaintext)
+    store.record_transfer(
+        identity=identity,
+        operation="upload",
+        filename="report.pdf",
+        byte_count=2048,
+        duration_ms=100,
+        status="success",
+        file_id="file-1",
+        media_type="document",
+        client_ip="10.0.0.8",
+        user_agent="pytest-agent",
+    )
+    login(client)
+    page = client.get("/admin/limits")
+    assert page.status_code == 200
+    assert 'href="/admin/limits"' in page.text
+    assert "近 1 小时" in page.text
+    assert "近 8 小时" in page.text
+    assert 'id="limit-form-' in page.text
+    assert 'action="/admin/limits/history"' in page.text
+    assert "setInterval(refresh,30000)" in page.text
+
+    rates = client.get("/admin/limits/rates?window=2")
+    assert rates.status_code == 200
+    payload = rates.json()
+    assert payload["window"] == 2
+    assert payload["rows"][0]["request_count"] == 1
+    assert payload["rows"][0]["byte_count"] == 2048
+    assert payload["rows"][0]["bytes_per_second"] > 0
+
+    csrf = page.text.split('name="csrf" value="', 1)[1].split('"', 1)[0]
+    history = client.post(
+        "/admin/limits/history",
+        data={
+            "csrf": csrf,
+            "start": "2026-09-09T00:00",
+            "end": "2026-09-09T23:59",
+            "window_hours": "1",
+        },
+    )
+    assert history.status_code == 200
+    assert "B/s" in history.text
+    assert "browser-datetime" in history.text
+
+    tokens_page = client.get("/admin/tokens").text
+    assert "<th>限流</th>" not in tokens_page
+    assert "key-copy" in tokens_page
+
+    transfers = client.get("/admin/transfers").text
+    assert "<th>IP</th>" in transfers
+    assert "10.0.0.8" in transfers
+    assert "<th>User-Agent</th>" in transfers
+
+    token_id = next(row["token_id"] for row in store.list_tokens())
+    updated = client.post(
+        f"/admin/tokens/{token_id}/limits",
+        data={
+            "csrf": csrf,
+            "period_seconds": "120",
+            "upload_requests_limit": "11",
+            "download_requests_limit": "22",
+            "upload_bytes_limit": "1100",
+            "download_bytes_limit": "2200",
+        },
+        follow_redirects=False,
+    )
+    assert updated.status_code == 303
+    assert updated.headers["location"] == "/admin/limits"
+    assert store.list_tokens()[0]["period_seconds"] == 120
