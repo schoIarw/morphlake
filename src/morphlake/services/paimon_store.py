@@ -151,7 +151,7 @@ def audit_schema(_: Settings) -> pa.Schema:
 
 
 def deletion_schema(_: Settings) -> pa.Schema:
-    """Append-only tombstones keep indexed source tables immutable."""
+    """Append-only file tombstones used without Paimon deletion vectors."""
     return pa.schema(
         [
             pa.field("file_id", pa.string(), nullable=False),
@@ -201,21 +201,9 @@ class PaimonStore:
         definitions = {
             ASSET_TABLE: (self.settings.paimon_table, asset_schema(self.settings), False),
             TEXT_TABLE: (self.settings.paimon_text_table, text_schema(self.settings), True),
-            IMAGE_TABLE: (
-                self.settings.paimon_image_table,
-                image_schema(self.settings),
-                True,
-            ),
-            AUDIO_TABLE: (
-                self.settings.paimon_audio_table,
-                audio_schema(self.settings),
-                True,
-            ),
-            AUDIT_TABLE: (
-                self.settings.paimon_audit_table,
-                audit_schema(self.settings),
-                False,
-            ),
+            IMAGE_TABLE: (self.settings.paimon_image_table, image_schema(self.settings), True),
+            AUDIO_TABLE: (self.settings.paimon_audio_table, audio_schema(self.settings), True),
+            AUDIT_TABLE: (self.settings.paimon_audit_table, audit_schema(self.settings), False),
             DELETION_TABLE: (
                 self.settings.paimon_deletion_table,
                 deletion_schema(self.settings),
@@ -400,30 +388,32 @@ class PaimonStore:
             columns=PUBLIC_COLUMNS,
             limit=1,
         )
-        if not rows or self._deleted_file_ids([file_id]):
+        if not rows:
+            raise NotFoundError(f"File {file_id} does not exist")
+        if file_id in self._deleted_file_ids([file_id]):
             raise NotFoundError(f"File {file_id} does not exist")
         return rows[0]
 
     def get_assets(self, file_ids: list[str]) -> list[dict[str, Any]]:
-        unique_ids = list(dict.fromkeys(file_ids))
+        if not file_ids:
+            return []
         builder = self._builder(ASSET_TABLE)
         rows = self._read(
             ASSET_TABLE,
-            builder.is_in("file_id", unique_ids),
+            builder.is_in("file_id", file_ids),
             columns=PUBLIC_COLUMNS,
             limit=None,
         )
-        deleted = self._deleted_file_ids(unique_ids)
+        deleted = self._deleted_file_ids(file_ids)
         by_id = {row["file_id"]: row for row in rows if row["file_id"] not in deleted}
-        missing = [file_id for file_id in unique_ids if file_id not in by_id]
+        missing = [file_id for file_id in file_ids if file_id not in by_id]
         if missing:
-            preview = ", ".join(missing[:5])
-            suffix = " …" if len(missing) > 5 else ""
-            raise NotFoundError(f"Files do not exist: {preview}{suffix}")
-        return [by_id[file_id] for file_id in unique_ids]
+            raise NotFoundError(f"File {missing[0]} does not exist")
+        return [by_id[file_id] for file_id in file_ids]
 
     def delete_assets(self, assets: list[dict[str, Any]]) -> None:
-        """Append tombstones without rewriting global-index source tables."""
+        if not assets:
+            return
         deleted_at = datetime.now(UTC).isoformat()
         rows = [
             {
@@ -447,48 +437,7 @@ class PaimonStore:
                     pa.Table.from_pylist(rows, schema=deletion_schema(self.settings))
                 )
         except Exception as exc:
-            raise StorageError(f"Paimon delete failed: {exc}") from exc
-
-    def _deleted_file_ids(self, file_ids: list[str]) -> set[str]:
-        if not file_ids:
-            return set()
-        builder = self._builder(DELETION_TABLE)
-        rows = self._read(
-            DELETION_TABLE,
-            builder.is_in("file_id", list(dict.fromkeys(file_ids))),
-            columns=["file_id"],
-            limit=None,
-        )
-        return {row["file_id"] for row in rows}
-
-    def _deleted_file_ids_for_scope(
-        self,
-        *,
-        business_domain: str | None,
-        department: str | None,
-        media_type: str | None,
-        start_date: date | None,
-        end_date: date | None,
-    ) -> set[str]:
-        builder = self._builder(DELETION_TABLE)
-        predicates = []
-        if business_domain:
-            predicates.extend(self._domain_predicates(builder, business_domain))
-        if department:
-            predicates.append(builder.equal("department", department))
-        if media_type:
-            predicates.append(builder.equal("media_type", media_type))
-        if start_date:
-            predicates.append(builder.greater_or_equal("ingest_date", start_date.isoformat()))
-        if end_date:
-            predicates.append(builder.less_or_equal("ingest_date", end_date.isoformat()))
-        rows = self._read(
-            DELETION_TABLE,
-            PredicateBuilder.and_predicates(predicates),
-            columns=["file_id"],
-            limit=None,
-        )
-        return {row["file_id"] for row in rows}
+            raise StorageError(f"Paimon deletion write failed: {exc}") from exc
 
     def get_preview(self, file_id: str, max_chars: int) -> dict[str, Any]:
         asset = self._enrich_assets([self.get_asset(file_id)])[0]
@@ -725,6 +674,7 @@ class PaimonStore:
         file_ids = list(dict.fromkeys(row["file_id"] for row in rows))
         if not file_ids:
             return []
+        deleted = self._deleted_file_ids(file_ids)
         builder = self._builder(ASSET_TABLE)
         committed = self._enrich_assets(
             self._read(
@@ -734,7 +684,6 @@ class PaimonStore:
                 limit=len(file_ids),
             )
         )
-        deleted = self._deleted_file_ids(file_ids)
         assets = {row["file_id"]: row for row in committed if row["file_id"] not in deleted}
         hits = []
         seen = set()
@@ -922,6 +871,47 @@ class PaimonStore:
             DELETION_TABLE: self.settings.paimon_deletion_table,
         }
         self.tables.update({key: self.connection.get_table(name) for key, name in names.items()})
+
+    def _deleted_file_ids(self, file_ids: list[str]) -> set[str]:
+        if not file_ids:
+            return set()
+        builder = self._builder(DELETION_TABLE)
+        rows = self._read(
+            DELETION_TABLE,
+            builder.is_in("file_id", list(dict.fromkeys(file_ids))),
+            columns=["file_id"],
+            limit=None,
+        )
+        return {row["file_id"] for row in rows}
+
+    def _deleted_file_ids_for_scope(
+        self,
+        *,
+        business_domain: str | None,
+        department: str | None,
+        media_type: str | None,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> set[str]:
+        builder = self._builder(DELETION_TABLE)
+        predicates = []
+        if business_domain:
+            predicates.extend(self._domain_predicates(builder, business_domain))
+        if department:
+            predicates.append(builder.equal("department", department))
+        if media_type:
+            predicates.append(builder.equal("media_type", media_type))
+        if start_date:
+            predicates.append(builder.greater_or_equal("ingest_date", start_date.isoformat()))
+        if end_date:
+            predicates.append(builder.less_or_equal("ingest_date", end_date.isoformat()))
+        rows = self._read(
+            DELETION_TABLE,
+            PredicateBuilder.and_predicates(predicates),
+            columns=["file_id"],
+            limit=None,
+        )
+        return {row["file_id"] for row in rows}
 
     @staticmethod
     def _rank_hits(rows: list[dict[str, Any]], result: Any) -> list[dict[str, Any]]:

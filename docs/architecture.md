@@ -9,7 +9,7 @@ flowchart TB
     S --> D["共享管理数据库\nSQLite / MySQL / PostgreSQL"]
     M --> D
     S --> O["MinIO\n原始文件"]
-    S --> P["Paimon 六表\n资产、特征、审计、删除标记"]
+    S --> P["Paimon 六表\n资产、特征、审计、墓碑"]
     S --> G["配置化模型"]
     P --> W["MinIO Paimon warehouse"]
 ```
@@ -22,7 +22,7 @@ flowchart TB
 
 十年理论总量约 3650 亿条。工程不按“部门 × 类型 × 日期”组合创建物理表，否则表数量、
 元数据和运维复杂度会随组织变化持续膨胀。固定使用六张不同粒度的表：资产描述符、文本
-切片、图片特征、音频特征、传输审计、文件删除标记。
+切片、图片特征、音频特征、传输审计、文件删除墓碑。
 
 六表统一按 `ingest_date / domain_shard` 分区，其中 `domain_shard` 是业务域 SHA-256 的稳定
 哈希模 32。业务部门、业务域和媒体类型使用 Bitmap 索引，保留精确业务过滤能力而不形成
@@ -70,19 +70,18 @@ PyPaimon 增量索引构建，已索引 row range 会跳过。默认 300 秒，M
 | 图片特征 | file_id BTree；业务字段 Bitmap；image_embedding IVF-SQ |
 | 音频特征 | file_id BTree；业务字段 Bitmap；audio_embedding IVF-SQ |
 | 传输审计 | event_id/token_id/file_id BTree；业务域/部门/操作/状态 Bitmap |
-| 删除标记 | file_id BTree；业务域/部门/类型 Bitmap |
+| 删除墓碑 | file_id BTree；业务域/部门/类型 Bitmap |
+
+## 删除可见性
+
+删除 API 先读取全部目标描述符并完成 Key 范围校验，再向墓碑表追加记录；整批校验失败时不会
+删除任何文件。墓碑提交成功后，对外读取链路立即过滤对应 `file_id`，然后批量清理 MinIO 原文件
+及图片缩略图。该顺序优先保证不会继续暴露已删除数据；对象清理异常通过响应字段和日志报告，
+可由运维任务重试。
 
 默认搜索模式为 `fast`，因此新写入数据会在下一次索引维护完成后进入全文/向量 TopK；清单
 和下载不受此延迟影响。若本地测试需要更快可缩短间隔，生产环境应根据每批行数和索引耗时
 调整，而不是每次上传构建。
-
-## 删除可见性
-
-PyPaimon 2.0 通用全局索引与 deletion vectors 不能同时启用。删除 API 因此先对整批文件执行存在性
-和业务域权限校验，再向删除标记表追加 tombstone。清单和检索先读取索引结果，再以资产描述符及
-tombstone 校验可见性；预览、下载也会拒绝已删除 `file_id`。tombstone 提交成功后清理 MinIO 原件
-及缩略图，避免出现仍可检索但对象已经不存在的状态。大规模物理清理可在维护窗口按 tombstone
-重写受影响分区，无需常驻 Flink 作业。
 
 ## 生产注意事项
 

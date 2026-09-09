@@ -93,13 +93,14 @@ feature_id、file_id、公共业务/分区/结果字段、feature_type、时间�
 
 ## 6. multimodal_file_deletion
 
-每个已删除文件追加一条 tombstone。字段包括 `file_id`、业务域、部门、`domain_shard`、原始
-`ingest_date`、`deleted_at`、文件名、媒体类型和 MinIO `object_key`。`file_id` 使用 BTree 索引，
-业务域、部门和媒体类型使用 Bitmap 索引。默认表名由 `PAIMON_DELETION_TABLE` 配置。
+每次成功删除一个文件写入一条不可变墓碑记录。主要字段为 `file_id`、业务域、部门、
+`domain_shard`、原始 `ingest_date`、`deleted_at`、文件名、媒体类型和原始对象键。`file_id`
+使用 BTree 索引，业务域、部门和媒体类型使用 Bitmap 索引。默认表名由
+`PAIMON_DELETION_TABLE` 配置。
 
-PyPaimon 2.0 的通用全文和向量全局索引不支持开启 deletion vectors，因此不直接改写前四张
-索引源表。所有读取路径会以 tombstone 排除已删除 `file_id`；MinIO 原文件及图片缩略图同步清理。
-这种设计避免单条删除重写海量每日分区，也保留后续在维护窗口按删除标记物理清理的依据。
+内容表继续保持追加写和 `deletion-vectors.enabled=false`，以兼容 Paimon 通用全文/向量全局
+索引。清单、详情、下载、预览、全文检索和向量检索均以墓碑表过滤已删除 `file_id`；原始文件
+和图片缩略图从 MinIO 清理。历史内容行的物理回收在维护窗口按分区重写完成。
 
 ## 表参数
 

@@ -11,7 +11,7 @@ Authorization: Bearer mlk_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 - 业务域 Key 上传时自动使用其绑定的 `business_domain + department`，查询时仅能访问所属业务域；
 - 默认管理 Key 的业务域、部门均为“管理员”，查询时不添加业务范围过滤，可查询全部数据；
-- 下载和删除接口会读取文件描述符并校验业务域，业务域 Key 不能操作其他业务域文件。
+- 下载接口会读取文件描述符并校验业务域，业务域 Key 不能下载其他业务域文件。
 
 ## 错误格式与 Key 状态
 
@@ -29,7 +29,6 @@ Authorization: Bearer mlk_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 | 403 | `token_expired` | Key 已过期 |
 | 403 | `token_scope_mismatch` | 业务域 Key 访问了其他业务域文件 |
 | 403 | `admin_key_required` | 普通业务 Key 调用了管理员专属接口 |
-| 404 | `not_found` | 文件不存在或已经删除 |
 | 429 | `rate_limit_exceeded` | 上传/下载周期次数或字节配额耗尽 |
 
 429 响应包含 `Retry-After` 秒数。限流同时检查周期请求次数和周期字节数；配置值 0 表示不限制。
@@ -115,35 +114,26 @@ curl -G http://localhost:8080/api/v1/admin/files \
 
 ## 删除文件
 
-单条删除使用 `DELETE`；批量删除使用独立 JSON 接口，单次最多 200 个 `file_id`。批量操作会先
-读取并校验全部文件的业务域，任一文件不存在或越权时不会写入本批删除标记。
+单条和批量删除接口均可独立调用。业务域 Key 只能删除本业务域文件，管理 Key 可删除全部业务域
+文件；批量请求会先验证全部目标，任一文件不存在或越权时整批拒绝。单批最多 200 个 `file_id`。
 
 ```bash
-# 单条删除
 curl -X DELETE http://localhost:8080/api/v1/files/FILE_ID \
   -H "Authorization: Bearer $MORPHLAKE_TOKEN"
 
-# 批量删除
 curl -X POST http://localhost:8080/api/v1/files/batch-delete \
   -H "Authorization: Bearer $MORPHLAKE_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"file_ids":["FILE_ID_1","FILE_ID_2"]}'
 ```
 
-成功响应：
-
 ```json
-{
-  "requested": 2,
-  "deleted": 2,
-  "file_ids": ["FILE_ID_1", "FILE_ID_2"],
-  "object_cleanup_failed": 0
-}
+{"requested":2,"deleted":2,"file_ids":["FILE_ID_1","FILE_ID_2"],"object_cleanup_failed":0}
 ```
 
-业务 API 向 Paimon 删除标记表追加 tombstone，使文件立即从清单、预览、下载、全文和向量结果中
-消失，再清理 MinIO 原文件及图片缩略图。`object_cleanup_failed` 非 0 表示元数据已经删除，但存在
-需运维清理的 MinIO 残留对象；不会恢复已经删除的 API 可见性。
+删除成功会向 `multimodal_file_deletion` 追加墓碑，使清单、详情、下载、预览、全文和向量查询
+立即排除目标；随后批量清理 MinIO 原文件及图片缩略图。若 `object_cleanup_failed` 非 0，墓碑仍
+然有效，管理员应根据服务日志重试对象清理。
 
 ## 全文检索
 

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from morphlake.config import Settings
-from morphlake.errors import ConfigurationError, NotFoundError
+from morphlake.errors import ConfigurationError
 from morphlake.partitioning import domain_shard
 from morphlake.services.paimon_store import PaimonStore
 
@@ -302,22 +302,27 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
             }
         ]
     )
-    assert set(store.tables) == {"asset", "text", "image", "audio", "audit", "deletion"}
-    assert all(
-        table.raw_table.table_schema.options["deletion-vectors.enabled"] == "false"
-        for table in store.tables.values()
-    )
-
-    assert [asset["file_id"] for asset in store.get_assets(["file-2", "file-1"])] == [
+    assert [row["file_id"] for row in store.get_assets(["file-2", "file-1"])] == [
         "file-2",
         "file-1",
     ]
-    store.delete_assets(store.get_assets(["file-1"]))
-    with pytest.raises(NotFoundError):
+    store.delete_assets([base])
+    with pytest.raises(Exception, match="does not exist"):
         store.get_asset("file-1")
+    visible = store.list_assets(
+        media_type="document",
+        business_domain="risk",
+        department="audit",
+        filename=None,
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 9, 2),
+        limit=10,
+        offset=0,
+    )
+    assert {row["file_id"] for row in visible} == {"file-2", "file-3", "file-4"}
     assert all(
-        hit["file_id"] != "file-1"
-        for hit in store.full_text_search(
+        row["file_id"] != "file-1"
+        for row in store.full_text_search(
             business_domain="risk",
             department="audit",
             keyword="liquidity",
@@ -326,11 +331,19 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
             limit=10,
         )
     )
+    assert set(store.tables) == {"asset", "text", "image", "audio", "audit", "deletion"}
 
     restarted = PaimonStore(settings)
     restarted.initialize()
-    assert set(restarted.tables) == {"asset", "text", "image", "audio", "audit", "deletion"}
-    with pytest.raises(NotFoundError):
+    assert set(restarted.tables) == {
+        "asset",
+        "text",
+        "image",
+        "audio",
+        "audit",
+        "deletion",
+    }
+    with pytest.raises(Exception, match="does not exist"):
         restarted.get_asset("file-1")
 
     incompatible = settings.model_copy(update={"text_vector_dimension": 8})

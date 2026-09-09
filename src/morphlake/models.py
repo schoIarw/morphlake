@@ -45,9 +45,9 @@ class DeleteFilesRequest(BaseModel):
     @field_validator("file_ids")
     @classmethod
     def normalize_file_ids(cls, value: list[str]) -> list[str]:
-        normalized = list(dict.fromkeys(file_id.strip() for file_id in value if file_id.strip()))
+        normalized = list(dict.fromkeys(item.strip() for item in value if item.strip()))
         if not normalized:
-            raise ValueError("file_ids must contain at least one non-empty file ID")
+            raise ValueError("file_ids must contain at least one non-empty value")
         return normalized
 
 

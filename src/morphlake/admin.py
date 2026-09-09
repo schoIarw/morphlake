@@ -395,8 +395,6 @@ def files_page(
         selected_domain=business_domain,
         selected_department=department,
     )
-    return_to = _files_url(filters, page, page_size)
-    notice = f'<div class="success-notice">已删除 {deleted} 个文件</div>' if deleted else ""
     body = (
         _api_intro(
             "文件清单",
@@ -415,12 +413,15 @@ def files_page(
       <a class="button secondary" href="/admin/api/files">清除筛选</a></div>
     </form></section>"""
     )
+    if deleted:
+        body += f'<div class="notice-success">已删除 {deleted} 个文件。</div>'
     if 200 <= result.status_code < 300:
-        body += f"""{notice}<section class="panel"><div class="section-head"><h2>最近文件</h2>
+        return_to = _files_url({**filters, "page": page, "page_size": page_size})
+        body += f"""<section class="panel"><div class="section-head"><h2>最近文件</h2>
           <div class="asset-toolbar"><span class="hint">共 {total} 条 · 第 {page} / {total_pages} 页</span>
           <form id="batch-delete-form" method="post" action="/admin/api/files/delete">
           {_csrf_input(session)}<input type="hidden" name="return_to" value="{html.escape(return_to)}">
-          <button type="submit" class="danger" disabled>删除所选</button></form></div></div>
+          <button class="danger" disabled>删除所选 <span id="selected-count"></span></button></form></div></div>
           {_object_table(items if isinstance(items, list) else [], selectable=True)}
           {_pagination(filters, page, page_size, total_pages)}</section>"""
     else:
@@ -449,21 +450,11 @@ def delete_files_action(
         json_body={"file_ids": file_ids},
     )
     if 200 <= result.status_code < 300:
-        payload = result.payload if isinstance(result.payload, dict) else {}
         destination = _safe_files_return(return_to)
         separator = "&" if "?" in destination else "?"
-        return RedirectResponse(
-            f"{destination}{separator}deleted={int(payload.get('deleted') or 0)}",
-            status_code=303,
-        )
+        return RedirectResponse(f"{destination}{separator}deleted={len(file_ids)}", status_code=303)
     return HTMLResponse(
-        _page(
-            "删除失败",
-            _result_panel(result, "文件删除失败"),
-            session,
-            settings,
-            "files",
-        ),
+        _page("文件删除失败", _result_panel(result, "文件删除失败"), session, settings, "files"),
         status_code=result.status_code,
     )
 
@@ -961,7 +952,6 @@ def _object_table(items: list[Any], *, selectable: bool = False) -> str:
 
 def _asset_table(items: list[dict[str, Any]], *, selectable: bool = False) -> str:
     columns = [
-        ("selection", ""),
         ("rank", "排名"),
         ("asset_preview", "预览"),
         ("filename", "文件名"),
@@ -976,33 +966,31 @@ def _asset_table(items: list[dict[str, Any]], *, selectable: bool = False) -> st
     ]
     available = {key for item in items for key in item}
     selected = [
-        (key, label)
-        for key, label in columns
-        if key == "asset_preview" or key in available or (key == "selection" and selectable)
+        (key, label) for key, label in columns if key == "asset_preview" or key in available
     ]
-    head = "".join(
+    head = (
         '<th><input id="select-all-files" type="checkbox" aria-label="选择本页全部文件"></th>'
-        if key == "selection"
-        else f"<th>{label}</th>"
-        for key, label in selected
-    )
+        if selectable
+        else ""
+    ) + "".join(f"<th>{label}</th>" for _, label in selected)
     rows = []
     for item in items:
-        cells = []
+        file_id = html.escape(str(item.get("file_id") or ""))
+        cells = (
+            [
+                f'<td><input class="file-select" type="checkbox" name="file_ids" '
+                f'value="{file_id}" form="batch-delete-form" aria-label="选择文件"></td>'
+            ]
+            if selectable
+            else []
+        )
         for key, _ in selected:
-            if key == "selection":
-                file_id = html.escape(str(item.get("file_id") or ""))
-                value = (
-                    f'<input class="file-select" type="checkbox" name="file_ids" '
-                    f'value="{file_id}" form="batch-delete-form" aria-label="选择文件">'
-                )
-            elif key == "asset_preview":
+            if key == "asset_preview":
                 value = _asset_preview_cell(item)
             elif key == "filename":
-                file_id = html.escape(str(item.get("file_id") or ""))
-                filename = html.escape(str(item.get("filename") or "file"))
+                filename = html.escape(str(item.get(key) or "file"))
                 value = f"""<button type="button" class="filename-download download-file"
-                  data-file-id="{file_id}" data-filename="{filename}" title="下载文件">
+                  data-file-id="{file_id}" data-filename="{filename}" title="下载 {filename}">
                   <span>{filename}</span><small>下载</small></button>"""
             elif key == "embedding_preview":
                 vector = item.get(key)
@@ -1041,11 +1029,12 @@ def _asset_preview_cell(item: dict[str, Any]) -> str:
 
 
 def _browser_datetime(value: Any) -> str:
-    timestamp = str(value or "")
-    escaped = html.escape(timestamp)
-    fallback_date, _, fallback_time = timestamp.replace("T", " ").partition(" ")
+    raw = str(value or "")
+    escaped = html.escape(raw)
+    date_part, _, time_part = raw.replace(" ", "T").partition("T")
+    time_part = time_part[:8]
     return f"""<time class="browser-datetime" datetime="{escaped}" title="{escaped}">
-      <span>{html.escape(fallback_date)}</span><small>{html.escape(fallback_time[:8])}</small></time>"""
+      <span>{html.escape(date_part)}</span><small>{html.escape(time_part)}</small></time>"""
 
 
 def _human_bytes(value: Any) -> str:
@@ -1064,8 +1053,31 @@ def _compact(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value not in (None, "")}
 
 
-def _files_url(filters: dict[str, Any], page: int, page_size: int) -> str:
-    query = urlencode(_compact({**filters, "page": page, "page_size": page_size}))
+def _pagination(filters: dict[str, Any], page: int, page_size: int, total_pages: int) -> str:
+    def link(target: int, label: str) -> str:
+        if target < 1 or target > total_pages:
+            return f'<span class="page-link disabled">{label}</span>'
+        query = urlencode(_compact({**filters, "page": target, "page_size": page_size}))
+        return f'<a class="page-link" href="/admin/api/files?{html.escape(query)}">{label}</a>'
+
+    hidden = "".join(
+        f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(str(value))}">'
+        for key, value in filters.items()
+        if value not in (None, "")
+    )
+    options = "".join(
+        f'<option value="{size}" {"selected" if size == page_size else ""}>{size} 条/页</option>'
+        for size in (10, 20, 50, 100, 200)
+    )
+    return f"""<div class="table-footer"><form method="get" action="/admin/api/files"
+      class="page-size-form">{hidden}<input type="hidden" name="page" value="1">
+      <label>每页条数<select name="page_size">{options}</select></label><button class="secondary">应用</button>
+      </form><nav class="pagination" aria-label="文件清单分页">
+      {link(page - 1, "上一页")}<span>第 {page} 页</span>{link(page + 1, "下一页")}</nav></div>"""
+
+
+def _files_url(values: dict[str, Any]) -> str:
+    query = urlencode(_compact(values))
     return f"/admin/api/files?{query}" if query else "/admin/api/files"
 
 
@@ -1074,28 +1086,6 @@ def _safe_files_return(value: str) -> str:
     if parsed.scheme or parsed.netloc or parsed.path != "/admin/api/files":
         return "/admin/api/files"
     return value
-
-
-def _pagination(filters: dict[str, Any], page: int, page_size: int, total_pages: int) -> str:
-    def link(target: int, label: str) -> str:
-        if target < 1 or target > total_pages:
-            return f'<span class="page-link disabled">{label}</span>'
-        return f'<a class="page-link" href="{html.escape(_files_url(filters, target, page_size))}">{label}</a>'
-
-    size_options = "".join(
-        f'<option value="{size}" {"selected" if page_size == size else ""}>{size} 条/页</option>'
-        for size in (10, 20, 50, 100, 200)
-    )
-    hidden = "".join(
-        f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(str(value))}">'
-        for key, value in filters.items()
-        if value not in (None, "")
-    )
-    return f"""<div class="table-footer"><form method="get" action="/admin/api/files"
-      class="page-size-form">{hidden}<input type="hidden" name="page" value="1">
-      <label>每页条数<select name="page_size" onchange="this.form.submit()">{size_options}</select></label>
-      </form><nav class="pagination" aria-label="文件清单分页">
-      {link(page - 1, "上一页")}<span>第 {page} 页</span>{link(page + 1, "下一页")}</nav></div>"""
 
 
 def _rows(rows: list[dict[str, Any]], keys: list[str]) -> str:
@@ -1352,6 +1342,31 @@ document.querySelectorAll('.key-copy').forEach(button=>button.addEventListener('
   else{input.type='text';input.select();document.execCommand('copy');done();}
 }));
 
+const pad=value=>String(value).padStart(2,'0');
+document.querySelectorAll('.browser-datetime').forEach(element=>{
+  const date=new Date(element.dateTime);
+  if(Number.isNaN(date.getTime()))return;
+  element.querySelector('span').textContent=date.getFullYear()+'-'+pad(date.getMonth()+1)+'-'+pad(date.getDate());
+  element.querySelector('small').textContent=pad(date.getHours())+':'+pad(date.getMinutes())+':'+pad(date.getSeconds());
+});
+
+const batchDeleteForm=document.getElementById('batch-delete-form');
+const fileSelections=[...document.querySelectorAll('.file-select')];
+const selectAll=document.getElementById('select-all-files');
+if(batchDeleteForm){
+  const deleteButton=batchDeleteForm.querySelector('button'),selectedCount=document.getElementById('selected-count');
+  const refreshSelection=()=>{const count=fileSelections.filter(item=>item.checked).length;
+    deleteButton.disabled=count===0;selectedCount.textContent=count?'('+count+')':'';
+    if(selectAll){selectAll.checked=count>0&&count===fileSelections.length;selectAll.indeterminate=count>0&&count<fileSelections.length;}};
+  fileSelections.forEach(item=>item.addEventListener('change',refreshSelection));
+  if(selectAll)selectAll.addEventListener('change',()=>{fileSelections.forEach(item=>item.checked=selectAll.checked);refreshSelection();});
+  batchDeleteForm.addEventListener('submit',event=>{
+    const count=fileSelections.filter(item=>item.checked).length;
+    if(!count||!window.confirm('确定删除所选 '+count+' 个文件？删除后将无法通过接口访问。')){event.preventDefault();return;}
+  });
+  refreshSelection();
+}
+
 const scopeDomain=document.getElementById('scope-business-domain');
 const scopeDepartment=document.getElementById('scope-department');
 if(scopeDomain&&scopeDepartment){
@@ -1378,35 +1393,6 @@ if(createScopeDomain&&createScopeDepartments){
   });
 }
 
-document.querySelectorAll('.browser-datetime').forEach(element=>{
-  const value=new Date(element.dateTime);
-  if(Number.isNaN(value.getTime()))return;
-  const pad=number=>String(number).padStart(2,'0');
-  element.innerHTML='<span>'+value.getFullYear()+'-'+pad(value.getMonth()+1)+'-'+pad(value.getDate())+
-    '</span><small>'+pad(value.getHours())+':'+pad(value.getMinutes())+':'+pad(value.getSeconds())+'</small>';
-});
-
-const selectAllFiles=document.getElementById('select-all-files');
-const fileSelections=[...document.querySelectorAll('.file-select')];
-const batchDeleteForm=document.getElementById('batch-delete-form');
-const batchDeleteButton=batchDeleteForm?.querySelector('button[type="submit"]');
-const updateDeleteSelection=()=>{
-  const selected=fileSelections.filter(item=>item.checked).length;
-  if(batchDeleteButton){batchDeleteButton.disabled=selected===0;
-    batchDeleteButton.textContent=selected?'删除所选（'+selected+'）':'删除所选';}
-  if(selectAllFiles){selectAllFiles.checked=selected>0&&selected===fileSelections.length;
-    selectAllFiles.indeterminate=selected>0&&selected<fileSelections.length;}
-};
-selectAllFiles?.addEventListener('change',()=>{fileSelections.forEach(item=>item.checked=selectAllFiles.checked);
-  updateDeleteSelection();});
-fileSelections.forEach(item=>item.addEventListener('change',updateDeleteSelection));
-batchDeleteForm?.addEventListener('submit',event=>{
-  const selected=fileSelections.filter(item=>item.checked).length;
-  if(!selected||!window.confirm('确定删除所选 '+selected+' 个文件？删除后不可通过接口恢复。')){
-    event.preventDefault();
-  }
-});
-
 const setBusy=(button,busy,label='处理中…')=>{
   if(!button)return;
   if(busy){button.dataset.original=button.innerHTML;button.disabled=true;
@@ -1417,8 +1403,7 @@ document.querySelectorAll('form[action^="/admin/api/"]').forEach(form=>form.addE
   if(event.defaultPrevented)return;
   if(form.dataset.submitting==='1'){event.preventDefault();return;}
   form.dataset.submitting='1';const button=form.querySelector('button[type="submit"],button:not([type])');
-  const label=form.action.endsWith('/delete')?'删除处理中…':
-    (form.enctype==='multipart/form-data'?'上传处理中…':'查询处理中…');
+  const label=form.id==='batch-delete-form'?'删除处理中…':(form.enctype==='multipart/form-data'?'上传处理中…':'查询处理中…');
   setBusy(button,true,label);
   setTimeout(()=>{form.dataset.submitting='0';setBusy(button,false);},60000);
 }));
@@ -1494,8 +1479,8 @@ _CSS = """
 .key-view{display:grid;grid-template-columns:minmax(180px,1fr) auto auto;gap:4px;min-width:310px;margin-bottom:4px}.key-view input{height:30px;margin:0;padding:4px 7px}.key-view button{min-height:30px;padding:4px 8px}.admin-key{background:#eef2ff;color:var(--blue2)}
 button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;border:0;border-radius:7px;background:var(--blue);color:#fff;padding:6px 13px;text-decoration:none;font-family:inherit;font-size:13px;font-weight:600;line-height:1.2;cursor:pointer}button:hover,.button:hover{background:var(--blue2)}button:disabled{cursor:wait;opacity:.7}.secondary{background:#f1f3f7;color:#46536a}.secondary:hover{background:#e7eaf0;color:#253047}.danger{background:#fff0f1;color:var(--red)}.danger:hover{background:#ffe4e6}.inline{display:inline}.spinner{display:inline-block;width:13px;height:13px;margin-right:7px;border:2px solid #ffffff70;border-top-color:#fff;border-radius:50%;vertical-align:-2px;animation:spin .72s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 .table-wrap{overflow:auto;margin-top:9px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#fafafb;color:#606a7b;font-size:11px;font-weight:600}td{color:#344054}.asset-table td{vertical-align:middle}.asset-table input[type=checkbox]{width:16px;height:16px;margin:0}.asset-table .text-clip{display:block;max-width:280px;white-space:normal;line-height:1.4}.vector-preview{display:block;width:76px;white-space:normal;line-height:1.25;color:#344054}.vector-preview+small,.browser-datetime small{display:block;color:var(--muted);margin-top:2px}.browser-datetime span{display:block}.filename-download{display:flex;align-items:flex-start;gap:5px;max-width:230px;min-height:0;padding:0;background:transparent;color:var(--blue2);font-weight:500;text-align:left}.filename-download span{overflow:hidden;text-overflow:ellipsis}.filename-download small{flex:none;color:var(--muted);font-size:10px}.filename-download:hover{background:transparent;color:var(--blue);text-decoration:underline}.asset-toolbar{display:flex;align-items:center;gap:10px}.asset-toolbar form{margin:0}.asset-toolbar button{min-height:28px;padding:4px 9px;font-size:12px}.media-tile{position:relative;width:58px;height:46px;padding:0;overflow:hidden;border:1px solid #dce3ef;border-radius:8px;background:#f4f6fa;color:var(--blue2);display:grid;place-items:center}.media-tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.media-placeholder{font-size:10px;color:var(--muted)}.media-icon{font-size:20px;line-height:1}.media-tile small{font-size:9px}.preview-unavailable:after{content:'暂无缩略图';position:absolute;inset:0;display:grid;place-items:center;background:#f4f6fa;color:var(--muted);font-size:9px}
-.table-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-top:12px}.page-size-form label{display:flex;align-items:center;gap:7px;white-space:nowrap}.page-size-form select{width:auto;min-width:92px;margin:0}.pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px}.page-link{padding:5px 10px;border-radius:7px;background:#f1f3f7;text-decoration:none}.page-link.disabled{color:#a5adba;background:#f7f8fa}.success-notice{padding:9px 12px;margin-bottom:12px;border:1px solid #bce4cd;border-radius:8px;background:#ecfaf2;color:var(--green)}
+.table-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-top:12px}.page-size-form{display:flex;align-items:flex-end;gap:6px}.page-size-form label{min-width:105px}.page-size-form select{height:30px;margin-top:2px}.page-size-form button{min-height:30px;padding:4px 9px}.pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px}.page-link{padding:5px 10px;border-radius:7px;background:#f1f3f7;text-decoration:none}.page-link.disabled{color:#a5adba;background:#f7f8fa}.notice-success{padding:9px 12px;margin-bottom:12px;border:1px solid #bce5ca;border-radius:8px;background:#edf9f1;color:var(--green)}
 .media-modal{width:min(920px,92vw);max-height:88vh;padding:0;border:0;border-radius:16px;box-shadow:0 24px 70px #10182755}.media-modal::backdrop{background:#10182799}.modal-head{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line)}.modal-head h2{margin:0;font-size:16px}.modal-close{width:30px;height:30px;min-height:30px;padding:0;border-radius:50%;background:#f1f3f7;color:var(--ink);font-size:20px}.modal-body{padding:16px;max-height:calc(88vh - 55px);overflow:auto}.modal-image{display:block;max-width:100%;max-height:72vh;margin:auto;border-radius:8px}.modal-body audio{display:block;width:min(680px,100%);margin:30px auto}.text-preview{display:grid;gap:12px}.text-preview section{padding:13px;border:1px solid var(--line);border-radius:10px}.text-preview h3{margin:0 0 7px}.text-preview p{white-space:pre-wrap}.text-preview pre{max-height:50vh}.empty{text-align:center!important;color:var(--muted);padding:24px!important}.status-pill{display:inline-block;padding:3px 8px;border-radius:16px;background:#f1f3f7;font-size:11px}.status-pill.ok,.status-pill.active{background:#e7f8ee;color:var(--green)}.status-pill.error,.status-pill.deleted{background:#fff0f1;color:var(--red)}.status-pill.disabled{background:#fff6dc;color:var(--amber)}.result-head{margin-bottom:9px}.tabs{display:flex;gap:6px}.tabs a{padding:4px 8px;background:#f1f3f7;border-radius:7px;text-decoration:none}.limit-form{min-width:310px;display:grid;grid-template-columns:1fr 1fr;gap:7px;padding:10px}.alert{padding:9px 12px;background:#fff7e8;border:1px solid #f1d59b;border-radius:8px;color:#775310;margin-bottom:11px}pre{white-space:pre-wrap;word-break:break-all;background:#151a24;color:#dbe7ff;padding:13px;border-radius:9px;max-height:460px;overflow:auto}.secret{font-size:14px}.token-created{text-align:center;max-width:720px;margin:30px auto}.success-mark{display:grid;place-items:center;width:46px;height:46px;margin:0 auto 10px;border-radius:50%;background:#e7f8ee;color:var(--green);font-size:23px}
 .login-body{min-height:100vh;background:#f4f5f7;display:grid;place-items:center;padding:20px}.login-shell{width:min(860px,100%);display:grid;grid-template-columns:1fr .9fr;overflow:hidden;border:1px solid var(--line);border-radius:18px;background:#fff;box-shadow:0 18px 55px #27324a18}.login-brand{color:#fff;padding:52px 44px;background:#315ee8}.login-brand .eyebrow{color:#dbe4ff}.login-brand h1{font-size:31px;line-height:1.25;margin:18px 0 10px}.login-brand p{color:#dbe4ff}.login-card{background:#fff;padding:44px 40px;display:flex;flex-direction:column;justify-content:center}.login-card h2{font-size:22px;margin:5px 0}.login-card p{color:var(--muted);margin:0 0 15px}.login-card form{display:grid;gap:11px}.login-button{width:100%;margin-top:3px}.login-card>small{color:var(--muted);margin-top:14px;text-align:center}
-@media(max-width:1000px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}.grid-form>label{max-width:none}}@media(max-width:760px){.topbar{padding:0 12px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:64px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 7px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:7px 9px}.content{margin-left:0;padding:124px 10px 24px}.grid-form{display:grid;grid-template-columns:1fr}.grid-form>label,.grid-form>.wide,.grid-form>.form-actions{max-width:none}.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.welcome{align-items:flex-start;gap:14px;flex-direction:column}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:34px 25px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}
+@media(max-width:1000px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}.grid-form>label{max-width:none}}@media(max-width:760px){.topbar{padding:0 12px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:64px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 7px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:7px 9px}.content{margin-left:0;padding:124px 10px 24px}.grid-form{display:grid;grid-template-columns:1fr}.grid-form>label,.grid-form>.wide,.grid-form>.form-actions{max-width:none}.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.welcome{align-items:flex-start;gap:14px;flex-direction:column}.table-footer{align-items:stretch;flex-direction:column}.pagination{justify-content:flex-start}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:34px 25px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}
 """

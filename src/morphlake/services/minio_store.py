@@ -59,17 +59,17 @@ class MinioStore:
             raise StorageError(f"MinIO cleanup failed: {exc.code}") from exc
 
     def delete_many(self, keys: list[str]) -> int:
-        """Delete multiple objects in one S3 request and return per-object failures."""
-        unique_keys = list(dict.fromkeys(keys))
+        """Delete object keys in one MinIO bulk request and return error count."""
+        unique_keys = list(dict.fromkeys(key for key in keys if key))
+        if not unique_keys:
+            return 0
         try:
-            return sum(
-                1
-                for _ in self.client.remove_objects(
-                    self.bucket, (DeleteObject(key) for key in unique_keys)
-                )
+            errors = self.client.remove_objects(
+                self.bucket, (DeleteObject(key) for key in unique_keys)
             )
+            return sum(1 for _ in errors)
         except S3Error as exc:
-            raise StorageError(f"MinIO batch cleanup failed: {exc.code}") from exc
+            raise StorageError(f"MinIO bulk cleanup failed: {exc.code}") from exc
 
     def stream(self, key: str, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
         try:

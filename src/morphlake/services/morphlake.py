@@ -127,22 +127,21 @@ class MorphLakeService:
         return self.catalog.get_assets(file_ids)
 
     def delete_assets(self, assets: list[dict[str, Any]]) -> dict[str, Any]:
-        """Remove searchable metadata first, then clean up descriptor-only objects."""
-        file_ids = list(dict.fromkeys(asset["file_id"] for asset in assets))
+        """Hide descriptors atomically, then best-effort clean object binaries."""
+        file_ids = [asset["file_id"] for asset in assets]
         self.catalog.delete_assets(assets)
-        object_keys = []
-        for asset in assets:
-            object_keys.append(asset["object_key"])
-            if asset["media_type"] == "image":
-                object_keys.append(self._thumbnail_key(asset["object_key"]))
+        object_keys = [asset["object_key"] for asset in assets]
+        object_keys.extend(
+            self._thumbnail_key(asset["object_key"])
+            for asset in assets
+            if asset["media_type"] == "image"
+        )
+        cleanup_failed = 0
         try:
             cleanup_failed = self.objects.delete_many(object_keys)
         except Exception:
             cleanup_failed = len(object_keys)
-            LOGGER.exception(
-                "MinIO batch cleanup failed after metadata deletion: file_ids=%s",
-                ",".join(file_ids),
-            )
+            LOGGER.exception("MinIO object cleanup failed after Paimon deletion commit")
         return {
             "requested": len(file_ids),
             "deleted": len(file_ids),
