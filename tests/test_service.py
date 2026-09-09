@@ -28,6 +28,10 @@ class FakeObjects:
     def delete(self, key):
         self.deleted.append(key)
 
+    def delete_many(self, keys):
+        self.deleted.extend(keys)
+        return 0
+
     def stream(self, key):
         yield self.values[key]
 
@@ -44,6 +48,7 @@ class FakeCatalog:
         self.image_features = []
         self.audio_features = []
         self.vector_query = None
+        self.deleted_file_ids = []
 
     def initialize(self):
         return None
@@ -67,6 +72,12 @@ class FakeCatalog:
     def vector_search(self, **values):
         self.vector_query = values
         return []
+
+    def get_assets(self, file_ids):
+        return [self.asset] if self.asset and self.asset["file_id"] in file_ids else []
+
+    def delete_assets(self, assets):
+        self.deleted_file_ids = [asset["file_id"] for asset in assets]
 
 
 def models(tmp_path: Path) -> ModelGateway:
@@ -165,6 +176,27 @@ def test_upload_compensates_object_on_paimon_failure(tmp_path: Path):
             department="audit",
         )
     assert len(objects.deleted) == 1
+
+
+def test_delete_removes_paimon_records_before_minio_objects(tmp_path: Path):
+    source = io.BytesIO()
+    Image.new("RGB", (100, 100), "navy").save(source, "PNG")
+    objects, catalog = FakeObjects(), FakeCatalog()
+    service = MorphLakeService(settings(), objects, catalog, models(tmp_path))
+    asset = service.upload(
+        filename="dashboard.png",
+        content_type="image/png",
+        body=source.getvalue(),
+        business_domain="risk",
+        department="audit",
+    )
+
+    result = service.delete_assets(service.get_assets([asset["file_id"]]))
+
+    assert result["deleted"] == 1
+    assert result["object_cleanup_failed"] == 0
+    assert catalog.deleted_file_ids == [asset["file_id"]]
+    assert objects.deleted == [asset["object_key"], service._thumbnail_key(asset["object_key"])]
 
 
 def test_upload_rejects_empty_body(tmp_path: Path):

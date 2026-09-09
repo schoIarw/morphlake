@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 from minio import Minio
+from minio.deleteobjects import DeleteObject
 from minio.error import S3Error
 
 from morphlake.config import Settings
@@ -56,6 +57,19 @@ class MinioStore:
             self.client.remove_object(self.bucket, key)
         except S3Error as exc:
             raise StorageError(f"MinIO cleanup failed: {exc.code}") from exc
+
+    def delete_many(self, keys: list[str]) -> int:
+        """Delete multiple objects in one S3 request and return per-object failures."""
+        unique_keys = list(dict.fromkeys(keys))
+        try:
+            return sum(
+                1
+                for _ in self.client.remove_objects(
+                    self.bucket, (DeleteObject(key) for key in unique_keys)
+                )
+            )
+        except S3Error as exc:
+            raise StorageError(f"MinIO batch cleanup failed: {exc.code}") from exc
 
     def stream(self, key: str, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
         try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import mimetypes
 import re
@@ -19,6 +20,8 @@ from morphlake.services.embeddings import ModelGateway
 from morphlake.services.extractors import chunk_text, classify, create_thumbnail, extract_text
 from morphlake.services.minio_store import MinioStore
 from morphlake.services.paimon_store import PaimonStore
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MorphLakeService:
@@ -119,6 +122,33 @@ class MorphLakeService:
 
     def get_asset(self, file_id: str):
         return self.catalog.get_asset(file_id)
+
+    def get_assets(self, file_ids: list[str]):
+        return self.catalog.get_assets(file_ids)
+
+    def delete_assets(self, assets: list[dict[str, Any]]) -> dict[str, Any]:
+        """Remove searchable metadata first, then clean up descriptor-only objects."""
+        file_ids = list(dict.fromkeys(asset["file_id"] for asset in assets))
+        self.catalog.delete_assets(assets)
+        object_keys = []
+        for asset in assets:
+            object_keys.append(asset["object_key"])
+            if asset["media_type"] == "image":
+                object_keys.append(self._thumbnail_key(asset["object_key"]))
+        try:
+            cleanup_failed = self.objects.delete_many(object_keys)
+        except Exception:
+            cleanup_failed = len(object_keys)
+            LOGGER.exception(
+                "MinIO batch cleanup failed after metadata deletion: file_ids=%s",
+                ",".join(file_ids),
+            )
+        return {
+            "requested": len(file_ids),
+            "deleted": len(file_ids),
+            "file_ids": file_ids,
+            "object_cleanup_failed": cleanup_failed,
+        }
 
     def download(self, file_id: str):
         asset = self.catalog.get_asset(file_id)

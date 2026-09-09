@@ -454,7 +454,7 @@ class AdminStore:
             values.append(item)
         return values
 
-    def list_scope_options(self) -> list[dict[str, str]]:
+    def list_scope_options(self, *, include_admin: bool = False) -> list[dict[str, str]]:
         """Return known business-domain/department pairs for administration filters.
 
         Token rows are retained after deletion and therefore remain useful for
@@ -462,19 +462,20 @@ class AdminStore:
         the current token registry was introduced.
         """
         with self._engine_required().connect() as connection:
-            token_rows = connection.execute(
-                select(API_TOKENS.c.business_domain, API_TOKENS.c.department)
-                .where(API_TOKENS.c.access_level == "domain")
-                .distinct()
-            ).all()
-            transfer_rows = connection.execute(
-                select(
-                    TRANSFER_EVENTS.c.business_domain,
-                    TRANSFER_EVENTS.c.department,
+            token_statement = select(
+                API_TOKENS.c.business_domain, API_TOKENS.c.department
+            ).distinct()
+            transfer_statement = select(
+                TRANSFER_EVENTS.c.business_domain,
+                TRANSFER_EVENTS.c.department,
+            ).distinct()
+            if not include_admin:
+                token_statement = token_statement.where(API_TOKENS.c.access_level == "domain")
+                transfer_statement = transfer_statement.where(
+                    TRANSFER_EVENTS.c.business_domain != "管理员"
                 )
-                .where(TRANSFER_EVENTS.c.business_domain != "管理员")
-                .distinct()
-            ).all()
+            token_rows = connection.execute(token_statement).all()
+            transfer_rows = connection.execute(transfer_statement).all()
         scopes = {
             (str(row.business_domain).strip(), str(row.department).strip())
             for row in [*token_rows, *transfer_rows]

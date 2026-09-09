@@ -39,6 +39,25 @@ class AssetList(BaseModel):
     total: int | None = None
 
 
+class DeleteFilesRequest(BaseModel):
+    file_ids: list[str] = Field(min_length=1, max_length=200)
+
+    @field_validator("file_ids")
+    @classmethod
+    def normalize_file_ids(cls, value: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(file_id.strip() for file_id in value if file_id.strip()))
+        if not normalized:
+            raise ValueError("file_ids must contain at least one non-empty file ID")
+        return normalized
+
+
+class DeleteFilesResult(BaseModel):
+    requested: int
+    deleted: int
+    file_ids: list[str]
+    object_cleanup_failed: int = 0
+
+
 class SearchHit(BaseModel):
     rank: int
     file_id: str

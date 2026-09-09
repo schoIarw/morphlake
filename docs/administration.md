@@ -96,7 +96,7 @@ curl http://localhost:8080/health/live
 curl http://localhost:8081/health/live
 ```
 
-浏览器访问 `http://localhost:8081/admin`，会自动进入登录页。使用
+浏览器直接访问 `http://localhost:8081`，会自动跳转到登录页，无需输入 `/admin`。使用
 `MORPHLAKE_ADMIN_USERNAME` 和 `MORPHLAKE_ADMIN_PASSWORD` 登录后，页面采用窄头部、左侧菜单、
 右侧工作区布局，并兼容桌面与移动浏览器。管理台参考 new-api 经典界面的信息密度与视觉习惯：
 浅色导航、圆角卡片、紧凑字号和统一高度的输入控件；桌面端筛选项优先横向排列，窄屏时自动折行。
@@ -121,6 +121,7 @@ MORPHLAKE_ADMIN_COOKIE_SECURE=true
 | --- | --- |
 | 文件上传 | `POST /api/v1/files` 及 documents/images/audio 类型端点 |
 | 文件清单 | `GET /api/v1/admin/files`；自动显示最近清单、总数和翻页 |
+| 文件删除 | `POST /api/v1/files/batch-delete`；清单复选框组合调用 |
 | 全文检索 | `POST /api/v1/search/full-text` |
 | 向量检索 | `POST /api/v1/search/vector`、`POST /api/v1/search/vector/file` |
 | 文件下载 | `GET /api/v1/files/{file_id}/download`，流式转发 |
@@ -131,13 +132,19 @@ MORPHLAKE_ADMIN_COOKIE_SECURE=true
 文件清单是管理员专属页面，管理容器在服务端从管理数据库解密默认管理 Key，直接加载最近数据，
 并支持业务域、部门、文件名、文本概要、类型和日期筛选以及分页；管理 Key 不下发到页面。业务域
 与部门筛选项从管理数据库中的 Key 和历史传输记录去重生成下拉选项，选择业务域后部门下拉只显示
-该域已有部门。Key 分配页使用相同数据生成可输入的下拉建议，以便复用已有范围，同时保留首次创建
+该域已有部门；文件筛选下拉同时包含“管理员/管理员”，可查询管理 Key 上传的文件。Key 分配页
+使用非管理员范围生成可输入的下拉建议，以便复用已有范围，同时保留首次创建
 或新增业务范围的能力。
 配置项：
 
 上传、清单、全文、向量和状态查询提交后，按钮会被禁用并显示转圈状态，阻止重复提交。查询结果
 按照模态组合调用既有 API：图片显示缩略图并可放大，文档可查看提取文本，音频可在线播放，
 三类文件均可下载；清单以文本形式显示向量前 8 位和完整维度。
+
+文件清单将“每页条数”放在表格底部；向量每一维按逗号换行，创建时间由浏览器转换到本地时区并将
+年月日、时分秒分两行显示。预览框本身就是图片放大、文本查看或音频播放入口，文件名是下载入口，
+不再增加重复操作列。勾选行后可使用清单顶部“删除所选”按钮，管理容器仅调用业务容器的批量删除
+API，不直接操作 Paimon 或 MinIO。
 
 ```bash
 MORPHLAKE_API_BASE_URL=http://morphlake-api:8080

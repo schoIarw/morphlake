@@ -26,6 +26,8 @@ from morphlake.metrics import Metrics, get_metrics
 from morphlake.models import (
     Asset,
     AssetList,
+    DeleteFilesRequest,
+    DeleteFilesResult,
     FilePreview,
     FullTextSearchRequest,
     Health,
@@ -270,6 +272,39 @@ def admin_list_files(
         returned=len(items),
         total=total,
     )
+
+
+@router.post(
+    "/api/v1/files/batch-delete",
+    response_model=DeleteFilesResult,
+    tags=["files"],
+)
+def batch_delete_files(
+    request: DeleteFilesRequest,
+    service: Annotated[MorphLakeService, Depends(get_service)],
+    identity: Annotated[TokenIdentity, Depends(require_token)],
+) -> DeleteFilesResult:
+    """Delete up to 200 files after validating every item is within the Key's scope."""
+    assets = service.get_assets(request.file_ids)
+    for asset in assets:
+        enforce_asset_access(identity, asset["business_domain"])
+    return DeleteFilesResult.model_validate(service.delete_assets(assets))
+
+
+@router.delete(
+    "/api/v1/files/{file_id}",
+    response_model=DeleteFilesResult,
+    tags=["files"],
+)
+def delete_file(
+    file_id: str,
+    service: Annotated[MorphLakeService, Depends(get_service)],
+    identity: Annotated[TokenIdentity, Depends(require_token)],
+) -> DeleteFilesResult:
+    """Delete one file and all of its modality records after scope validation."""
+    assets = service.get_assets([file_id])
+    enforce_asset_access(identity, assets[0]["business_domain"])
+    return DeleteFilesResult.model_validate(service.delete_assets(assets))
 
 
 @router.get("/api/v1/files/{file_id}/download", tags=["files"])

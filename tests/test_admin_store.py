@@ -57,6 +57,9 @@ def test_token_is_hashed_and_lifecycle_is_enforced(tmp_path: Path):
     assert protected.value.code == "admin_key_protected"
     created = create_token(store)
     assert store.list_scope_options() == [{"business_domain": "risk", "department": "audit"}]
+    assert {"business_domain": "管理员", "department": "管理员"} in store.list_scope_options(
+        include_admin=True
+    )
     row = store.list_tokens()[0]
     assert created.plaintext not in str(row)
     assert store.authenticate(created.plaintext).department == "audit"

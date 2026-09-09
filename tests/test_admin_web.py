@@ -32,6 +32,16 @@ class FakeApiClient:
                     "content_text": "report body",
                 },
             )
+        if path == "/api/v1/files/batch-delete":
+            return ApiResult(
+                200,
+                {
+                    "requested": len(kwargs["json_body"]["file_ids"]),
+                    "deleted": len(kwargs["json_body"]["file_ids"]),
+                    "file_ids": kwargs["json_body"]["file_ids"],
+                    "object_cleanup_failed": 0,
+                },
+            )
         if path in {"/api/v1/files", "/api/v1/admin/files"} and method == "GET":
             return ApiResult(
                 200,
@@ -45,6 +55,7 @@ class FakeApiClient:
                             "summary_text": "report summary",
                             "embedding_preview": [0.1, 0.2, 0.3],
                             "embedding_dimension": 768,
+                            "created_at": "2026-09-09T08:07:06+00:00",
                         }
                     ],
                     "returned": 1,
@@ -119,6 +130,9 @@ def login(client: TestClient) -> str:
 
 def test_admin_login_session_layout_and_token_lifecycle(tmp_path: Path):
     client, store, _ = build_admin(tmp_path)
+    root = client.get("/", follow_redirects=True)
+    assert root.status_code == 200
+    assert "登录管理系统" in root.text
     unauthenticated = client.get("/admin", follow_redirects=False)
     assert unauthenticated.status_code == 303
     assert unauthenticated.headers["location"].startswith("/admin/login")
@@ -248,9 +262,18 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
             assert '<select id="scope-department"' in response.text
             assert '<option value="risk"' in response.text
             assert '<option value="audit"' in response.text
+            assert '<option value="管理员"' in response.text
             assert "data-departments=" in response.text
             assert ".grid-form{display:flex" in response.text
             assert "height:34px" in response.text
+            assert 'id="select-all-files"' in response.text
+            assert 'id="batch-delete-form"' in response.text
+            assert 'class="filename-download download-file"' in response.text
+            assert 'class="browser-datetime"' in response.text
+            assert "<br>" in response.text
+            assert "每页条数" in response.text
+            assert response.text.index("每页条数") > response.text.index("asset-table")
+            assert ">操作</th>" not in response.text
         else:
             assert "API Key" in response.text
             assert 'name="business_domain"' not in response.text
@@ -287,10 +310,24 @@ def test_all_api_console_pages_forward_to_existing_api(tmp_path: Path):
     assert files.status_code == 200
     assert "report.pdf" in files.text
     assert "report summary" in files.text
-    assert "[0.1, 0.2, 0.3, …]" in files.text
+    assert "[0.1,<br>0.2,<br>0.3,<br>…]" in files.text
     assert "preview-open" in files.text
     assert "download-file" in files.text
     assert api.calls[-1]["path"] == "/api/v1/admin/files"
+
+    deleted = client.post(
+        "/admin/api/files/delete",
+        data={
+            "csrf": csrf,
+            "file_ids": ["file-1", "file-2"],
+            "return_to": "/admin/api/files?business_domain=risk&page=2&page_size=20",
+        },
+        follow_redirects=False,
+    )
+    assert deleted.status_code == 303
+    assert deleted.headers["location"].endswith("page_size=20&deleted=2")
+    assert api.calls[-1]["path"] == "/api/v1/files/batch-delete"
+    assert api.calls[-1]["json_body"]["file_ids"] == ["file-1", "file-2"]
 
     full_text = client.post(
         "/admin/api/full-text",

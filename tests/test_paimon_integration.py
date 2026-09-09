@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from morphlake.config import Settings
-from morphlake.errors import ConfigurationError
+from morphlake.errors import ConfigurationError, NotFoundError
 from morphlake.partitioning import domain_shard
 from morphlake.services.paimon_store import PaimonStore
 
@@ -20,6 +20,7 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
         PAIMON_IMAGE_TABLE="image_features",
         PAIMON_AUDIO_TABLE="audio_features",
         PAIMON_AUDIT_TABLE="transfer_audit",
+        PAIMON_DELETION_TABLE="file_deletions",
         PAIMON_TEXT_VECTOR_DIMENSION=4,
         PAIMON_IMAGE_VECTOR_DIMENSION=4,
         PAIMON_AUDIO_VECTOR_DIMENSION=4,
@@ -301,11 +302,36 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
             }
         ]
     )
-    assert set(store.tables) == {"asset", "text", "image", "audio", "audit"}
+    assert set(store.tables) == {"asset", "text", "image", "audio", "audit", "deletion"}
+    assert all(
+        table.raw_table.table_schema.options["deletion-vectors.enabled"] == "false"
+        for table in store.tables.values()
+    )
+
+    assert [asset["file_id"] for asset in store.get_assets(["file-2", "file-1"])] == [
+        "file-2",
+        "file-1",
+    ]
+    store.delete_assets(store.get_assets(["file-1"]))
+    with pytest.raises(NotFoundError):
+        store.get_asset("file-1")
+    assert all(
+        hit["file_id"] != "file-1"
+        for hit in store.full_text_search(
+            business_domain="risk",
+            department="audit",
+            keyword="liquidity",
+            start_date=None,
+            end_date=None,
+            limit=10,
+        )
+    )
 
     restarted = PaimonStore(settings)
     restarted.initialize()
-    assert set(restarted.tables) == {"asset", "text", "image", "audio", "audit"}
+    assert set(restarted.tables) == {"asset", "text", "image", "audio", "audit", "deletion"}
+    with pytest.raises(NotFoundError):
+        restarted.get_asset("file-1")
 
     incompatible = settings.model_copy(update={"text_vector_dimension": 8})
     with pytest.raises(ConfigurationError, match="dimension must be 8"):

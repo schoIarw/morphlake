@@ -17,6 +17,7 @@ class FakeService:
         self.admin_list_filters = None
         self.full_text_scope = None
         self.vector_scope = None
+        self.deleted_assets = []
 
     def initialize(self):
         return None
@@ -91,6 +92,18 @@ class FakeService:
             "business_domain": "risk",
             "department": "audit",
             "object_key": "risk/a.png",
+        }
+
+    def get_assets(self, file_ids):
+        return [self.get_asset(file_id) for file_id in file_ids]
+
+    def delete_assets(self, assets):
+        self.deleted_assets = assets
+        return {
+            "requested": len(assets),
+            "deleted": len(assets),
+            "file_ids": [asset["file_id"] for asset in assets],
+            "object_cleanup_failed": 0,
         }
 
     def preview(self, file_id):
@@ -278,6 +291,44 @@ def test_domain_key_cannot_download_another_domain(tmp_path: Path):
     denied = test_client.get(
         "/api/v1/files/file-1/download",
         headers={"Authorization": f"Bearer {finance.plaintext}"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "token_scope_mismatch"
+
+
+def test_single_and_batch_delete_validate_scope_before_service_call(tmp_path: Path):
+    test_client, store, _ = build_client(tmp_path)
+    service = test_client.app.state.fake_service
+
+    single = test_client.delete("/api/v1/files/file-1")
+    assert single.status_code == 200
+    assert single.json()["file_ids"] == ["file-1"]
+
+    batch = test_client.post(
+        "/api/v1/files/batch-delete",
+        json={"file_ids": ["file-1", "file-2", "file-1"]},
+    )
+    assert batch.status_code == 200
+    assert batch.json()["requested"] == 2
+    assert [asset["file_id"] for asset in service.deleted_assets] == ["file-1", "file-2"]
+
+    finance = store.create_token(
+        business_domain="finance",
+        department="accounting",
+        assignee_name="Bob",
+        phone="13900000000",
+        notes="test",
+        allocated_by="pytest",
+        period_seconds=60,
+        upload_requests_limit=10,
+        download_requests_limit=10,
+        upload_bytes_limit=10_000,
+        download_bytes_limit=10_000,
+    )
+    denied = test_client.post(
+        "/api/v1/files/batch-delete",
+        headers={"Authorization": f"Bearer {finance.plaintext}"},
+        json={"file_ids": ["file-1", "file-2"]},
     )
     assert denied.status_code == 403
     assert denied.json()["error"]["code"] == "token_scope_mismatch"

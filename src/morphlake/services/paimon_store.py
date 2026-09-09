@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Iterable
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pyarrow as pa
@@ -21,6 +21,7 @@ TEXT_TABLE = "text"
 IMAGE_TABLE = "image"
 AUDIO_TABLE = "audio"
 AUDIT_TABLE = "audit"
+DELETION_TABLE = "deletion"
 PARTITION_KEYS = ["ingest_date", "domain_shard"]
 PUBLIC_COLUMNS = [
     "file_id",
@@ -149,6 +150,23 @@ def audit_schema(_: Settings) -> pa.Schema:
     )
 
 
+def deletion_schema(_: Settings) -> pa.Schema:
+    """Append-only tombstones keep indexed source tables immutable."""
+    return pa.schema(
+        [
+            pa.field("file_id", pa.string(), nullable=False),
+            pa.field("business_domain", pa.string(), nullable=False),
+            pa.field("department", pa.string(), nullable=False),
+            pa.field("domain_shard", pa.int32(), nullable=False),
+            pa.field("ingest_date", pa.string(), nullable=False),
+            pa.field("deleted_at", pa.string(), nullable=False),
+            pa.field("filename", pa.string(), nullable=False),
+            pa.field("media_type", pa.string(), nullable=False),
+            pa.field("object_key", pa.string(), nullable=False),
+        ]
+    )
+
+
 def _search_fields(identifier: str) -> list[pa.Field]:
     return [
         pa.field(identifier, pa.string(), nullable=False),
@@ -167,7 +185,7 @@ def _search_fields(identifier: str) -> list[pa.Field]:
 
 
 class PaimonStore:
-    """Owns five append-only Paimon tables with one partition strategy."""
+    """Owns six append-only Paimon tables with one partition strategy."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -183,9 +201,26 @@ class PaimonStore:
         definitions = {
             ASSET_TABLE: (self.settings.paimon_table, asset_schema(self.settings), False),
             TEXT_TABLE: (self.settings.paimon_text_table, text_schema(self.settings), True),
-            IMAGE_TABLE: (self.settings.paimon_image_table, image_schema(self.settings), True),
-            AUDIO_TABLE: (self.settings.paimon_audio_table, audio_schema(self.settings), True),
-            AUDIT_TABLE: (self.settings.paimon_audit_table, audit_schema(self.settings), False),
+            IMAGE_TABLE: (
+                self.settings.paimon_image_table,
+                image_schema(self.settings),
+                True,
+            ),
+            AUDIO_TABLE: (
+                self.settings.paimon_audio_table,
+                audio_schema(self.settings),
+                True,
+            ),
+            AUDIT_TABLE: (
+                self.settings.paimon_audit_table,
+                audit_schema(self.settings),
+                False,
+            ),
+            DELETION_TABLE: (
+                self.settings.paimon_deletion_table,
+                deletion_schema(self.settings),
+                False,
+            ),
         }
         try:
             for key, (name, schema, has_vector) in definitions.items():
@@ -256,6 +291,11 @@ class PaimonStore:
                     AUDIT_TABLE,
                     ["event_id", "token_id", "file_id"],
                     ["business_domain", "department", "operation", "status"],
+                )
+                self._build_scalar_indexes(
+                    DELETION_TABLE,
+                    ["file_id"],
+                    ["business_domain", "department", "media_type"],
                 )
                 self._refresh_tables()
         except Exception as exc:
@@ -340,6 +380,14 @@ class PaimonStore:
             columns=PUBLIC_COLUMNS,
             limit=None,
         )
+        deleted = self._deleted_file_ids_for_scope(
+            business_domain=business_domain,
+            department=department,
+            media_type=media_type,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        rows = [row for row in rows if row["file_id"] not in deleted]
         rows.sort(key=lambda row: (row["created_at"], row["file_id"]), reverse=True)
         total = len(rows)
         return self._enrich_assets(rows[offset : offset + limit]), total
@@ -352,9 +400,95 @@ class PaimonStore:
             columns=PUBLIC_COLUMNS,
             limit=1,
         )
-        if not rows:
+        if not rows or self._deleted_file_ids([file_id]):
             raise NotFoundError(f"File {file_id} does not exist")
         return rows[0]
+
+    def get_assets(self, file_ids: list[str]) -> list[dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(file_ids))
+        builder = self._builder(ASSET_TABLE)
+        rows = self._read(
+            ASSET_TABLE,
+            builder.is_in("file_id", unique_ids),
+            columns=PUBLIC_COLUMNS,
+            limit=None,
+        )
+        deleted = self._deleted_file_ids(unique_ids)
+        by_id = {row["file_id"]: row for row in rows if row["file_id"] not in deleted}
+        missing = [file_id for file_id in unique_ids if file_id not in by_id]
+        if missing:
+            preview = ", ".join(missing[:5])
+            suffix = " …" if len(missing) > 5 else ""
+            raise NotFoundError(f"Files do not exist: {preview}{suffix}")
+        return [by_id[file_id] for file_id in unique_ids]
+
+    def delete_assets(self, assets: list[dict[str, Any]]) -> None:
+        """Append tombstones without rewriting global-index source tables."""
+        deleted_at = datetime.now(UTC).isoformat()
+        rows = [
+            {
+                "file_id": asset["file_id"],
+                "business_domain": asset["business_domain"],
+                "department": asset["department"],
+                "domain_shard": domain_shard(
+                    asset["business_domain"], self.settings.paimon_domain_shards
+                ),
+                "ingest_date": str(asset["created_at"])[:10],
+                "deleted_at": deleted_at,
+                "filename": asset["filename"],
+                "media_type": asset["media_type"],
+                "object_key": asset["object_key"],
+            }
+            for asset in assets
+        ]
+        try:
+            with self._lock:
+                self._require_table(DELETION_TABLE).add(
+                    pa.Table.from_pylist(rows, schema=deletion_schema(self.settings))
+                )
+        except Exception as exc:
+            raise StorageError(f"Paimon delete failed: {exc}") from exc
+
+    def _deleted_file_ids(self, file_ids: list[str]) -> set[str]:
+        if not file_ids:
+            return set()
+        builder = self._builder(DELETION_TABLE)
+        rows = self._read(
+            DELETION_TABLE,
+            builder.is_in("file_id", list(dict.fromkeys(file_ids))),
+            columns=["file_id"],
+            limit=None,
+        )
+        return {row["file_id"] for row in rows}
+
+    def _deleted_file_ids_for_scope(
+        self,
+        *,
+        business_domain: str | None,
+        department: str | None,
+        media_type: str | None,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> set[str]:
+        builder = self._builder(DELETION_TABLE)
+        predicates = []
+        if business_domain:
+            predicates.extend(self._domain_predicates(builder, business_domain))
+        if department:
+            predicates.append(builder.equal("department", department))
+        if media_type:
+            predicates.append(builder.equal("media_type", media_type))
+        if start_date:
+            predicates.append(builder.greater_or_equal("ingest_date", start_date.isoformat()))
+        if end_date:
+            predicates.append(builder.less_or_equal("ingest_date", end_date.isoformat()))
+        rows = self._read(
+            DELETION_TABLE,
+            PredicateBuilder.and_predicates(predicates),
+            columns=["file_id"],
+            limit=None,
+        )
+        return {row["file_id"] for row in rows}
 
     def get_preview(self, file_id: str, max_chars: int) -> dict[str, Any]:
         asset = self._enrich_assets([self.get_asset(file_id)])[0]
@@ -513,7 +647,14 @@ class PaimonStore:
             raise StorageError(f"Paimon vector search failed: {exc}") from exc
 
     def ping(self) -> None:
-        for key in (ASSET_TABLE, TEXT_TABLE, IMAGE_TABLE, AUDIO_TABLE, AUDIT_TABLE):
+        for key in (
+            ASSET_TABLE,
+            TEXT_TABLE,
+            IMAGE_TABLE,
+            AUDIO_TABLE,
+            AUDIT_TABLE,
+            DELETION_TABLE,
+        ):
             self._require_table(key)
         self.connection.catalog.list_tables(self.settings.paimon_database)
 
@@ -593,7 +734,8 @@ class PaimonStore:
                 limit=len(file_ids),
             )
         )
-        assets = {row["file_id"]: row for row in committed}
+        deleted = self._deleted_file_ids(file_ids)
+        assets = {row["file_id"]: row for row in committed if row["file_id"] not in deleted}
         hits = []
         seen = set()
         for row in rows:
@@ -777,6 +919,7 @@ class PaimonStore:
             IMAGE_TABLE: self.settings.paimon_image_table,
             AUDIO_TABLE: self.settings.paimon_audio_table,
             AUDIT_TABLE: self.settings.paimon_audit_table,
+            DELETION_TABLE: self.settings.paimon_deletion_table,
         }
         self.tables.update({key: self.connection.get_table(name) for key, name in names.items()})
 

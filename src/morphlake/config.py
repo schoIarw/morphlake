@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     paimon_image_table: str = Field("multimodal_image_feature", alias="PAIMON_IMAGE_TABLE")
     paimon_audio_table: str = Field("multimodal_audio_feature", alias="PAIMON_AUDIO_TABLE")
     paimon_audit_table: str = Field("multimodal_transfer_audit", alias="PAIMON_AUDIT_TABLE")
+    paimon_deletion_table: str = Field("multimodal_file_deletion", alias="PAIMON_DELETION_TABLE")
     paimon_warehouse: str = Field("s3://morphlake-paimon/warehouse", alias="PAIMON_WAREHOUSE")
     paimon_domain_shards: int = Field(32, alias="PAIMON_DOMAIN_SHARDS", ge=1, le=4096)
     paimon_vector_index_type: str = Field("ivf-sq", alias="PAIMON_VECTOR_INDEX_TYPE")

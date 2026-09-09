@@ -1,6 +1,6 @@
 # Paimon 后端表模型
 
-API 服务首次启动时使用 `ignore_if_exists=true` 创建以下五张表，并校验必需字段、统一分区、
+API 服务首次启动时使用 `ignore_if_exists=true` 创建以下六张表，并校验必需字段、统一分区、
 `bucket=-1` 和 deletion vector 配置。已存在但与模型不兼容的表会令启动失败，避免静默写坏。
 
 ## 统一物理设计
@@ -90,6 +90,16 @@ feature_id、file_id、公共业务/分区/结果字段、feature_type、时间�
 
 索引：event_id、token_id、file_id BTree；业务域、部门、操作和状态 Bitmap。表不保存 Token
 明文、使用人姓名和手机号码；人员信息只保留在受管理权限保护的管理数据库中。
+
+## 6. multimodal_file_deletion
+
+每个已删除文件追加一条 tombstone。字段包括 `file_id`、业务域、部门、`domain_shard`、原始
+`ingest_date`、`deleted_at`、文件名、媒体类型和 MinIO `object_key`。`file_id` 使用 BTree 索引，
+业务域、部门和媒体类型使用 Bitmap 索引。默认表名由 `PAIMON_DELETION_TABLE` 配置。
+
+PyPaimon 2.0 的通用全文和向量全局索引不支持开启 deletion vectors，因此不直接改写前四张
+索引源表。所有读取路径会以 tombstone 排除已删除 `file_id`；MinIO 原文件及图片缩略图同步清理。
+这种设计避免单条删除重写海量每日分区，也保留后续在维护窗口按删除标记物理清理的依据。
 
 ## 表参数
 

@@ -9,7 +9,7 @@ import time
 import uvicorn
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from morphlake import __version__
 from morphlake.admin import router
@@ -49,6 +49,10 @@ def create_admin_app(
         application.dependency_overrides[get_admin_api_client] = lambda: api_client
     application.state.admin_store = store
     application.state.metrics = metrics
+
+    @application.get("/", include_in_schema=False)
+    def root() -> RedirectResponse:
+        return RedirectResponse("/admin", status_code=307)
 
     @application.middleware("http")
     async def observe_http(request: Request, call_next):

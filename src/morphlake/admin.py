@@ -11,7 +11,7 @@ import re
 import secrets
 from datetime import UTC, datetime
 from typing import Annotated, Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from fastapi import (
@@ -355,6 +355,7 @@ def files_page(
     end_date: Annotated[str, Query(pattern=r"^$|^\d{4}-\d{2}-\d{2}$")] = "",
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1, le=200)] = 20,
+    deleted: Annotated[int, Query(ge=0)] = 0,
 ) -> HTMLResponse:
     filters = {
         "business_domain": business_domain,
@@ -389,15 +390,13 @@ def files_page(
             ("audio", "音频"),
         )
     )
-    size_options = "".join(
-        f'<option value="{size}" {"selected" if page_size == size else ""}>{size} 条/页</option>'
-        for size in (10, 20, 50, 100, 200)
-    )
     scope_filters = _scope_filter_selects(
-        scopes=store.list_scope_options(),
+        scopes=store.list_scope_options(include_admin=True),
         selected_domain=business_domain,
         selected_department=department,
     )
+    return_to = _files_url(filters, page, page_size)
+    notice = f'<div class="success-notice">已删除 {deleted} 个文件</div>' if deleted else ""
     body = (
         _api_intro(
             "文件清单",
@@ -409,7 +408,6 @@ def files_page(
       <label>文件类型<select name="media_type">{media_options}</select></label>
       {_input("文件名模糊匹配", "filename", value=filename)}
       {_input("描述/概要模糊匹配", "description", value=description)}
-      <label>每页条数<select name="page_size">{size_options}</select></label>
       {_input("开始日期", "start_date", "date", start_date)}
       {_input("结束日期", "end_date", "date", end_date)}
       <input type="hidden" name="page" value="1">
@@ -418,15 +416,55 @@ def files_page(
     </form></section>"""
     )
     if 200 <= result.status_code < 300:
-        body += f"""<section class="panel"><div class="section-head"><h2>最近文件</h2>
-          <span class="hint">共 {total} 条 · 第 {page} / {total_pages} 页</span></div>
-          {_object_table(items if isinstance(items, list) else [])}
+        body += f"""{notice}<section class="panel"><div class="section-head"><h2>最近文件</h2>
+          <div class="asset-toolbar"><span class="hint">共 {total} 条 · 第 {page} / {total_pages} 页</span>
+          <form id="batch-delete-form" method="post" action="/admin/api/files/delete">
+          {_csrf_input(session)}<input type="hidden" name="return_to" value="{html.escape(return_to)}">
+          <button type="submit" class="danger" disabled>删除所选</button></form></div></div>
+          {_object_table(items if isinstance(items, list) else [], selectable=True)}
           {_pagination(filters, page, page_size, total_pages)}</section>"""
     else:
         body += _result_panel(result, "文件清单查询失败")
     return HTMLResponse(
         _page("文件清单", body, session, settings, "files"),
         status_code=result.status_code if result.status_code >= 500 else 200,
+    )
+
+
+@router.post("/api/files/delete", response_model=None)
+def delete_files_action(
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    client: Annotated[AdminApiClient, Depends(get_admin_api_client)],
+    csrf: Annotated[str, Form()],
+    file_ids: Annotated[list[str], Form()],
+    return_to: Annotated[str, Form()] = "/admin/api/files",
+) -> RedirectResponse | HTMLResponse:
+    _verify_csrf(csrf, session)
+    result = client.request(
+        "POST",
+        "/api/v1/files/batch-delete",
+        store.default_admin_token(),
+        json_body={"file_ids": file_ids},
+    )
+    if 200 <= result.status_code < 300:
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        destination = _safe_files_return(return_to)
+        separator = "&" if "?" in destination else "?"
+        return RedirectResponse(
+            f"{destination}{separator}deleted={int(payload.get('deleted') or 0)}",
+            status_code=303,
+        )
+    return HTMLResponse(
+        _page(
+            "删除失败",
+            _result_panel(result, "文件删除失败"),
+            session,
+            settings,
+            "files",
+        ),
+        status_code=result.status_code,
     )
 
 
@@ -902,11 +940,13 @@ def _result_panel(result: ApiResult, title: str) -> str:
       </details></section>"""
 
 
-def _object_table(items: list[Any]) -> str:
+def _object_table(items: list[Any], *, selectable: bool = False) -> str:
     if not items:
         return '<div class="empty">没有匹配数据</div>'
     if any(isinstance(item, dict) and item.get("file_id") for item in items):
-        return _asset_table([item for item in items if isinstance(item, dict)])
+        return _asset_table(
+            [item for item in items if isinstance(item, dict)], selectable=selectable
+        )
     keys = list(dict.fromkeys(key for item in items if isinstance(item, dict) for key in item))
     head = "".join(f"<th>{html.escape(str(key))}</th>" for key in keys)
     rows = "".join(
@@ -919,8 +959,9 @@ def _object_table(items: list[Any]) -> str:
     return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
 
 
-def _asset_table(items: list[dict[str, Any]]) -> str:
+def _asset_table(items: list[dict[str, Any]], *, selectable: bool = False) -> str:
     columns = [
+        ("selection", ""),
         ("rank", "排名"),
         ("asset_preview", "预览"),
         ("filename", "文件名"),
@@ -932,29 +973,43 @@ def _asset_table(items: list[dict[str, Any]]) -> str:
         ("department", "部门"),
         ("created_at", "创建时间"),
         ("content_text", "命中内容"),
-        ("actions", "操作"),
     ]
     available = {key for item in items for key in item}
     selected = [
         (key, label)
         for key, label in columns
-        if key in {"asset_preview", "actions"} or key in available
+        if key == "asset_preview" or key in available or (key == "selection" and selectable)
     ]
-    head = "".join(f"<th>{label}</th>" for _, label in selected)
+    head = "".join(
+        '<th><input id="select-all-files" type="checkbox" aria-label="选择本页全部文件"></th>'
+        if key == "selection"
+        else f"<th>{label}</th>"
+        for key, label in selected
+    )
     rows = []
     for item in items:
         cells = []
         for key, _ in selected:
-            if key == "asset_preview":
+            if key == "selection":
+                file_id = html.escape(str(item.get("file_id") or ""))
+                value = (
+                    f'<input class="file-select" type="checkbox" name="file_ids" '
+                    f'value="{file_id}" form="batch-delete-form" aria-label="选择文件">'
+                )
+            elif key == "asset_preview":
                 value = _asset_preview_cell(item)
-            elif key == "actions":
-                value = _asset_actions(item)
+            elif key == "filename":
+                file_id = html.escape(str(item.get("file_id") or ""))
+                filename = html.escape(str(item.get("filename") or "file"))
+                value = f"""<button type="button" class="filename-download download-file"
+                  data-file-id="{file_id}" data-filename="{filename}" title="下载文件">
+                  <span>{filename}</span><small>下载</small></button>"""
             elif key == "embedding_preview":
                 vector = item.get(key)
                 if vector:
-                    compact = ", ".join(f"{float(number):.5g}" for number in vector[:8])
+                    compact = ",<br>".join(f"{float(number):.5g}" for number in vector[:8])
                     dimension = item.get("embedding_dimension") or "?"
-                    value = f'<code class="vector-preview">[{compact}, …]</code><small>{dimension} 维</small>'
+                    value = f'<code class="vector-preview">[{compact},<br>…]</code><small>{dimension} 维</small>'
                 else:
                     value = '<span class="hint">暂无</span>'
             elif key in {"summary_text", "content_text"}:
@@ -963,6 +1018,8 @@ def _asset_table(items: list[dict[str, Any]]) -> str:
                 value = f'<span class="text-clip" title="{html.escape(text)}">{html.escape(short)}</span>'
             elif key == "file_size":
                 value = html.escape(_human_bytes(item.get(key)))
+            elif key == "created_at":
+                value = _browser_datetime(item.get(key))
             else:
                 value = html.escape(str(item.get(key) or ""))
             cells.append(f"<td>{value}</td>")
@@ -983,19 +1040,12 @@ def _asset_preview_cell(item: dict[str, Any]) -> str:
       aria-label="查看文本"><span class="media-icon">▤</span><small>文档</small></button>"""
 
 
-def _asset_actions(item: dict[str, Any]) -> str:
-    file_id = html.escape(str(item.get("file_id") or ""))
-    filename = html.escape(str(item.get("filename") or "file"))
-    media_type = item.get("media_type")
-    action_class = {
-        "image": "thumbnail-open",
-        "audio": "audio-open",
-        "document": "preview-open",
-    }.get(media_type, "preview-open")
-    action_text = {"image": "放大", "audio": "播放", "document": "查看"}.get(media_type, "查看")
-    return f"""<div class="row-actions"><button type="button" class="secondary {action_class}"
-      data-file-id="{file_id}">{action_text}</button><button type="button" class="secondary download-file"
-      data-file-id="{file_id}" data-filename="{filename}">下载</button></div>"""
+def _browser_datetime(value: Any) -> str:
+    timestamp = str(value or "")
+    escaped = html.escape(timestamp)
+    fallback_date, _, fallback_time = timestamp.replace("T", " ").partition(" ")
+    return f"""<time class="browser-datetime" datetime="{escaped}" title="{escaped}">
+      <span>{html.escape(fallback_date)}</span><small>{html.escape(fallback_time[:8])}</small></time>"""
 
 
 def _human_bytes(value: Any) -> str:
@@ -1014,15 +1064,38 @@ def _compact(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value not in (None, "")}
 
 
+def _files_url(filters: dict[str, Any], page: int, page_size: int) -> str:
+    query = urlencode(_compact({**filters, "page": page, "page_size": page_size}))
+    return f"/admin/api/files?{query}" if query else "/admin/api/files"
+
+
+def _safe_files_return(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or parsed.path != "/admin/api/files":
+        return "/admin/api/files"
+    return value
+
+
 def _pagination(filters: dict[str, Any], page: int, page_size: int, total_pages: int) -> str:
     def link(target: int, label: str) -> str:
         if target < 1 or target > total_pages:
             return f'<span class="page-link disabled">{label}</span>'
-        query = urlencode(_compact({**filters, "page": target, "page_size": page_size}))
-        return f'<a class="page-link" href="/admin/api/files?{html.escape(query)}">{label}</a>'
+        return f'<a class="page-link" href="{html.escape(_files_url(filters, target, page_size))}">{label}</a>'
 
-    return f"""<nav class="pagination" aria-label="文件清单分页">
-      {link(page - 1, "上一页")}<span>第 {page} 页</span>{link(page + 1, "下一页")}</nav>"""
+    size_options = "".join(
+        f'<option value="{size}" {"selected" if page_size == size else ""}>{size} 条/页</option>'
+        for size in (10, 20, 50, 100, 200)
+    )
+    hidden = "".join(
+        f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(str(value))}">'
+        for key, value in filters.items()
+        if value not in (None, "")
+    )
+    return f"""<div class="table-footer"><form method="get" action="/admin/api/files"
+      class="page-size-form">{hidden}<input type="hidden" name="page" value="1">
+      <label>每页条数<select name="page_size" onchange="this.form.submit()">{size_options}</select></label>
+      </form><nav class="pagination" aria-label="文件清单分页">
+      {link(page - 1, "上一页")}<span>第 {page} 页</span>{link(page + 1, "下一页")}</nav></div>"""
 
 
 def _rows(rows: list[dict[str, Any]], keys: list[str]) -> str:
@@ -1305,6 +1378,35 @@ if(createScopeDomain&&createScopeDepartments){
   });
 }
 
+document.querySelectorAll('.browser-datetime').forEach(element=>{
+  const value=new Date(element.dateTime);
+  if(Number.isNaN(value.getTime()))return;
+  const pad=number=>String(number).padStart(2,'0');
+  element.innerHTML='<span>'+value.getFullYear()+'-'+pad(value.getMonth()+1)+'-'+pad(value.getDate())+
+    '</span><small>'+pad(value.getHours())+':'+pad(value.getMinutes())+':'+pad(value.getSeconds())+'</small>';
+});
+
+const selectAllFiles=document.getElementById('select-all-files');
+const fileSelections=[...document.querySelectorAll('.file-select')];
+const batchDeleteForm=document.getElementById('batch-delete-form');
+const batchDeleteButton=batchDeleteForm?.querySelector('button[type="submit"]');
+const updateDeleteSelection=()=>{
+  const selected=fileSelections.filter(item=>item.checked).length;
+  if(batchDeleteButton){batchDeleteButton.disabled=selected===0;
+    batchDeleteButton.textContent=selected?'删除所选（'+selected+'）':'删除所选';}
+  if(selectAllFiles){selectAllFiles.checked=selected>0&&selected===fileSelections.length;
+    selectAllFiles.indeterminate=selected>0&&selected<fileSelections.length;}
+};
+selectAllFiles?.addEventListener('change',()=>{fileSelections.forEach(item=>item.checked=selectAllFiles.checked);
+  updateDeleteSelection();});
+fileSelections.forEach(item=>item.addEventListener('change',updateDeleteSelection));
+batchDeleteForm?.addEventListener('submit',event=>{
+  const selected=fileSelections.filter(item=>item.checked).length;
+  if(!selected||!window.confirm('确定删除所选 '+selected+' 个文件？删除后不可通过接口恢复。')){
+    event.preventDefault();
+  }
+});
+
 const setBusy=(button,busy,label='处理中…')=>{
   if(!button)return;
   if(busy){button.dataset.original=button.innerHTML;button.disabled=true;
@@ -1312,9 +1414,12 @@ const setBusy=(button,busy,label='处理中…')=>{
   else{button.disabled=false;button.innerHTML=button.dataset.original||button.innerHTML;}
 };
 document.querySelectorAll('form[action^="/admin/api/"]').forEach(form=>form.addEventListener('submit',event=>{
+  if(event.defaultPrevented)return;
   if(form.dataset.submitting==='1'){event.preventDefault();return;}
   form.dataset.submitting='1';const button=form.querySelector('button[type="submit"],button:not([type])');
-  setBusy(button,true,form.enctype==='multipart/form-data'?'上传处理中…':'查询处理中…');
+  const label=form.action.endsWith('/delete')?'删除处理中…':
+    (form.enctype==='multipart/form-data'?'上传处理中…':'查询处理中…');
+  setBusy(button,true,label);
   setTimeout(()=>{form.dataset.submitting='0';setBusy(button,false);},60000);
 }));
 
@@ -1388,8 +1493,8 @@ _CSS = """
 .grid-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 12px}.grid-form>label{flex:1 1 185px;min-width:160px;max-width:300px}.grid-form>.wide{flex:2 1 360px;max-width:none}.grid-form>.token-field{flex-basis:100%;max-width:none}.grid-form>.form-actions{flex:0 0 auto;min-width:auto;max-width:none}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}.wide{min-width:0}label{display:block;color:#515b6d;font-size:12px;font-weight:600}input,textarea,select{display:block;width:100%;height:34px;margin-top:4px;padding:5px 9px;border:1px solid #d7dbe3;border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;line-height:1.35;outline:none}input[type=file]{padding:4px 7px}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px #3b65f618}textarea{height:64px;min-height:64px;resize:vertical;padding-top:7px}label small,.hint{color:var(--muted);font-size:11px;font-weight:400}.token-field{padding:9px 11px;background:#f7f8fb;border-radius:9px}.form-actions{display:flex;align-items:center;gap:8px;min-height:34px}
 .key-view{display:grid;grid-template-columns:minmax(180px,1fr) auto auto;gap:4px;min-width:310px;margin-bottom:4px}.key-view input{height:30px;margin:0;padding:4px 7px}.key-view button{min-height:30px;padding:4px 8px}.admin-key{background:#eef2ff;color:var(--blue2)}
 button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;border:0;border-radius:7px;background:var(--blue);color:#fff;padding:6px 13px;text-decoration:none;font-family:inherit;font-size:13px;font-weight:600;line-height:1.2;cursor:pointer}button:hover,.button:hover{background:var(--blue2)}button:disabled{cursor:wait;opacity:.7}.secondary{background:#f1f3f7;color:#46536a}.secondary:hover{background:#e7eaf0;color:#253047}.danger{background:#fff0f1;color:var(--red)}.danger:hover{background:#ffe4e6}.inline{display:inline}.spinner{display:inline-block;width:13px;height:13px;margin-right:7px;border:2px solid #ffffff70;border-top-color:#fff;border-radius:50%;vertical-align:-2px;animation:spin .72s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
-.table-wrap{overflow:auto;margin-top:9px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#fafafb;color:#606a7b;font-size:11px;font-weight:600}td{color:#344054}.asset-table td{vertical-align:middle}.asset-table .text-clip{display:block;max-width:280px;white-space:normal;line-height:1.4}.vector-preview{display:block;max-width:225px;overflow:hidden;text-overflow:ellipsis;color:#344054}.vector-preview+small{display:block;color:var(--muted);margin-top:2px}.row-actions{display:flex;gap:5px}.row-actions button{min-height:28px;padding:4px 8px;font-size:12px}.media-tile{position:relative;width:58px;height:46px;padding:0;overflow:hidden;border:1px solid #dce3ef;border-radius:8px;background:#f4f6fa;color:var(--blue2);display:grid;place-items:center}.media-tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.media-placeholder{font-size:10px;color:var(--muted)}.media-icon{font-size:20px;line-height:1}.media-tile small{font-size:9px}.preview-unavailable:after{content:'暂无缩略图';position:absolute;inset:0;display:grid;place-items:center;background:#f4f6fa;color:var(--muted);font-size:9px}
-.pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:12px}.page-link{padding:5px 10px;border-radius:7px;background:#f1f3f7;text-decoration:none}.page-link.disabled{color:#a5adba;background:#f7f8fa}
+.table-wrap{overflow:auto;margin-top:9px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#fafafb;color:#606a7b;font-size:11px;font-weight:600}td{color:#344054}.asset-table td{vertical-align:middle}.asset-table input[type=checkbox]{width:16px;height:16px;margin:0}.asset-table .text-clip{display:block;max-width:280px;white-space:normal;line-height:1.4}.vector-preview{display:block;width:76px;white-space:normal;line-height:1.25;color:#344054}.vector-preview+small,.browser-datetime small{display:block;color:var(--muted);margin-top:2px}.browser-datetime span{display:block}.filename-download{display:flex;align-items:flex-start;gap:5px;max-width:230px;min-height:0;padding:0;background:transparent;color:var(--blue2);font-weight:500;text-align:left}.filename-download span{overflow:hidden;text-overflow:ellipsis}.filename-download small{flex:none;color:var(--muted);font-size:10px}.filename-download:hover{background:transparent;color:var(--blue);text-decoration:underline}.asset-toolbar{display:flex;align-items:center;gap:10px}.asset-toolbar form{margin:0}.asset-toolbar button{min-height:28px;padding:4px 9px;font-size:12px}.media-tile{position:relative;width:58px;height:46px;padding:0;overflow:hidden;border:1px solid #dce3ef;border-radius:8px;background:#f4f6fa;color:var(--blue2);display:grid;place-items:center}.media-tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.media-placeholder{font-size:10px;color:var(--muted)}.media-icon{font-size:20px;line-height:1}.media-tile small{font-size:9px}.preview-unavailable:after{content:'暂无缩略图';position:absolute;inset:0;display:grid;place-items:center;background:#f4f6fa;color:var(--muted);font-size:9px}
+.table-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-top:12px}.page-size-form label{display:flex;align-items:center;gap:7px;white-space:nowrap}.page-size-form select{width:auto;min-width:92px;margin:0}.pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px}.page-link{padding:5px 10px;border-radius:7px;background:#f1f3f7;text-decoration:none}.page-link.disabled{color:#a5adba;background:#f7f8fa}.success-notice{padding:9px 12px;margin-bottom:12px;border:1px solid #bce4cd;border-radius:8px;background:#ecfaf2;color:var(--green)}
 .media-modal{width:min(920px,92vw);max-height:88vh;padding:0;border:0;border-radius:16px;box-shadow:0 24px 70px #10182755}.media-modal::backdrop{background:#10182799}.modal-head{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line)}.modal-head h2{margin:0;font-size:16px}.modal-close{width:30px;height:30px;min-height:30px;padding:0;border-radius:50%;background:#f1f3f7;color:var(--ink);font-size:20px}.modal-body{padding:16px;max-height:calc(88vh - 55px);overflow:auto}.modal-image{display:block;max-width:100%;max-height:72vh;margin:auto;border-radius:8px}.modal-body audio{display:block;width:min(680px,100%);margin:30px auto}.text-preview{display:grid;gap:12px}.text-preview section{padding:13px;border:1px solid var(--line);border-radius:10px}.text-preview h3{margin:0 0 7px}.text-preview p{white-space:pre-wrap}.text-preview pre{max-height:50vh}.empty{text-align:center!important;color:var(--muted);padding:24px!important}.status-pill{display:inline-block;padding:3px 8px;border-radius:16px;background:#f1f3f7;font-size:11px}.status-pill.ok,.status-pill.active{background:#e7f8ee;color:var(--green)}.status-pill.error,.status-pill.deleted{background:#fff0f1;color:var(--red)}.status-pill.disabled{background:#fff6dc;color:var(--amber)}.result-head{margin-bottom:9px}.tabs{display:flex;gap:6px}.tabs a{padding:4px 8px;background:#f1f3f7;border-radius:7px;text-decoration:none}.limit-form{min-width:310px;display:grid;grid-template-columns:1fr 1fr;gap:7px;padding:10px}.alert{padding:9px 12px;background:#fff7e8;border:1px solid #f1d59b;border-radius:8px;color:#775310;margin-bottom:11px}pre{white-space:pre-wrap;word-break:break-all;background:#151a24;color:#dbe7ff;padding:13px;border-radius:9px;max-height:460px;overflow:auto}.secret{font-size:14px}.token-created{text-align:center;max-width:720px;margin:30px auto}.success-mark{display:grid;place-items:center;width:46px;height:46px;margin:0 auto 10px;border-radius:50%;background:#e7f8ee;color:var(--green);font-size:23px}
 .login-body{min-height:100vh;background:#f4f5f7;display:grid;place-items:center;padding:20px}.login-shell{width:min(860px,100%);display:grid;grid-template-columns:1fr .9fr;overflow:hidden;border:1px solid var(--line);border-radius:18px;background:#fff;box-shadow:0 18px 55px #27324a18}.login-brand{color:#fff;padding:52px 44px;background:#315ee8}.login-brand .eyebrow{color:#dbe4ff}.login-brand h1{font-size:31px;line-height:1.25;margin:18px 0 10px}.login-brand p{color:#dbe4ff}.login-card{background:#fff;padding:44px 40px;display:flex;flex-direction:column;justify-content:center}.login-card h2{font-size:22px;margin:5px 0}.login-card p{color:var(--muted);margin:0 0 15px}.login-card form{display:grid;gap:11px}.login-button{width:100%;margin-top:3px}.login-card>small{color:var(--muted);margin-top:14px;text-align:center}
 @media(max-width:1000px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.api-target{display:none}.grid-form>label{max-width:none}}@media(max-width:760px){.topbar{padding:0 12px}.top-actions>span:not(.avatar){display:none}.sidebar{position:fixed;top:64px;width:100%;height:48px;bottom:auto;display:flex;overflow-x:auto;padding:5px 7px}.nav-group{display:flex;margin:0}.nav-group small{display:none}.nav-group a{white-space:nowrap;padding:7px 9px}.content{margin-left:0;padding:124px 10px 24px}.grid-form{display:grid;grid-template-columns:1fr}.grid-form>label,.grid-form>.wide,.grid-form>.form-actions{max-width:none}.quick-grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}.welcome{align-items:flex-start;gap:14px;flex-direction:column}.login-shell{grid-template-columns:1fr}.login-brand{display:none}.login-card{padding:34px 25px}.brand em{display:none}}@media(max-width:430px){.cards{grid-template-columns:1fr}.top-actions .avatar{display:none}}
