@@ -235,6 +235,10 @@ def test_native_paimon_list_full_text_and_vector(tmp_path: Path):
     )
     assert page[0]["file_id"] == "file-2"
     assert vector[0]["file_id"] == "file-1"
+    assert vector[0]["match_rate"] == 1.0
+    assert all("match_rate" in row for row in vector)
+    rates = [row["match_rate"] for row in vector]
+    assert rates == sorted(rates, reverse=True)
     fresh = {
         **base,
         "file_id": "file-4",
@@ -535,3 +539,83 @@ def test_add_compensates_half_published_asset_with_tombstone(tmp_path: Path, mon
     )
     assert total == 0
     assert page == []
+
+
+def test_vector_match_rate_ranks_descending(tmp_path: Path):
+    settings = Settings(
+        PAIMON_WAREHOUSE=str(tmp_path / "warehouse"),
+        PAIMON_DATABASE="morphlake_test",
+        PAIMON_TABLE="assets",
+        PAIMON_TEXT_TABLE="text_segments",
+        PAIMON_IMAGE_TABLE="image_features",
+        PAIMON_AUDIO_TABLE="audio_features",
+        PAIMON_AUDIT_TABLE="transfer_audit",
+        PAIMON_DELETION_TABLE="file_deletions",
+        PAIMON_TEXT_VECTOR_DIMENSION=4,
+        PAIMON_IMAGE_VECTOR_DIMENSION=4,
+        PAIMON_AUDIO_VECTOR_DIMENSION=4,
+        PAIMON_VECTOR_INDEX_TYPE="ivf-sq",
+    )
+    store = PaimonStore(settings)
+    store.initialize()
+    shard = domain_shard("risk", settings.paimon_domain_shards)
+    for index, vector in enumerate(
+        ([1.0, 0.0, 0.0, 0.0], [0.8, 0.6, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [-0.5, 0.0, 0.0, 0.0])
+    ):
+        created = f"2026-08-{30 - index:02d}T00:00:00+00:00"
+        store.add(
+            asset={
+                "file_id": f"file-{index}",
+                "business_domain": "risk",
+                "department": "audit",
+                "domain_shard": shard,
+                "ingest_date": created[:10],
+                "created_at": created,
+                "filename": f"report-{index}.txt",
+                "media_type": "document",
+                "content_type": "text/plain",
+                "file_size": 12,
+                "object_bucket": "data",
+                "object_key": f"risk/report-{index}.txt",
+                "object_etag": "etag",
+                "chunk_count": 1,
+                "content_sha256": "abc",
+            },
+            text_segments=[
+                {
+                    "segment_id": f"file-{index}:0",
+                    "file_id": f"file-{index}",
+                    "business_domain": "risk",
+                    "department": "audit",
+                    "domain_shard": shard,
+                    "ingest_date": created[:10],
+                    "created_at": created,
+                    "filename": f"report-{index}.txt",
+                    "media_type": "document",
+                    "record_type": "chunk",
+                    "chunk_index": 0,
+                    "content_text": f"queryable content {index}",
+                    "segment_type": "document_chunk",
+                    "chunk_start": 0,
+                    "chunk_end": 12,
+                    "embedding_model": "test",
+                    "embedding_version": "1",
+                    "text_embedding": vector,
+                }
+            ],
+            image_features=[],
+            audio_features=[],
+        )
+    store.maintain_indexes()
+    hits = store.vector_search(
+        business_domain="risk",
+        department="audit",
+        vector=[1.0, 0.0, 0.0, 0.0],
+        vector_field="text",
+        start_date=None,
+        end_date=None,
+        limit=10,
+    )
+    assert [hit["match_rate"] for hit in hits] == [1.0, 0.8, 0.0, 0.0]
+    assert [hit["file_id"] for hit in hits] == ["file-0", "file-1", "file-2", "file-3"]
+    assert hits[3]["match_rate"] == 0.0  # negative cosine is clamped to 0%

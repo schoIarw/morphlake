@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
@@ -638,11 +639,15 @@ class PaimonStore:
             rows = self._read(
                 table_key,
                 exact_predicate,
-                columns=[*SEARCH_COLUMNS, "_ROW_ID"],
+                columns=[*SEARCH_COLUMNS, column, "_ROW_ID"],
                 limit=fetch_limit,
                 global_index_result=result,
             )
-            return self._committed_hits(self._rank_hits(rows, result), limit)
+            rows = self._rank_hits(rows, result)
+            for row in rows:
+                row["match_rate"] = self._match_rate(vector, row.get(column))
+            rows.sort(key=lambda row: row["match_rate"], reverse=True)
+            return self._committed_hits(rows, limit)
         except Exception as exc:
             raise StorageError(f"Paimon vector search failed: {exc}") from exc
 
@@ -815,6 +820,21 @@ class PaimonStore:
         if vector is None:
             return None
         return [float(value) for value in vector[:4]]
+
+    @staticmethod
+    def _match_rate(query: list[float], vector: Any) -> float:
+        """Cosine similarity of the query against a stored vector, clamped to
+        [0, 1] and rounded to four decimals. A negative cosine means the
+        vectors point away from each other, so the match rate is 0%."""
+        if not vector:
+            return 0.0
+        values = [float(value) for value in vector]
+        if len(values) != len(query):
+            return 0.0
+        dot = sum(q * v for q, v in zip(query, values, strict=True))
+        query_norm = math.sqrt(sum(q * q for q in query)) or 1.0
+        vector_norm = math.sqrt(sum(v * v for v in values)) or 1.0
+        return round(max(0.0, dot / (query_norm * vector_norm)), 4)
 
     def _read(
         self,

@@ -73,6 +73,7 @@ class SearchHit(BaseModel):
     file_size: int | None = None
     summary_text: str | None = None
     thumbnail_available: bool = False
+    match_rate: float | None = None
 
 
 class FilePreview(BaseModel):
