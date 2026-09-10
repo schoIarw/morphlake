@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import secrets
 import time
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Header, Request
@@ -32,8 +33,12 @@ def create_admin_app(
     settings = settings or get_settings()
     store = store or AdminStore(settings)
     metrics = metrics or Metrics()
-    store.initialize()
-    metrics.management_db_info.labels(store.backend).set(1)
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        store.initialize()
+        metrics.management_db_info.labels(store.backend).set(1)
+        yield
 
     application = FastAPI(
         title="MorphLake Administration",
@@ -41,7 +46,10 @@ def create_admin_app(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
+    application.state.store = store
+    application.state.settings = settings
     application.include_router(router)
     application.dependency_overrides[get_settings] = lambda: settings
     application.dependency_overrides[get_admin_store] = lambda: store

@@ -115,8 +115,13 @@ def build_admin(tmp_path: Path):
         MORPHLAKE_API_BASE_URL="http://api.test",
     )
     store = AdminStore(settings)
+    store.initialize()
+    from morphlake.metrics import Metrics
+
+    metrics = Metrics()
+    metrics.management_db_info.labels(store.backend).set(1)
     api_client = FakeApiClient()
-    client = TestClient(create_admin_app(settings, store, api_client=api_client))
+    client = TestClient(create_admin_app(settings, store, metrics=metrics, api_client=api_client))
     return client, store, api_client
 
 
@@ -493,15 +498,17 @@ def test_limits_config_unified_save_and_limit_board(tmp_path: Path):
     )
     login(client)
 
-    # 限额配置页：统一保存按钮，无每行保存，无速率面板
+    # 限额配置页：统一保存按钮，无每行保存，无速率面板，支持 MB/GB 单位
     page = client.get("/admin/limits")
     assert page.status_code == 200
     assert "保存全部限额" in page.text
     assert 'form="limit-form-' not in page.text
     assert "rate-panel" not in page.text
     assert "limits[" in page.text
+    assert "upload_bytes_limit_unit" in page.text
+    assert "下载配额" in page.text and "上传配额" in page.text
 
-    # 统一保存所有 key 的限额
+    # 统一保存所有 key 的限额（上传 10MB，下载 2GB）
     csrf = page.text.split('name="csrf" value="', 1)[1].split('"', 1)[0]
     token_id = next(row["token_id"] for row in store.list_tokens())
     saved = client.post(
@@ -511,14 +518,18 @@ def test_limits_config_unified_save_and_limit_board(tmp_path: Path):
             f"limits[{token_id}][period_seconds]": "120",
             f"limits[{token_id}][upload_requests_limit]": "20",
             f"limits[{token_id}][download_requests_limit]": "30",
-            f"limits[{token_id}][upload_bytes_limit]": "12000",
-            f"limits[{token_id}][download_bytes_limit]": "12000",
+            f"limits[{token_id}][upload_bytes_limit]": "10",
+            f"limits[{token_id}][upload_bytes_limit_unit]": "MB",
+            f"limits[{token_id}][download_bytes_limit]": "2",
+            f"limits[{token_id}][download_bytes_limit_unit]": "GB",
         },
         follow_redirects=False,
     )
     assert saved.status_code == 303
     assert saved.headers["location"] == "/admin/limits"
     assert store.list_tokens()[0]["period_seconds"] == 120
+    assert store.list_tokens()[0]["upload_bytes_limit"] == 10 * 1024 * 1024
+    assert store.list_tokens()[0]["download_bytes_limit"] == 2 * 1024**3
 
     # 限额看板页
     board = client.get("/admin/limit-board")
@@ -527,8 +538,8 @@ def test_limits_config_unified_save_and_limit_board(tmp_path: Path):
     assert 'data-mode="realtime"' in board.text
     assert 'data-mode="history"' in board.text
     assert 'id="board-chart"' in board.text
-    assert "board-token-filter" in board.text
-    assert "board-prefix-filter" in board.text
+    assert "board-domain-filter" in board.text
+    assert "board-department-filter" in board.text
     assert "board-auto-toggle" in board.text
     assert "board-badge" in board.text
 

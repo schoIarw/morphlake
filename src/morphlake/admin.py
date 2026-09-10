@@ -315,7 +315,7 @@ def limits_page(
       <form method="post" action="/admin/limits/save">
       {_csrf_input(session)}
       <div class="table-wrap"><table><thead><tr><th>Key</th><th>业务范围</th>
-      <th>周期（秒）</th><th>上传次数</th><th>上传字节</th><th>下载次数</th><th>下载字节</th>
+      <th>周期（秒）</th><th>上传次数</th><th>上传配额</th><th>下载次数</th><th>下载配额</th>
       </tr></thead><tbody>{limit_rows or _empty_row(7)}</tbody></table></div>
       <div class="form-actions" style="margin-top:12px;"><button>保存全部限额</button></div>
       </form></section>"""
@@ -341,11 +341,11 @@ async def limits_save(
             download_requests_limit = int(
                 form.get(f"{prefix}[download_requests_limit]", token["download_requests_limit"])
             )
-            upload_bytes_limit = int(
-                form.get(f"{prefix}[upload_bytes_limit]", token["upload_bytes_limit"])
+            upload_bytes_limit = _parse_byte_limit(
+                form, prefix, "upload_bytes_limit", token["upload_bytes_limit"]
             )
-            download_bytes_limit = int(
-                form.get(f"{prefix}[download_bytes_limit]", token["download_bytes_limit"])
+            download_bytes_limit = _parse_byte_limit(
+                form, prefix, "download_bytes_limit", token["download_bytes_limit"]
             )
         except (TypeError, ValueError):
             continue
@@ -1505,6 +1505,41 @@ def _card(title: str, value: Any, note: str = "") -> str:
       <strong>{html.escape(str(value))}</strong><small>{html.escape(note)}</small></div>"""
 
 
+BYTE_UNITS = (("B", 1), ("KB", 1024), ("MB", 1024**2), ("GB", 1024**3))
+
+
+def _bytes_to_display(byte_count: int) -> tuple[float, str]:
+    """Pick the largest unit that keeps the displayed value >= 1."""
+    value = float(byte_count or 0)
+    for unit, multiplier in reversed(BYTE_UNITS):
+        if value >= multiplier:
+            return round(value / multiplier, 2), unit
+    return value, "B"
+
+
+def _byte_limit_input(token_id: str, field_name: str, byte_value: int) -> str:
+    display_value, display_unit = _bytes_to_display(byte_value)
+    unit_options = "".join(
+        f'<option value="{unit}"{" selected" if unit == display_unit else ""}>{unit}</option>'
+        for unit, _ in BYTE_UNITS
+    )
+    return f"""<div class="byte-limit-input">
+      <input class="limit-input" type="number" step="0.01" min="0"
+        name="limits[{token_id}][{field_name}]" value="{display_value}" required>
+      <select name="limits[{token_id}][{field_name}_unit]">{unit_options}</select></div>"""
+
+
+def _parse_byte_limit(form: dict[str, Any], prefix: str, field_name: str, fallback: int) -> int:
+    raw_value = form.get(f"{prefix}[{field_name}]")
+    raw_unit = form.get(f"{prefix}[{field_name}_unit]", "B")
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return fallback
+    multiplier = dict(BYTE_UNITS).get(raw_unit, 1)
+    return max(0, int(round(value * multiplier)))
+
+
 def _limit_row(row: dict[str, Any]) -> str:
     token_id = html.escape(row["token_id"])
     prefix = html.escape(row["token_prefix"])
@@ -1512,19 +1547,20 @@ def _limit_row(row: dict[str, Any]) -> str:
         f"{html.escape(row['business_domain'])}<br>"
         f'<span class="hint">{html.escape(row["department"])}</span>'
     )
-    fields = (
-        ("period_seconds", "period_seconds", 1),
-        ("upload_requests_limit", "upload_requests_limit", 0),
-        ("upload_bytes_limit", "upload_bytes_limit", 0),
-        ("download_requests_limit", "download_requests_limit", 0),
-        ("download_bytes_limit", "download_bytes_limit", 0),
+    period_cell = f"""<td><input class="limit-input" type="number"
+      name="limits[{token_id}][period_seconds]" value="{row["period_seconds"]}" min="1" required></td>"""
+    upload_req_cell = f"""<td><input class="limit-input" type="number"
+      name="limits[{token_id}][upload_requests_limit]" value="{row["upload_requests_limit"]}" min="0" required></td>"""
+    upload_byte_cell = (
+        f"<td>{_byte_limit_input(token_id, 'upload_bytes_limit', row['upload_bytes_limit'])}</td>"
     )
-    cells = "".join(
-        f"""<td><input class="limit-input" type="number"
-          name="limits[{token_id}][{name}]" value="{row[key]}" min="{minimum}" required></td>"""
-        for name, key, minimum in fields
+    download_req_cell = f"""<td><input class="limit-input" type="number"
+      name="limits[{token_id}][download_requests_limit]" value="{row["download_requests_limit"]}" min="0" required></td>"""
+    download_byte_cell = f"<td>{_byte_limit_input(token_id, 'download_bytes_limit', row['download_bytes_limit'])}</td>"
+    return (
+        f"<tr><td><code>{prefix}</code></td><td>{scope}</td>{period_cell}"
+        f"{upload_req_cell}{upload_byte_cell}{download_req_cell}{download_byte_cell}</tr>"
     )
-    return f"<tr><td><code>{prefix}</code></td><td>{scope}</td>{cells}</tr>"
 
 
 def _transfer_detail_rows(rows: list[dict[str, Any]]) -> str:
@@ -1818,7 +1854,7 @@ _CSS = """
 .topbar{height:64px;background:var(--white);border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 20px;position:fixed;z-index:20;top:0;left:0;right:0}.brand{display:flex;align-items:center;gap:8px;color:var(--ink);text-decoration:none}.brand b{font-size:16px}.brand em{font-style:normal;color:var(--muted);border-left:1px solid var(--line);padding-left:9px}.logo-mark{display:grid;place-items:center;width:44px;height:44px;border-radius:12px;background:var(--blue);color:#fff;font-weight:800;font-size:20px}.logo-mark.small{width:32px;height:32px;border-radius:9px;font-size:14px}.top-actions{display:flex;align-items:center;gap:8px;color:var(--muted)}.top-actions form{margin:0}.api-target{padding:4px 9px;background:#f2f3f5;border-radius:16px;font-size:11px}.avatar{display:grid;place-items:center;width:28px;height:28px;background:#eef2ff;color:var(--blue2);border-radius:50%;font-weight:700}.link-button{border:0;background:transparent;color:var(--muted);padding:5px 7px;cursor:pointer}
 .sidebar{position:fixed;z-index:10;top:64px;bottom:0;left:0;width:var(--sidebar);background:var(--white);border-right:1px solid var(--line);padding:12px 8px;overflow:auto}.nav-group{margin-bottom:13px}.nav-group small{display:block;color:#8a93a3;font-size:11px;letter-spacing:.04em;padding:6px 12px}.nav-group a{display:flex;align-items:center;gap:9px;color:#4f596b;text-decoration:none;padding:8px 11px;margin:3px 0;border-radius:7px;transition:.15s}.nav-group a:hover{background:#f4f6fb;color:var(--blue2)}.nav-group a.active{background:#eef2ff;color:var(--blue2);font-weight:600}.nav-dot{width:6px;height:6px;border-radius:50%;background:#a5adba}.active .nav-dot{background:var(--blue);box-shadow:0 0 0 3px #3b65f620}
 .content{margin-left:var(--sidebar);padding:80px 18px 28px;max-width:1720px}.page-head{display:flex;justify-content:space-between;align-items:end;margin-bottom:12px}.page-head h1{font-size:22px;line-height:1.3;margin:1px 0}.eyebrow{color:var(--blue);font-size:9px;font-weight:800;letter-spacing:.12em}.panel,.intro,.quick,.card{background:var(--white);border:1px solid var(--line);border-radius:16px;box-shadow:0 1px 2px #1c243408}.panel{padding:16px;margin:0 0 12px}.panel h2,.intro h2{margin:0 0 4px;font-size:16px}.panel p,.intro p{color:var(--muted);margin:3px 0 11px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.intro{padding:14px 16px;margin-bottom:12px}.intro p{margin-bottom:0}
-.cards{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-bottom:12px}.card{padding:14px}.card span,.card small{display:block;color:var(--muted)}.card strong{display:block;font-size:24px;margin:3px 0}.limit-input{width:96px;min-width:96px}
+.cards{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-bottom:12px}.card{padding:14px}.card span,.card small{display:block;color:var(--muted)}.card strong{display:block;font-size:24px;margin:3px 0}.limit-input{width:96px;min-width:96px}.byte-limit-input{display:flex;align-items:center;gap:4px}.byte-limit-input select{border:1px solid var(--border);border-radius:6px;padding:5px 4px;font-size:12px;background:#fff}
 .board-panel{padding:0;overflow:hidden}.board-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;padding:16px 20px 12px;border-bottom:1px solid var(--border)}.board-title{display:flex;align-items:center;gap:10px}.board-title h2{margin:0;font-size:18px}.board-icon{font-size:18px}.board-badge{background:#DCFCE7;color:#166534;border-radius:12px;padding:2px 10px;font-size:12px;font-weight:600}.board-controls{display:flex;align-items:center;gap:8px;flex-wrap:nowrap}.board-realtime-controls,.board-history-controls{display:flex;align-items:center;gap:8px;flex-wrap:nowrap}.board-tabs{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}.board-tabs button{border:none;background:#fff;padding:6px 16px;cursor:pointer;font-size:13px;color:var(--muted)}.board-tabs button.active{background:var(--blue2);color:var(--blue);font-weight:600}.board-controls select,.board-controls input[type=datetime-local]{border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:13px;background:#fff}.board-controls button{border:1px solid var(--border);background:#fff;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px;white-space:nowrap;flex-shrink:0}.board-controls button.active{background:#EFF6FF;color:#2563EB;border-color:#BFDBFE;font-weight:600}
 .board-filters{display:flex;flex-wrap:nowrap;align-items:center;gap:10px;padding:10px 20px;border-bottom:1px solid var(--border);background:#FAFAFA}.filter-label{color:var(--muted);font-size:13px;white-space:nowrap;flex-shrink:0}.board-filters select,.board-filters input{border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:13px;min-width:160px}.board-chart-wrap{position:relative;padding:16px 20px;min-height:320px}#board-chart{width:100%;height:auto;display:block}.board-empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:var(--muted)}.board-empty strong{font-size:18px;color:var(--text)}.board-legend{display:flex;flex-wrap:wrap;gap:14px;padding:0 20px 16px}.legend-item{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text)}.legend-item i{width:14px;height:3px;border-radius:2px;display:inline-block}.legend-item small{color:var(--muted)}.welcome{display:flex;justify-content:space-between;align-items:center;padding:18px}.welcome p{margin-bottom:0}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick{display:flex;flex-direction:column;padding:16px;text-decoration:none;color:var(--ink);transition:.15s}.quick:hover{border-color:#c8d3fa;background:#fbfcff}.quick strong{font-size:15px}.quick span{color:var(--muted);margin:5px 0 10px}.quick b{color:var(--blue);font-size:12px}
 .grid-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 12px}.grid-form>label{flex:1 1 185px;min-width:160px;max-width:300px}.grid-form>.field-name{flex:0 0 140px;max-width:140px}.grid-form>.field-phone{flex:0 0 170px;max-width:170px}.grid-form>.wide{flex:2 1 360px;max-width:none}.grid-form>.token-field{flex-basis:100%;max-width:none}.grid-form>.form-actions{flex:0 0 auto;min-width:auto;max-width:none}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}.wide{min-width:0}label{display:block;color:#515b6d;font-size:12px;font-weight:600}input,textarea,select{display:block;width:100%;height:34px;margin-top:4px;padding:5px 9px;border:1px solid #d7dbe3;border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;line-height:1.35;outline:none}input[type=file]{padding:4px 7px}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px #3b65f618}textarea{height:64px;min-height:64px;resize:vertical;padding-top:7px}label small,.hint{color:var(--muted);font-size:11px;font-weight:400}.token-field{padding:9px 11px;background:#f7f8fb;border-radius:9px}.form-actions{display:flex;align-items:center;gap:8px;min-height:34px}

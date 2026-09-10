@@ -39,13 +39,13 @@ def create_app(
     service = service or MorphLakeService(settings)
     admin_store = admin_store or AdminStore(settings)
     metrics = metrics or Metrics()
-    admin_store.initialize()
-    metrics.management_db_info.labels(admin_store.backend).set(1)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         tasks: list[asyncio.Task] = []
         if initialize:
+            admin_store.initialize()
+            metrics.management_db_info.labels(admin_store.backend).set(1)
             await asyncio.to_thread(service.initialize)
             tasks.extend(
                 [
