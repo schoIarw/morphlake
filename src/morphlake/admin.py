@@ -155,14 +155,13 @@ def tokens_page(
     store: Annotated[AdminStore, Depends(get_admin_store)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> HTMLResponse:
-    scopes = store.list_scope_options()
-    rows = "".join(_token_row(row, session.csrf_token) for row in store.list_tokens(reveal=True))
+    rows = "".join(_token_row(row) for row in store.list_tokens(reveal=True))
     body = f"""
     <section class="panel"><div class="section-head"><div><h2>分配业务域 Key</h2>
       <p>Key 固定绑定业务域和部门；上传自动继承归属，查询自动限制到该业务域。</p></div></div>
       <form method="post" action="/admin/tokens" class="grid-form">
         {_csrf_input(session)}
-        {_scope_assignment_inputs(scopes)}
+        {_scope_assignment_inputs()}
         {_input("使用人姓名", "assignee_name", required=True, maxlength=128)}
         {_input("手机号码", "phone", required=True, maxlength=32)}
         {_input("周期（秒）", "period_seconds", "number", settings.default_rate_period_seconds, min=1, required=True)}
@@ -175,12 +174,40 @@ def tokens_page(
         <div class="wide form-actions"><button type="submit">生成 Key</button><span class="hint">配额填 0 表示不限制</span></div>
       </form>
     </section>
-    <section class="panel"><h2>已分配 Key</h2><p class="hint">管理 Key 可查询全部数据；业务域 Key 仅能查询所属业务域。限额配置已移至“限额管理”。</p>
+    <section class="panel"><div class="section-head"><div><h2>已分配 Key</h2>
+      <p class="hint">管理 Key 可查询全部数据；业务域 Key 仅能查询所属业务域。限额配置已移至“限额配置”。</p></div>
+      <form id="token-batch-form" class="token-toolbar" method="post" action="/admin/tokens/batch">
+      {_csrf_input(session)}<span id="token-selected-count" class="hint"></span>
+      <button class="secondary token-batch-action" name="action" value="enable" disabled>启用</button>
+      <button class="secondary token-batch-action" name="action" value="disable" disabled>停用</button>
+      <button class="secondary token-batch-action" name="action" value="rotate" disabled>重新生成</button>
+      <button id="token-delete-selected" class="danger token-batch-action" name="action" value="delete" disabled>删除</button>
+      </form></div>
       <div class="table-wrap"><table><thead><tr>
+      <th><input id="select-all-tokens" class="table-checkbox" type="checkbox" aria-label="选择全部 Key"></th>
       <th>Key</th><th>权限</th><th>业务范围</th><th>使用人</th><th>手机</th><th>备注</th><th>状态</th>
-      <th>创建/过期</th><th>操作</th>
+      <th>创建/过期</th>
       </tr></thead><tbody>{rows or _empty_row(9)}</tbody></table></div></section>"""
     return HTMLResponse(_page("Key 管理", body, session, settings, "tokens"))
+
+
+@router.post("/tokens/batch")
+def batch_tokens(
+    session: Annotated[AdminSession, Depends(require_admin_session)],
+    store: Annotated[AdminStore, Depends(get_admin_store)],
+    csrf: Annotated[str, Form()],
+    token_ids: Annotated[list[str], Form()],
+    action: Annotated[str, Form()],
+) -> RedirectResponse:
+    _verify_csrf(csrf, session)
+    if action == "rotate":
+        store.rotate_tokens(token_ids)
+    else:
+        status = {"enable": "active", "disable": "disabled", "delete": "deleted"}.get(action)
+        if status is None:
+            raise MorphLakeError("invalid_token_action", "Unsupported token action", 400)
+        store.set_token_statuses(token_ids, status)
+    return RedirectResponse("/admin/tokens", status_code=303)
 
 
 @router.post("/tokens", response_class=HTMLResponse)
@@ -1421,25 +1448,9 @@ def _input(
       value="{html.escape(str(value))}" {rendered}></label>"""
 
 
-def _scope_assignment_inputs(scopes: list[dict[str, str]]) -> str:
-    domains = sorted({row["business_domain"] for row in scopes})
-    department_map: dict[str, set[str]] = {"": set()}
-    for row in scopes:
-        department_map[""].add(row["department"])
-        department_map.setdefault(row["business_domain"], set()).add(row["department"])
-    serialized_map = {domain: sorted(departments) for domain, departments in department_map.items()}
-    data_map = html.escape(json.dumps(serialized_map, ensure_ascii=False), quote=True)
-    domain_options = "".join(f'<option value="{html.escape(value)}">' for value in domains)
-    department_options = "".join(
-        f'<option value="{html.escape(value)}">' for value in serialized_map[""]
-    )
-    return f"""<label>业务域<input id="scope-create-business-domain" name="business_domain"
-      required maxlength="128" list="known-business-domains" data-departments="{data_map}"
-      placeholder="选择或输入业务域"></label>
-      <label>部门<input id="scope-create-department" name="department" required maxlength="128"
-      list="known-departments" placeholder="选择或输入部门"></label>
-      <datalist id="known-business-domains">{domain_options}</datalist>
-      <datalist id="known-departments">{department_options}</datalist>"""
+def _scope_assignment_inputs() -> str:
+    return f"""{_input("业务域", "business_domain", required=True, maxlength=128)}
+      {_input("部门", "department", required=True, maxlength=128)}"""
 
 
 def _scope_filter_selects(
@@ -1535,34 +1546,26 @@ def _transfer_detail_rows(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def _token_row(row: dict[str, Any], csrf: str) -> str:
+def _token_row(row: dict[str, Any]) -> str:
     token_id = html.escape(row["token_id"])
-    action = "enable" if row["status"] == "disabled" else "disable"
-    action_text = "启用" if action == "enable" else "停用"
     plaintext = row.get("plaintext")
     if plaintext:
-        key_view = f"""<div class="key-view"><button type="button" class="secondary key-copy"
-          data-target="{token_id}" data-key="{html.escape(plaintext)}">复制</button></div>"""
+        key_note = f"""<button type="button" class="text-link key-copy"
+          data-target="{token_id}" data-key="{html.escape(plaintext)}">复制</button>"""
     else:
-        key_view = """<span class="hint">历史 Key 无法恢复</span>"""
+        key_note = '<span class="hint">历史 Key 无法恢复</span>'
     permission = "全域管理" if row["access_level"] == "admin" else "业务域"
-    delete_form = ""
-    if row["access_level"] != "admin":
-        delete_form = f"""<form class="inline" method="post"
-          action="/admin/tokens/{token_id}/status/delete"><input type="hidden" name="csrf"
-          value="{csrf}"><button class="danger">删除</button></form>"""
+    is_admin = row["access_level"] == "admin"
     expires = _browser_datetime(row["expires_at"]) if row.get("expires_at") else "永不过期"
-    return f"""<tr><td>{key_view}<code>{html.escape(row["token_prefix"])}</code></td>
+    return f"""<tr><td><input class="table-checkbox token-select" type="checkbox" name="token_ids"
+      value="{token_id}" form="token-batch-form" data-admin="{str(is_admin).lower()}" aria-label="选择 Key"></td>
+      <td><code class="key-hash">{html.escape(row["token_prefix"])}</code>
+      <div class="key-note">{key_note}</div></td>
       <td><span class="status-pill {"admin-key" if row["access_level"] == "admin" else ""}">{permission}</span></td>
       <td>{html.escape(row["business_domain"])}<br><span class="hint">{html.escape(row["department"])}</span></td>
       <td>{html.escape(row["assignee_name"])}</td><td>{html.escape(row["phone"])}</td>
       <td>{html.escape(row["notes"])}</td><td><span class="status-pill {row["status"]}">{row["status"]}</span></td>
-      <td>{_browser_datetime(row["created_at"])}<br><span class="hint">{expires}</span></td>
-      <td><form class="inline" method="post" action="/admin/tokens/{token_id}/status/{action}">
-      <input type="hidden" name="csrf" value="{csrf}"><button class="secondary">{action_text}</button></form></td>
-      <td><form class="inline" method="post" action="/admin/tokens/{token_id}/rotate">
-      <input type="hidden" name="csrf" value="{csrf}"><button class="secondary">重新生成</button></form>
-      {delete_form}</td></tr>"""
+      <td>{_browser_datetime(row["created_at"])}<br><span class="hint">{expires}</span></td></tr>"""
 
 
 def _prometheus_value(result: list[dict[str, Any]]) -> str:
@@ -1670,6 +1673,33 @@ document.querySelectorAll('.key-copy').forEach(button=>button.addEventListener('
     input.select();document.execCommand('copy');input.remove();done();}
 }));
 
+const tokenBatchForm=document.getElementById('token-batch-form');
+const tokenSelections=[...document.querySelectorAll('.token-select')];
+const selectAllTokens=document.getElementById('select-all-tokens');
+if(tokenBatchForm){
+  const actionButtons=[...tokenBatchForm.querySelectorAll('.token-batch-action')];
+  const deleteButton=document.getElementById('token-delete-selected');
+  const selectedCount=document.getElementById('token-selected-count');
+  const refreshTokens=()=>{const selected=tokenSelections.filter(item=>item.checked);
+    actionButtons.forEach(button=>button.disabled=selected.length===0);
+    const includesAdmin=selected.some(item=>item.dataset.admin==='true');
+    deleteButton.disabled=selected.length===0||includesAdmin;
+    deleteButton.title=includesAdmin?'管理员 Key 不允许删除':'';
+    selectedCount.textContent=selected.length?'已选 '+selected.length+' 项':'';
+    if(selectAllTokens){selectAllTokens.checked=selected.length>0&&selected.length===tokenSelections.length;
+      selectAllTokens.indeterminate=selected.length>0&&selected.length<tokenSelections.length;}};
+  tokenSelections.forEach(item=>item.addEventListener('change',refreshTokens));
+  if(selectAllTokens)selectAllTokens.addEventListener('change',()=>{
+    tokenSelections.forEach(item=>item.checked=selectAllTokens.checked);refreshTokens();});
+  tokenBatchForm.addEventListener('submit',event=>{
+    const count=tokenSelections.filter(item=>item.checked).length,action=event.submitter?.value;
+    const labels={enable:'启用',disable:'停用',rotate:'重新生成',delete:'删除'};
+    if(!count||!action){event.preventDefault();return;}
+    if((action==='rotate'||action==='delete')&&!window.confirm('确定'+labels[action]+'所选 '+count+' 个 Key？'))event.preventDefault();
+  });
+  refreshTokens();
+}
+
 const pad=value=>String(value).padStart(2,'0');
 document.querySelectorAll('.browser-datetime').forEach(element=>{
   const date=new Date(element.dateTime);
@@ -1706,18 +1736,6 @@ if(scopeDomain&&scopeDepartment){
     scopeDepartment.append(all);
     values.forEach(value=>{const option=document.createElement('option');
       option.value=value;option.textContent=value;scopeDepartment.append(option);});
-  });
-}
-
-const createScopeDomain=document.getElementById('scope-create-business-domain');
-const createScopeDepartments=document.getElementById('known-departments');
-if(createScopeDomain&&createScopeDepartments){
-  const departmentMap=JSON.parse(createScopeDomain.dataset.departments||'{}');
-  createScopeDomain.addEventListener('input',()=>{
-    const values=departmentMap[createScopeDomain.value]||departmentMap['']||[];
-    createScopeDepartments.replaceChildren();
-    values.forEach(value=>{const option=document.createElement('option');
-      option.value=value;createScopeDepartments.append(option);});
   });
 }
 
@@ -1806,7 +1824,7 @@ _CSS = """
 .board-panel{padding:0;overflow:hidden}.board-head{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;padding:16px 20px 12px;border-bottom:1px solid var(--border)}.board-title{display:flex;align-items:center;gap:10px}.board-title h2{margin:0;font-size:18px}.board-icon{font-size:18px}.board-badge{background:#DCFCE7;color:#166534;border-radius:12px;padding:2px 10px;font-size:12px;font-weight:600}.board-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.board-tabs{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}.board-tabs button{border:none;background:#fff;padding:6px 16px;cursor:pointer;font-size:13px;color:var(--muted)}.board-tabs button.active{background:var(--blue2);color:var(--blue);font-weight:600}.board-controls select,.board-controls input[type=datetime-local]{border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:13px;background:#fff}.board-controls button{border:1px solid var(--border);background:#fff;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px}.board-controls button.active{background:#EFF6FF;color:#2563EB;border-color:#BFDBFE;font-weight:600}
 .board-filters{display:flex;align-items:center;gap:10px;padding:10px 20px;border-bottom:1px solid var(--border);background:#FAFAFA}.filter-label{color:var(--muted);font-size:13px}.board-filters select,.board-filters input{border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:13px;min-width:160px}.board-chart-wrap{position:relative;padding:16px 20px;min-height:320px}#board-chart{width:100%;height:auto;display:block}.board-empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:var(--muted)}.board-empty strong{font-size:18px;color:var(--text)}.board-legend{display:flex;flex-wrap:wrap;gap:14px;padding:0 20px 16px}.legend-item{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text)}.legend-item i{width:14px;height:3px;border-radius:2px;display:inline-block}.legend-item small{color:var(--muted)}.welcome{display:flex;justify-content:space-between;align-items:center;padding:18px}.welcome p{margin-bottom:0}.quick-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.quick{display:flex;flex-direction:column;padding:16px;text-decoration:none;color:var(--ink);transition:.15s}.quick:hover{border-color:#c8d3fa;background:#fbfcff}.quick strong{font-size:15px}.quick span{color:var(--muted);margin:5px 0 10px}.quick b{color:var(--blue);font-size:12px}
 .grid-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 12px}.grid-form>label{flex:1 1 185px;min-width:160px;max-width:300px}.grid-form>.wide{flex:2 1 360px;max-width:none}.grid-form>.token-field{flex-basis:100%;max-width:none}.grid-form>.form-actions{flex:0 0 auto;min-width:auto;max-width:none}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}.wide{min-width:0}label{display:block;color:#515b6d;font-size:12px;font-weight:600}input,textarea,select{display:block;width:100%;height:34px;margin-top:4px;padding:5px 9px;border:1px solid #d7dbe3;border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-size:13px;line-height:1.35;outline:none}input[type=file]{padding:4px 7px}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px #3b65f618}textarea{height:64px;min-height:64px;resize:vertical;padding-top:7px}label small,.hint{color:var(--muted);font-size:11px;font-weight:400}.token-field{padding:9px 11px;background:#f7f8fb;border-radius:9px}.form-actions{display:flex;align-items:center;gap:8px;min-height:34px}
-.key-view{display:grid;grid-template-columns:auto;gap:4px;margin-bottom:4px}.key-view button{min-height:30px;padding:4px 8px}.admin-key{background:#eef2ff;color:var(--blue2)}
+.key-hash{display:block;color:#475467}.key-note{min-height:18px;margin-top:3px}.text-link{display:inline;min-height:0;padding:0;border:0;border-radius:0;background:transparent;color:var(--blue2);font-size:12px;font-weight:500;line-height:1.4}.text-link:hover{background:transparent;color:var(--blue);text-decoration:underline}.admin-key{background:#eef2ff;color:var(--blue2)}.token-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap}.token-toolbar .token-batch-action{min-height:28px;padding:4px 9px;font-size:12px}.table-checkbox{width:16px!important;height:16px!important;margin:0!important}
 button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;border:0;border-radius:7px;background:var(--blue);color:#fff;padding:6px 13px;text-decoration:none;font-family:inherit;font-size:13px;font-weight:600;line-height:1.2;cursor:pointer}button:hover,.button:hover{background:var(--blue2)}button:disabled{cursor:wait;opacity:.7}.secondary{background:#f1f3f7;color:#46536a}.secondary:hover{background:#e7eaf0;color:#253047}.danger{background:#fff0f1;color:var(--red)}.danger:hover{background:#ffe4e6}.inline{display:inline}.spinner{display:inline-block;width:13px;height:13px;margin-right:7px;border:2px solid #ffffff70;border-top-color:#fff;border-radius:50%;vertical-align:-2px;animation:spin .72s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 .table-wrap{overflow:auto;margin-top:9px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#fafafb;color:#606a7b;font-size:11px;font-weight:600}td{color:#344054}.asset-table td{vertical-align:middle}.asset-table input[type=checkbox]{width:16px;height:16px;margin:0}.asset-table .text-clip{display:block;max-width:280px;white-space:normal;line-height:1.4}.vector-preview{display:block;width:76px;white-space:normal;line-height:1.25;color:#344054}.vector-preview+small,.browser-datetime small{display:block;color:var(--muted);margin-top:2px}.browser-datetime span{display:block}.filename-download{display:block;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-height:0;padding:0;background:transparent;color:var(--blue2);font-weight:500;text-align:left;line-height:1.5}.filename-download:hover{background:transparent;color:var(--blue);text-decoration:underline}.asset-toolbar{display:flex;align-items:center;gap:10px}.asset-toolbar form{margin:0}.asset-toolbar button{min-height:28px;padding:4px 9px;font-size:12px}.media-tile{position:relative;width:58px;height:46px;padding:0;overflow:hidden;border:1px solid #dce3ef;border-radius:8px;background:#f4f6fa;color:var(--blue2);display:grid;place-items:center}.media-tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.media-placeholder{font-size:10px;color:var(--muted)}.media-icon{font-size:20px;line-height:1}.media-tile small{font-size:9px}.media-tile:hover{background:#eef2ff;border-color:#c3cfea}.preview-unavailable:after{content:'暂无缩略图';position:absolute;inset:0;display:grid;place-items:center;background:#f4f6fa;color:var(--muted);font-size:9px}
 .table-footer{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-top:12px}.page-size-form{display:flex;align-items:flex-end;gap:6px}.page-size-form label{min-width:105px}.page-size-form select{height:30px;margin-top:2px}.page-size-form button{min-height:30px;padding:4px 9px}.pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px}.page-link{padding:5px 10px;border-radius:7px;background:#f1f3f7;text-decoration:none}.page-link.disabled{color:#a5adba;background:#f7f8fa}.notice-success{padding:9px 12px;margin-bottom:12px;border:1px solid #bce5ca;border-radius:8px;background:#edf9f1;color:var(--green)}

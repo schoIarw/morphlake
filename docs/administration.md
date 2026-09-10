@@ -159,6 +159,11 @@ MORPHLAKE_ADMIN_API_TIMEOUT_SECONDS=30
 - 查看、隐藏和复制完整 Key，并可重新生成；重新生成后旧 Key 立即失效；
 - 启用、停用和删除业务域 Key；默认管理 Key 不允许删除。
 
+Key 表格将复制操作显示为 Hash 值下方的文本链接；无法解密的历史 Key 也在 Hash 值下方标明。
+启用、停用、重新生成和删除统一位于表格顶部，通过复选框批量操作。选中管理员 Key 时删除按钮
+自动禁用，后端也会整批拒绝包含管理员 Key 的删除请求，避免部分删除。新建 Key 的业务域和部门
+使用普通文本输入框，不启用浏览器 `datalist` 联想提示。
+
 Key 形如 `mlk_前缀_随机密钥`。管理数据库同时保存：用于快速认证的
 `MORPHLAKE_TOKEN_PEPPER` HMAC-SHA256 摘要，以及用于管理界面查看的 Fernet 密文。Fernet
 密钥由独立的 `MORPHLAKE_TOKEN_ENCRYPTION_SECRET` 派生，禁止与 pepper、管理员密码共用：

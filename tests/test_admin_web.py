@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -155,10 +156,14 @@ def test_admin_login_session_layout_and_token_lifecycle(tmp_path: Path):
     keys_page = client.get("/admin/tokens")
     assert "全域管理" in keys_page.text
     assert "key-copy" in keys_page.text
-    assert 'list="known-business-domains"' in keys_page.text
-    assert 'list="known-departments"' in keys_page.text
-    assert 'id="scope-create-business-domain"' in keys_page.text
-    assert "createScopeDomain.addEventListener('input'" in keys_page.text
+    assert 'list="known-business-domains"' not in keys_page.text
+    assert 'list="known-departments"' not in keys_page.text
+    assert "createScopeDomain" not in keys_page.text
+    assert 'id="token-batch-form"' in keys_page.text
+    assert 'id="select-all-tokens"' in keys_page.text
+    assert 'id="token-delete-selected"' in keys_page.text
+    assert 'class="text-link key-copy"' in keys_page.text
+    assert 'data-admin="true"' in keys_page.text
 
     created = client.post(
         "/admin/tokens",
@@ -188,6 +193,7 @@ def test_admin_login_session_layout_and_token_lifecycle(tmp_path: Path):
     visible = client.get("/admin/tokens")
     assert plaintext in visible.text
     assert "复制" in visible.text
+    assert visible.text.index('class="key-hash"') < visible.text.index('class="text-link key-copy"')
     limits = client.post(
         f"/admin/tokens/{token_id}/limits",
         data={
@@ -221,6 +227,29 @@ def test_admin_login_session_layout_and_token_lifecycle(tmp_path: Path):
         item["plaintext"] for item in store.list_tokens(reveal=True) if item["token_id"] == token_id
     )
     assert new_plaintext != plaintext
+
+    batch_disable = client.post(
+        "/admin/tokens/batch",
+        data={"csrf": csrf, "token_ids": token_id, "action": "disable"},
+        follow_redirects=False,
+    )
+    assert batch_disable.status_code == 303
+    assert next(row for row in store.list_tokens() if row["token_id"] == token_id)["status"] == (
+        "disabled"
+    )
+
+    admin_id = next(
+        row["token_id"] for row in store.list_tokens() if row["access_level"] == "admin"
+    )
+    protected = client.post(
+        "/admin/tokens/batch",
+        data={"csrf": csrf, "token_ids": [token_id, admin_id], "action": "delete"},
+        follow_redirects=False,
+    )
+    assert protected.status_code == 409
+    assert next(row for row in store.list_tokens() if row["token_id"] == token_id)["status"] == (
+        "disabled"
+    )
 
     logout = client.post("/admin/logout", data={"csrf": csrf}, follow_redirects=False)
     assert logout.status_code == 303
@@ -514,7 +543,8 @@ def test_limits_config_unified_save_and_limit_board(tmp_path: Path):
     assert any(v > 0 for v in payload["series"][0]["bytes_per_second"])
 
     # 看板历史 JSON
-    history = client.get("/admin/limit-board/history?start=2026-09-09T00:00&end=2026-09-09T23:59")
+    today = datetime.now(UTC).date().isoformat()
+    history = client.get(f"/admin/limit-board/history?start={today}T00:00&end={today}T23:59")
     assert history.status_code == 200
     hist = history.json()
     assert len(hist["buckets"]) == 24

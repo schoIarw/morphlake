@@ -79,6 +79,23 @@ def test_token_is_hashed_and_lifecycle_is_enforced(tmp_path: Path):
     assert invalid_old.value.code == "token_invalid"
     assert store.authenticate(rotated.plaintext).business_domain == "risk"
 
+    second = create_token(store)
+    rotated_batch = store.rotate_tokens([second.identity.token_id])
+    assert len(rotated_batch) == 1
+    assert rotated_batch[0].plaintext.startswith("mlk_")
+    assert store.authenticate(rotated_batch[0].plaintext).status == "active"
+
+    admin_token_id = next(
+        row["token_id"] for row in store.list_tokens() if row["access_level"] == "admin"
+    )
+    with pytest.raises(MorphLakeError) as batch_protected:
+        store.set_token_statuses(
+            [created.identity.token_id, admin_token_id],
+            "deleted",
+        )
+    assert batch_protected.value.code == "admin_key_protected"
+    assert store.authenticate(rotated.plaintext).status == "active"
+
     store.set_token_status(created.identity.token_id, "disabled")
     with pytest.raises(MorphLakeError, match="disabled"):
         store.authenticate(rotated.plaintext)

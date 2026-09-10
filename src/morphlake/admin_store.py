@@ -487,67 +487,92 @@ class AdminStore:
         ]
 
     def rotate_token(self, token_id: str) -> CreatedToken:
-        token_prefix = secrets.token_hex(4)
-        plaintext = f"mlk_{token_prefix}_{secrets.token_urlsafe(32)}"
+        return self.rotate_tokens([token_id])[0]
+
+    def rotate_tokens(self, token_ids: list[str]) -> list[CreatedToken]:
+        """Rotate several active or disabled keys in one database transaction."""
+        normalized = list(
+            dict.fromkeys(token_id.strip() for token_id in token_ids if token_id.strip())
+        )
+        if not normalized:
+            raise MorphLakeError("token_not_found", "No key was selected", 400)
         with self._transaction() as connection:
-            row = (
+            rows = (
                 connection.execute(
                     select(API_TOKENS).where(
                         and_(
-                            API_TOKENS.c.token_id == token_id,
+                            API_TOKENS.c.token_id.in_(normalized),
                             API_TOKENS.c.status != "deleted",
                         )
                     )
                 )
                 .mappings()
-                .first()
+                .all()
             )
-            if row is None:
-                raise MorphLakeError("token_not_found", "Active key does not exist", 404)
-            connection.execute(
-                update(API_TOKENS)
-                .where(API_TOKENS.c.token_id == token_id)
-                .values(
-                    token_hash=self._token_hash(plaintext),
-                    token_prefix=token_prefix,
-                    token_ciphertext=self._encrypt_token(plaintext),
-                    updated_at=datetime.now(UTC).isoformat(),
-                )
-            )
-        values = dict(row)
-        values["token_prefix"] = token_prefix
-        return CreatedToken(identity=self._identity(values), plaintext=plaintext)
-
-    def set_token_status(self, token_id: str, status: str) -> None:
-        if status not in {"active", "disabled", "deleted"}:
-            raise MorphLakeError("invalid_token_status", "Unsupported token status")
-        criteria = API_TOKENS.c.token_id == token_id
-        if status != "deleted":
-            criteria = and_(criteria, API_TOKENS.c.status != "deleted")
-        with self._transaction() as connection:
-            existing_row = (
+            if len(rows) != len(normalized):
+                raise MorphLakeError("token_not_found", "One or more active keys do not exist", 404)
+            by_id = {row["token_id"]: row for row in rows}
+            created = []
+            now = datetime.now(UTC).isoformat()
+            for token_id in normalized:
+                row = by_id[token_id]
+                token_prefix = secrets.token_hex(4)
+                plaintext = f"mlk_{token_prefix}_{secrets.token_urlsafe(32)}"
                 connection.execute(
-                    select(API_TOKENS.c.status, API_TOKENS.c.access_level).where(
-                        API_TOKENS.c.token_id == token_id
+                    update(API_TOKENS)
+                    .where(API_TOKENS.c.token_id == token_id)
+                    .values(
+                        token_hash=self._token_hash(plaintext),
+                        token_prefix=token_prefix,
+                        token_ciphertext=self._encrypt_token(plaintext),
+                        updated_at=now,
                     )
                 )
+                values = dict(row)
+                values["token_prefix"] = token_prefix
+                created.append(CreatedToken(identity=self._identity(values), plaintext=plaintext))
+        return created
+
+    def set_token_status(self, token_id: str, status: str) -> None:
+        self.set_token_statuses([token_id], status)
+
+    def set_token_statuses(self, token_ids: list[str], status: str) -> None:
+        """Apply a lifecycle state to several keys atomically."""
+        if status not in {"active", "disabled", "deleted"}:
+            raise MorphLakeError("invalid_token_status", "Unsupported token status")
+        normalized = list(
+            dict.fromkeys(token_id.strip() for token_id in token_ids if token_id.strip())
+        )
+        if not normalized:
+            raise MorphLakeError("token_not_found", "No key was selected", 400)
+        with self._transaction() as connection:
+            rows = (
+                connection.execute(
+                    select(
+                        API_TOKENS.c.token_id,
+                        API_TOKENS.c.status,
+                        API_TOKENS.c.access_level,
+                    ).where(API_TOKENS.c.token_id.in_(normalized))
+                )
                 .mappings()
-                .first()
+                .all()
             )
-            if status == "deleted" and existing_row and existing_row["access_level"] == "admin":
+            by_id = {row["token_id"]: row for row in rows}
+            if len(rows) != len(normalized):
+                raise MorphLakeError("token_not_found", "One or more keys do not exist", 404)
+            if any(by_id[token_id]["status"] == "deleted" for token_id in normalized):
+                raise MorphLakeError("token_deleted", "Deleted keys cannot be changed", 409)
+            if status == "deleted" and any(
+                by_id[token_id]["access_level"] == "admin" for token_id in normalized
+            ):
                 raise MorphLakeError(
                     "admin_key_protected", "The default administration key cannot be deleted", 409
                 )
-            result = connection.execute(
+            connection.execute(
                 update(API_TOKENS)
-                .where(criteria)
+                .where(API_TOKENS.c.token_id.in_(normalized))
                 .values(status=status, updated_at=datetime.now(UTC).isoformat())
             )
-            if result.rowcount != 1:
-                existing = existing_row["status"] if existing_row else None
-                if existing == "deleted":
-                    raise MorphLakeError("token_deleted", "Deleted tokens cannot be changed", 409)
-                raise MorphLakeError("token_not_found", "Token does not exist", 404)
 
     def update_token_limits(
         self,
