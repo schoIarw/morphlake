@@ -1,6 +1,19 @@
-# Default single-host profile. Both API and administration containers mount the
-# same /app/data volume, so they see the same SQLite database.
+# Local MacBook test profile. Both API and administration containers connect
+# to the in-compose MySQL service. Tables are created automatically on first
+# startup; the morphlake database itself is pre-created by the MySQL container
+# via MYSQL_DATABASE, so auto_create_database is false and the morphlake user
+# does not need CREATE privileges.
 database:
-  backend: sqlite
-  path: data/morphlake-admin.db
-
+  backend: mysql
+  host: mysql
+  port: 3306
+  name: morphlake
+  auth:
+    mode: native
+    username: morphlake
+    password: morphlake-pwd
+  auto_create_database: false
+  connect_timeout_seconds: 10
+  pool_size: 20
+  max_overflow: 40
+  pool_recycle_seconds: 1800

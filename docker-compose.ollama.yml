@@ -1,4 +1,66 @@
 services:
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - morphlake-minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.0
+    command:
+      - --default-authentication-plugin=caching_sha2_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: root-pwd
+      MYSQL_DATABASE: morphlake
+      MYSQL_USER: morphlake
+      MYSQL_PASSWORD: morphlake-pwd
+    ports:
+      - "3306:3306"
+    volumes:
+      - morphlake-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 10
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.listen-address=0.0.0.0:9090
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/morphlake-metrics-token:/etc/prometheus/morphlake-metrics-token:ro
+      - morphlake-prometheus-data:/prometheus
+    depends_on:
+      morphlake-api:
+        condition: service_started
+      morphlake-admin:
+        condition: service_started
+    restart: unless-stopped
+
   morphlake-api:
     build: .
     image: morphlake:ollama-local
@@ -9,11 +71,16 @@ services:
       - ./config/models.ollama.yaml:/app/config/models.ollama.yaml:ro
       - ./config/database.yaml:/app/config/database.yaml:ro
       - morphlake-admin-data:/app/data
+    depends_on:
+      minio:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/live', timeout=3)"]
       interval: 30s
       timeout: 5s
-      start_period: 20s
+      start_period: 30s
       retries: 3
     restart: unless-stopped
 
@@ -27,6 +94,10 @@ services:
     depends_on:
       morphlake-api:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
     volumes:
       - ./config/database.yaml:/app/config/database.yaml:ro
       - morphlake-admin-data:/app/data
@@ -34,9 +105,12 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health/live', timeout=3)"]
       interval: 30s
       timeout: 5s
-      start_period: 10s
+      start_period: 30s
       retries: 3
     restart: unless-stopped
 
 volumes:
   morphlake-admin-data:
+  morphlake-minio-data:
+  morphlake-mysql-data:
+  morphlake-prometheus-data:
